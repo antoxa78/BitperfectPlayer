@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Stylized Tube Amp Foreground -->
+
+    <!-- Base / Chassis -->
+    <path
+        android:pathData="M20,65 L88,65 L90,85 L18,85 Z"
+        android:fillColor="#222222" />
+
+    <!-- Knobs -->
+    <path
+        android:pathData="M30,75m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0"
+        android:fillColor="#444444" />
+    <path
+        android:pathData="M78,75m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0"
+        android:fillColor="#444444" />
+
+    <!-- Vacuum Tubes -->
+    <!-- Tube 1 -->
+    <path
+        android:pathData="M35,65 L35,40 C35,35 45,35 45,40 L45,65 Z"
+        android:fillColor="#44FFFFFF" />
+    <path
+        android:pathData="M38,60 L38,45"
+        android:strokeWidth="1"
+        android:strokeColor="#FF8800" />
+
+    <!-- Tube 2 (Central, larger) -->
+    <path
+        android:pathData="M50,65 L50,35 C50,25 65,25 65,35 L65,65 Z"
+        android:fillColor="#66FFFFFF" />
+    <path
+        android:pathData="M57,60 L57,40"
+        android:strokeWidth="2"
+        android:strokeColor="#FF6600" />
+
+    <!-- Tube 3 -->
+    <path
+        android:pathData="M70,65 L70,40 C70,35 80,35 80,40 L80,65 Z"
+        android:fillColor="#44FFFFFF" />
+    <path
+        android:pathData="M75,60 L75,45"
+        android:strokeWidth="1"
+        android:strokeColor="#FF8800" />
+
+    <!-- Frosted Glass Play Button (Large in center) -->
+    <path
+        android:pathData="M45,40 L70,54 L45,68 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="54"
+                android:centerY="54"
+                android:gradientRadius="30"
+                android:type="radial">
+                <item android:color="#99FFFFFF" android:offset="0.0" />
+                <item android:color="#44FFFFFF" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Glow effect for tubes -->
+    <path
+        android:pathData="M35,65 L80,65"
+        android:strokeWidth="4"
+        android:strokeColor="#22FF8800" />
+
+</vector>
