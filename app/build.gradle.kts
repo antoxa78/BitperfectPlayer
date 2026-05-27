@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 21
-        versionName = "2.2.0"
+        versionCode = 22
+        versionName = "2.2.1"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -35,6 +35,8 @@ android {
             )
         }
     }
+
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11

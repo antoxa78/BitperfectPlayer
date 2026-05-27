@@ -458,7 +458,7 @@ class MainFragment : BrowseSupportFragment() {
                 fun scanRecursive(file: java.io.File) {
                     if (file.isDirectory) {
                         file.listFiles()?.forEach { scanRecursive(it) }
-                    } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8")) {
+                    } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) {
                         activity?.runOnUiThread {
                             playlistAdapter.add(createMediaItem(file.name, "Local Playlist", Uri.fromFile(file).toString()))
                         }
@@ -497,7 +497,7 @@ class MainFragment : BrowseSupportFragment() {
                             
                             if (mime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
                                 scanRecursive(childUri)
-                            } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8")) {
+                            } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) {
                                 activity?.runOnUiThread {
                                     playlistAdapter.add(createMediaItem(name, "Local Playlist", childUri.toString()))
                                 }
@@ -521,7 +521,7 @@ class MainFragment : BrowseSupportFragment() {
                     for (f in files) {
                         if (f.isDirectory) {
                             scanRecursive(f.path)
-                        } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8")) {
+                        } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8") || f.name.lowercase().endsWith(".pls")) {
                             val name = f.name
                             val path = f.path
                             activity?.runOnUiThread {
@@ -691,7 +691,7 @@ class MainFragment : BrowseSupportFragment() {
                 val browseItems = sortedFiles.map { 
                     val isDir = it.isDirectory()
                     val icon = if (isDir) R.drawable.ic_folder 
-                              else if (it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8")) R.drawable.ic_playlist
+                              else if (it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8") || it.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist
                               else R.drawable.ic_audio
                     BrowseItem(it.name, it.path, icon, isDir)
                 }
@@ -776,7 +776,7 @@ class MainFragment : BrowseSupportFragment() {
                                 items.add(BrowseItem(name, android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, id).toString(), R.drawable.ic_folder, true))
                             }
                         } else if (isPlayable(name)) {
-                            val icon = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8")) R.drawable.ic_playlist else R.drawable.ic_audio
+                            val icon = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
                             items.add(BrowseItem(name, android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, id).toString(), icon, false))
                         }
                     }
@@ -942,8 +942,11 @@ class MainFragment : BrowseSupportFragment() {
                         }
                     }
                 } else if (isPlayable(displayName)) {
-                    if (displayName.lowercase().endsWith(".m3u") || displayName.lowercase().endsWith(".m3u8")) {
+                    val lower = displayName.lowercase()
+                    if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                         itemsToAdd.addAll(mainActivity.parseM3u(uri))
+                    } else if (lower.endsWith(".pls")) {
+                        itemsToAdd.addAll(mainActivity.parsePls(uri))
                     } else {
                         itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
                     }
@@ -955,8 +958,11 @@ class MainFragment : BrowseSupportFragment() {
                 context.contentResolver.getType(rootUri) == android.provider.DocumentsContract.Document.MIME_TYPE_DIR
             } catch (e: Exception) { false }
             
-            if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8")) {
+            val lowerName = name.lowercase()
+            if (lowerName.endsWith(".m3u") || lowerName.endsWith(".m3u8")) {
                 itemsToAdd.addAll(mainActivity.parseM3u(rootUri))
+            } else if (lowerName.endsWith(".pls")) {
+                itemsToAdd.addAll(mainActivity.parsePls(rootUri))
             } else if (isInitialDir) {
                 scanRecursive(rootUri, true, name)
             } else {
@@ -965,8 +971,12 @@ class MainFragment : BrowseSupportFragment() {
 
             activity?.runOnUiThread {
                 if (itemsToAdd.isNotEmpty()) {
-                    // Sort items by track number extracted from title, then by title
-                    val sortedItems = itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
+                    val sortedItems = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) {
+                        itemsToAdd
+                    } else {
+                        // Sort items by track number extracted from title, then by title
+                        itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
+                    }
                     
                     if (replace) {
                         controller.setMediaItems(sortedItems)
@@ -1031,13 +1041,18 @@ class MainFragment : BrowseSupportFragment() {
             try {
                 val mainActivity = activity as? MainActivity
                 val itemsToAdd = mutableListOf<MediaItem>()
+                val isPlaylistFile = !file.isDirectory() && isPlayable(file.name) &&
+                    (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls"))
                 
                 fun scanRecursive(f: SmbFile) {
                     if (f.isDirectory()) {
                         f.listFiles()?.forEach { scanRecursive(it) }
                     } else if (isPlayable(f.name)) {
-                        if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8")) {
+                        val lower = f.name.lowercase()
+                        if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                             f.getInputStream().use { itemsToAdd.addAll(mainActivity?.parseM3uFromStream(it) ?: emptyList()) }
+                        } else if (lower.endsWith(".pls")) {
+                            f.getInputStream().use { itemsToAdd.addAll(mainActivity?.parsePlsFromStream(it) ?: emptyList()) }
                         } else {
                             itemsToAdd.add(createMediaItem(f.name, "", f.path))
                         }
@@ -1050,8 +1065,12 @@ class MainFragment : BrowseSupportFragment() {
                     if (activity?.isFinishing == true) return@runOnUiThread
                     loadingToast.cancel()
                     if (itemsToAdd.isNotEmpty()) {
-                        // Sort items by track number extracted from title, then by title
-                        val sortedItems = itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
+                        val sortedItems = if (isPlaylistFile) {
+                            itemsToAdd
+                        } else {
+                            // Sort items by track number extracted from title, then by title
+                            itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
+                        }
                         
                         val controller = mainActivity?.getController()
                         if (controller != null) {
@@ -1249,7 +1268,7 @@ class MainFragment : BrowseSupportFragment() {
                     if (file.isDirectory) {
                         items.add(BrowseItem(file.name, file.absolutePath, R.drawable.ic_folder, true))
                     } else if (!isSelectionMode && isPlayable(file.name)) {
-                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8")) R.drawable.ic_playlist else R.drawable.ic_audio
+                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
                         items.add(BrowseItem(file.name, file.absolutePath, icon, false))
                     }
                 }
@@ -1389,15 +1408,24 @@ class MainFragment : BrowseSupportFragment() {
 
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
+            val isPlaylistFile = !root.isDirectory && isPlayable(root.name) &&
+                (root.name.lowercase().endsWith(".m3u") || root.name.lowercase().endsWith(".m3u8") || root.name.lowercase().endsWith(".pls"))
             
             fun scanRecursive(file: java.io.File) {
                 if (file.isDirectory) {
                     file.listFiles()?.forEach { scanRecursive(it) }
                 } else if (isPlayable(file.name)) {
-                    if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8")) {
+                    val lower = file.name.lowercase()
+                    if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                         try {
                             java.io.FileInputStream(file).use { stream ->
                                 itemsToAdd.addAll(mainActivity?.parseM3uFromStream(stream) ?: emptyList())
+                            }
+                        } catch (e: Exception) {}
+                    } else if (lower.endsWith(".pls")) {
+                        try {
+                            java.io.FileInputStream(file).use { stream ->
+                                itemsToAdd.addAll(mainActivity?.parsePlsFromStream(stream) ?: emptyList())
                             }
                         } catch (e: Exception) {}
                     } else {
@@ -1412,7 +1440,11 @@ class MainFragment : BrowseSupportFragment() {
             activity?.runOnUiThread {
                 loadingToast.cancel()
                 if (itemsToAdd.isNotEmpty()) {
-                    val sortedItems = itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
+                    val sortedItems = if (isPlaylistFile) {
+                        itemsToAdd
+                    } else {
+                        itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
+                    }
                     
                     if (replace) {
                         controller.setMediaItems(sortedItems)
@@ -1432,7 +1464,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls")
         return extensions.any { filename.lowercase().endsWith(it) }
     }
 
@@ -1919,14 +1951,24 @@ class MainFragment : BrowseSupportFragment() {
             val queueArray = JSONArray(queueJson)
             val items = mutableListOf<MediaItem>()
             for (i in 0 until queueArray.length()) {
-                val uri = queueArray.getString(i)
-                val segment = if (uri.startsWith("smb://")) {
-                    Uri.decode(uri.substringAfterLast("/").takeIf { it.isNotEmpty() } ?: uri)
+                val entry = queueArray.optJSONObject(i)
+                if (entry != null) {
+                    val uri = entry.optString("mediaId", "")
+                    val title = entry.optString("title", "")
+                    val artist = entry.optString("artist", "")
+                    if (uri.isNotEmpty()) {
+                        items.add(createMediaItem(title, artist, uri))
+                    }
                 } else {
-                    Uri.parse(uri).lastPathSegment ?: uri
+                    val uri = queueArray.getString(i)
+                    val segment = if (uri.startsWith("smb://")) {
+                        Uri.decode(uri.substringAfterLast("/").takeIf { it.isNotEmpty() } ?: uri)
+                    } else {
+                        Uri.parse(uri).lastPathSegment ?: uri
+                    }
+                    val title = segment.substringBeforeLast(".")
+                    items.add(createMediaItem(title, "", uri))
                 }
-                val title = segment.substringBeforeLast(".")
-                items.add(createMediaItem(title, "", uri))
             }
             
             if (items.isEmpty()) return

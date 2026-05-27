@@ -135,10 +135,16 @@ class MainActivity : BaseActivity() {
             val allItems = mutableListOf<MediaItem>()
             for (uri in uris) {
                 val fileName = uri.lastPathSegment?.lowercase() ?: ""
-                if (fileName.endsWith(".m3u") || fileName.endsWith(".m3u8")) {
-                    allItems.addAll(parseM3u(uri))
-                } else {
-                    allItems.add(createMediaItem(uri))
+                when {
+                    fileName.endsWith(".m3u") || fileName.endsWith(".m3u8") -> {
+                        allItems.addAll(parseM3u(uri))
+                    }
+                    fileName.endsWith(".pls") -> {
+                        allItems.addAll(parsePls(uri))
+                    }
+                    else -> {
+                        allItems.add(createMediaItem(uri))
+                    }
                 }
             }
 
@@ -257,6 +263,79 @@ class MainActivity : BaseActivity() {
                         )
                     }
                     currentTitle = null // Reset for next item
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return items
+    }
+
+    fun parsePls(uri: Uri): List<MediaItem> {
+        try {
+            contentResolver.openInputStream(uri)?.use { inputStream ->
+                return parsePlsFromStream(inputStream)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return emptyList()
+    }
+
+    fun parsePlsFromStream(inputStream: java.io.InputStream): List<MediaItem> {
+        val items = mutableListOf<MediaItem>()
+        try {
+            val reader = BufferedReader(InputStreamReader(inputStream))
+            val props = linkedMapOf<String, String>()
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val trimmed = line!!.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("[")) continue
+                val eq = trimmed.indexOf("=")
+                if (eq != -1) {
+                    val key = trimmed.substring(0, eq).trim().lowercase()
+                    val value = trimmed.substring(eq + 1).trim()
+                    props[key] = value
+                }
+            }
+            val count = props.remove("numberofentries")?.toIntOrNull() ?: 0
+            for (i in 1..count) {
+                val file = props.remove("file$i") ?: continue
+                val title = props.remove("title$i") ?: file.substringAfterLast("/").substringBeforeLast(".")
+                val length = props.remove("length$i")
+                val itemUri = try {
+                    when {
+                        file.startsWith("/") -> Uri.parse("file://$file")
+                        file.startsWith("file://") || file.startsWith("content://") ||
+                        file.startsWith("http://") || file.startsWith("https://") ||
+                        file.startsWith("smb://") -> Uri.parse(file)
+                        else -> null
+                    }
+                } catch (e: Exception) { null }
+
+                if (itemUri != null) {
+                    val lowercaseUrl = file.lowercase()
+                    val mimeType = when {
+                        lowercaseUrl.contains("flac") -> androidx.media3.common.MimeTypes.AUDIO_FLAC
+                        lowercaseUrl.contains("mp3") -> androidx.media3.common.MimeTypes.AUDIO_MPEG
+                        lowercaseUrl.contains("aac") || lowercaseUrl.contains("aacp") -> androidx.media3.common.MimeTypes.AUDIO_AAC
+                        else -> null
+                    }
+                    val metadataBuilder = MediaMetadata.Builder()
+                    var finalTitle = title
+                    if (finalTitle.contains(" - ")) {
+                        val parts = finalTitle.split(" - ", limit = 2)
+                        metadataBuilder.setArtist(parts[0].trim())
+                        finalTitle = parts[1].trim()
+                    }
+                    items.add(
+                        MediaItem.Builder()
+                            .setMediaId(file)
+                            .setUri(itemUri)
+                            .setMimeType(mimeType)
+                            .setMediaMetadata(metadataBuilder.setTitle(finalTitle).build())
+                            .build()
+                    )
                 }
             }
         } catch (e: Exception) {

@@ -130,10 +130,15 @@ class PlaybackService : MediaSessionService() {
         val settings = getSharedPreferences("AppSettings", MODE_PRIVATE)
         if (settings.getBoolean("resume_playback", false)) {
             val player = mediaSession?.player
-            val queue = mutableListOf<String>()
+            val queue = JSONArray()
             player?.let {
                 for (i in 0 until it.mediaItemCount) {
-                    queue.add(it.getMediaItemAt(i).mediaId)
+                    val item = it.getMediaItemAt(i)
+                    val obj = JSONObject()
+                    obj.put("mediaId", item.mediaId)
+                    obj.put("title", item.mediaMetadata.title?.toString() ?: "")
+                    obj.put("artist", item.mediaMetadata.artist?.toString() ?: "")
+                    queue.put(obj)
                 }
             }
             settings.edit()
@@ -141,7 +146,7 @@ class PlaybackService : MediaSessionService() {
                 .putString("last_played_title", title)
                 .putString("last_played_artist", artist)
                 .putInt("last_played_index", player?.currentMediaItemIndex ?: 0)
-                .putString("last_played_queue", JSONArray(queue).toString())
+                .putString("last_played_queue", queue.toString())
                 .apply()
         }
         

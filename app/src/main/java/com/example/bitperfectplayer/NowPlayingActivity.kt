@@ -32,6 +32,7 @@ class NowPlayingActivity : BaseActivity() {
     private lateinit var textTotalTime: TextView
     private lateinit var imgTrackIcon: ImageView
     private lateinit var seekBar: SeekBar
+    private var isSeekBarTracking: Boolean = false
     private lateinit var btnPlayPause: ImageButton
     private lateinit var btnShuffle: ImageButton
     private lateinit var btnRepeat: ImageButton
@@ -58,11 +59,21 @@ class NowPlayingActivity : BaseActivity() {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (fromUser) {
                     textCurrentTime.text = formatTime(progress.toLong())
+                    // On Android TV, D-pad events only fire onProgressChanged (not onStopTrackingTouch),
+                    // so we must seek here. For touch drags, onStopTrackingTouch handles the final seek.
+                    if (!isSeekBarTracking) {
+                        mediaController?.seekTo(progress.toLong())
+                    }
                 }
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {
+                isSeekBarTracking = true
+                handler.removeCallbacksAndMessages(null)
+            }
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
                 mediaController?.seekTo(seekBar?.progress?.toLong() ?: 0L)
+                isSeekBarTracking = false
+                startProgressUpdate()
             }
         })
 
@@ -154,6 +165,58 @@ class NowPlayingActivity : BaseActivity() {
                         )
                     }
                     currentTitle = null
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return items
+    }
+
+    private fun parsePlsLocal(inputStream: java.io.InputStream): List<androidx.media3.common.MediaItem> {
+        val items = mutableListOf<androidx.media3.common.MediaItem>()
+        try {
+            val reader = java.io.BufferedReader(java.io.InputStreamReader(inputStream))
+            val props = linkedMapOf<String, String>()
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val trimmed = line!!.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("[")) continue
+                val eq = trimmed.indexOf("=")
+                if (eq != -1) {
+                    val key = trimmed.substring(0, eq).trim().lowercase()
+                    val value = trimmed.substring(eq + 1).trim()
+                    props[key] = value
+                }
+            }
+            val count = props.remove("numberofentries")?.toIntOrNull() ?: 0
+            for (i in 1..count) {
+                val file = props.remove("file$i") ?: continue
+                val title = props.remove("title$i") ?: file.substringAfterLast("/").substringBeforeLast(".")
+                val itemUri = try {
+                    when {
+                        file.startsWith("/") -> android.net.Uri.parse("file://$file")
+                        file.startsWith("file://") || file.startsWith("content://") ||
+                        file.startsWith("http://") || file.startsWith("https://") ||
+                        file.startsWith("smb://") -> android.net.Uri.parse(file)
+                        else -> null
+                    }
+                } catch (e: Exception) { null }
+                if (itemUri != null) {
+                    val metadataBuilder = androidx.media3.common.MediaMetadata.Builder()
+                    var finalTitle = title
+                    if (finalTitle.contains(" - ")) {
+                        val parts = finalTitle.split(" - ", limit = 2)
+                        metadataBuilder.setArtist(parts[0].trim())
+                        finalTitle = parts[1].trim()
+                    }
+                    items.add(
+                        androidx.media3.common.MediaItem.Builder()
+                            .setMediaId(file)
+                            .setUri(itemUri)
+                            .setMediaMetadata(metadataBuilder.setTitle(finalTitle).build())
+                            .build()
+                    )
                 }
             }
         } catch (e: Exception) {
@@ -322,6 +385,8 @@ class NowPlayingActivity : BaseActivity() {
                 topMargin = (24 * density).toInt()
             }
             setPlaying(mediaController?.isPlaying == true)
+            val waveType = getSharedPreferences("AppSettings", MODE_PRIVATE).getInt("waveform_type", 0)
+            setWaveformType(waveType)
             setColor(getThemeColor())
         }
         container.addView(waveform)
@@ -710,7 +775,7 @@ class NowPlayingActivity : BaseActivity() {
                     if (file.isDirectory) {
                         items.add(BrowseItem(file.name, file.absolutePath, R.drawable.ic_folder, true))
                     } else if (!isDirectoryMode && isPlayable(file.name)) {
-                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8")) R.drawable.ic_playlist else R.drawable.ic_audio
+                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
                         items.add(BrowseItem(file.name, file.absolutePath, icon, false))
                     }
                 }
@@ -827,15 +892,24 @@ class NowPlayingActivity : BaseActivity() {
 
         Thread {
             val itemsToAdd = mutableListOf<androidx.media3.common.MediaItem>()
+            val isPlaylistFile = !root.isDirectory && isPlayable(root.name) &&
+                (root.name.lowercase().endsWith(".m3u") || root.name.lowercase().endsWith(".m3u8") || root.name.lowercase().endsWith(".pls"))
             
             fun scanRecursive(file: java.io.File) {
                 if (file.isDirectory) {
                     file.listFiles()?.forEach { scanRecursive(it) }
                 } else if (isPlayable(file.name)) {
-                    if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8")) {
+                    val lower = file.name.lowercase()
+                    if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                         try {
                             java.io.FileInputStream(file).use { stream ->
                                 itemsToAdd.addAll(parseM3uLocal(stream, android.net.Uri.fromFile(file)))
+                            }
+                        } catch (e: Exception) {}
+                    } else if (lower.endsWith(".pls")) {
+                        try {
+                            java.io.FileInputStream(file).use { stream ->
+                                itemsToAdd.addAll(parsePlsLocal(stream))
                             }
                         } catch (e: Exception) {}
                     } else {
@@ -865,7 +939,11 @@ class NowPlayingActivity : BaseActivity() {
             runOnUiThread {
                 loadingToast.cancel()
                 if (itemsToAdd.isNotEmpty()) {
-                    val sortedItems = itemsToAdd.sortedBy { it.mediaMetadata.title?.toString()?.lowercase() }
+                    val sortedItems = if (isPlaylistFile) {
+                        itemsToAdd
+                    } else {
+                        itemsToAdd.sortedBy { it.mediaMetadata.title?.toString()?.lowercase() }
+                    }
                     
                     if (replace) {
                         controller.setMediaItems(sortedItems)
@@ -884,7 +962,7 @@ class NowPlayingActivity : BaseActivity() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls")
         return extensions.any { filename.lowercase().endsWith(it) }
     }
 
