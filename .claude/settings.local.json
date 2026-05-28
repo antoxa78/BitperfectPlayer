@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs ls -la)",
+      "Bash(./gradlew :app:assembleDebug)",
+      "Bash(./gradlew assembleDebug)",
+      "Bash(./gradlew clean *)",
+      "Bash(gh release *)",
+      "Bash(which gh *)",
+      "Bash(snap list *)",
+      "Bash(apt list *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git tag *)",
+      "Bash(git push *)",
+      "Bash(echo \"===EXIT: $?===\")",
+      "Read(//home/anton/.ssh/**)",
+      "Read(//home/anton/.config/**)"
+    ]
+  }
+}
