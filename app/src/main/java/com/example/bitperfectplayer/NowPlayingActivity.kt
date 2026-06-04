@@ -919,11 +919,15 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun handleFileSelection(path: String, name: String) {
         val file = java.io.File(path)
-        val options = arrayOf("Add to current playlist", "Replace current playlist")
+        val items = listOf(
+            com.example.bitperfectplayer.MainFragment.DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
+            com.example.bitperfectplayer.MainFragment.DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
+        )
+        val adapter = com.example.bitperfectplayer.MainFragment.DialogOptionAdapter(this, items)
         
         android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle(name)
-            .setItems(options) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 addFilesToPlaylist(file, which == 1)
             }
             .setNegativeButton("Cancel", null)

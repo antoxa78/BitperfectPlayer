@@ -8,6 +8,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.widget.EditText
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.core.content.ContextCompat
 import androidx.leanback.app.BrowseSupportFragment
 import androidx.leanback.app.RowsSupportFragment
@@ -69,6 +70,27 @@ class MainFragment : BrowseSupportFragment() {
                 lastSelectedColumn = rowViewHolder.gridView.selectedPosition
             }
         }
+
+        requireActivity().onBackPressedDispatcher.addCallback(
+            viewLifecycleOwner,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    val activity = activity as? MainActivity
+                    AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle("Exit")
+                        .setMessage("Are you sure you want to exit?")
+                        .setPositiveButton("Yes") { _, _ ->
+                            activity?.stopService(
+                                android.content.Intent(requireContext(), PlaybackService::class.java)
+                            )
+                            activity?.finishAffinity()
+                            System.exit(0)
+                        }
+                        .setNegativeButton("No", null)
+                        .show()
+                }
+            }
+        )
     }
 
     override fun onStart() {
@@ -262,6 +284,7 @@ class MainFragment : BrowseSupportFragment() {
 
         val dialog = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Add SMB Share")
+            .setIcon(R.drawable.ic_network)
             .setView(view)
             .create()
 
@@ -1632,10 +1655,12 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun showWaveformTypeDialog() {
-        val types = arrayOf("Mirrored Bars", "Single Bars", "Bars with level hold", "Dots bars", "Dots bars with level holds")
+        val typeNames = arrayOf("Mirrored Bars", "Single Bars", "Bars with level hold", "Dots bars", "Dots bars with level holds")
+        val items = typeNames.map { DialogOptionItem(it, R.drawable.ic_waveform) }
+        val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Waveform Type")
-            .setItems(types) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                     .edit().putInt(KEY_WAVEFORM_TYPE, which).apply()
                 refreshWithCurrentFocus()
@@ -1669,10 +1694,12 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun showColorSchemeDialog() {
-        val schemes = arrayOf("Neon Green", "Electric Blue", "Amber Gold", "Deep Purple", "Hot Pink", "Pure Black with Grey", "Pure Black with Red", "Pure Black with Green", "Pure Black with White")
+        val schemeNames = arrayOf("Neon Green", "Electric Blue", "Amber Gold", "Deep Purple", "Hot Pink", "Pure Black with Grey", "Pure Black with Red", "Pure Black with Green", "Pure Black with White")
+        val items = schemeNames.map { DialogOptionItem(it, R.drawable.ic_palette) }
+        val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Player Color Scheme")
-            .setItems(schemes) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                     .edit().putInt(KEY_COLOR_SCHEME, which).apply()
                 refreshWithCurrentFocus()
@@ -1694,11 +1721,15 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun showScreensaverSettings() {
-        val mainOptions = arrayOf("Screensaver On", "Turn The Screen Off", "Never")
-
+        val items = listOf(
+            DialogOptionItem("Screensaver On", R.drawable.ic_screensaver),
+            DialogOptionItem("Turn The Screen Off", R.drawable.ic_screensaver),
+            DialogOptionItem("Never", R.drawable.ic_screensaver)
+        )
+        val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Screensaver Settings")
-            .setItems(mainOptions) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 when (which) {
                     0 -> showScreensaverDelayDialog(true)
                     1 -> showScreensaverDelayDialog(false)
@@ -1750,29 +1781,38 @@ class MainFragment : BrowseSupportFragment() {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.list_item_browse, parent, false)
             val item = getItem(position)!!
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.name
-            view.findViewById<android.widget.ImageView>(R.id.item_icon).setImageResource(item.icon)
+            val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
+            icon.setImageResource(item.icon)
+            icon.drawable?.mutate()?.setTint(getThemeColor(context))
             return view
         }
     }
 
-    private data class DialogOptionItem(val label: String, val iconRes: Int)
+    data class DialogOptionItem(val label: String, val iconRes: Int)
 
-    private class DialogOptionAdapter(context: Context, items: List<DialogOptionItem>) :
+    class DialogOptionAdapter(context: Context, items: List<DialogOptionItem>) :
         android.widget.ArrayAdapter<DialogOptionItem>(context, R.layout.list_item_browse, items) {
         override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.list_item_browse, parent, false)
             val item = getItem(position)!!
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.label
-            view.findViewById<android.widget.ImageView>(R.id.item_icon).setImageResource(item.iconRes)
+            val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
+            icon.setImageResource(item.iconRes)
+            icon.drawable?.mutate()?.setTint(getThemeColor(context))
             return view
         }
     }
 
     private fun manageMusicFolders() {
-        val options = arrayOf("Add Local Music Folder", "Add SMB Network Share", "View/Remove Folders")
+        val items = listOf(
+            DialogOptionItem("Add Local Music Folder", R.drawable.ic_storage),
+            DialogOptionItem("Add SMB Network Share", R.drawable.ic_network_music),
+            DialogOptionItem("View/Remove Folders", R.drawable.ic_folder)
+        )
+        val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Music Folders")
-            .setItems(options) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 when (which) {
                     0 -> checkAndBrowseInternalStorage(isSelectionMode = true)
                     1 -> showAddSmbDialog()
@@ -1937,6 +1977,7 @@ class MainFragment : BrowseSupportFragment() {
 
         val dialog = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Credentials for $ip")
+            .setIcon(R.drawable.ic_network)
             .setView(view)
             .create()
 
@@ -2113,13 +2154,17 @@ class MainFragment : BrowseSupportFragment() {
     private fun showRecentFilesMenu() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val isEnabled = prefs.getBoolean(KEY_RECENT, true)
-        val options = arrayOf(
-            if (isEnabled) "Remember Recent Files: Enabled" else "Remember Recent Files: Disabled",
-            "Clear Recent List"
+        val items = listOf(
+            DialogOptionItem(
+                if (isEnabled) "Remember Recent Files: Enabled" else "Remember Recent Files: Disabled",
+                R.drawable.ic_history
+            ),
+            DialogOptionItem("Clear Recent List", R.drawable.ic_history)
         )
+        val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Recent Files Settings")
-            .setItems(options) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 when (which) {
                     0 -> {
                         toggleRecentFiles()
@@ -2135,13 +2180,17 @@ class MainFragment : BrowseSupportFragment() {
     private fun showScanLibraryMenu() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val autoScan = prefs.getBoolean(KEY_AUTO_SCAN, false)
-        val options = arrayOf(
-            "Perform Library Scan Now",
-            if (autoScan) "Automatic Library Scan: Enabled" else "Automatic Library Scan: Disabled"
+        val items = listOf(
+            DialogOptionItem("Perform Library Scan Now", R.drawable.ic_sync),
+            DialogOptionItem(
+                if (autoScan) "Automatic Library Scan: Enabled" else "Automatic Library Scan: Disabled",
+                R.drawable.ic_history
+            )
         )
+        val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Scan Library Settings")
-            .setItems(options) { _, which ->
+            .setAdapter(adapter) { _, which ->
                 when (which) {
                     0 -> showScanConfirmationDialog()
                     1 -> {
@@ -2157,6 +2206,7 @@ class MainFragment : BrowseSupportFragment() {
     private fun showScanConfirmationDialog() {
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Perform Scan")
+            .setIcon(R.drawable.ic_sync)
             .setMessage("Scan all configured folders for new or deleted files?")
             .setPositiveButton("Yes") { _, _ -> performLibraryScan() }
             .setNegativeButton("No", null)
@@ -2189,9 +2239,28 @@ class MainFragment : BrowseSupportFragment() {
         val buildTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
             .format(java.util.Date(BuildConfig.BUILD_TIME))
 
-        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        val context = requireContext()
+        val logoSize = (96 * context.resources.displayMetrics.density).toInt()
+        val logo = android.widget.ImageView(context).apply {
+            setImageResource(R.drawable.ic_launcher_foreground)
+            layoutParams = android.widget.LinearLayout.LayoutParams(logoSize, logoSize)
+        }
+        val textView = android.widget.TextView(context).apply {
+            text = "Release: $versionName\nBuild Date: $buildDate\nBuild Time: $buildTime\n\nGitHub: https://github.com/antoxa78/Bitperfect-Player\n\nA high-fidelity music player for Android TV."
+            textSize = 14f
+            setPadding(16, 16, 16, 16)
+        }
+        val layout = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER
+            setPadding(16, 8, 16, 8)
+            addView(logo)
+            addView(textView)
+        }
+
+        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("About Bitperfect Player")
-            .setMessage("Release: $versionName\nBuild Date: $buildDate\nBuild Time: $buildTime\nGitHub: https://github.com/antoxa78/Bitperfect-Player\n\nA high-fidelity music player for Android TV.")
+            .setView(layout)
             .setPositiveButton("OK", null)
             .show()
     }
@@ -2251,6 +2320,25 @@ class MainFragment : BrowseSupportFragment() {
                 val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                 startActivity(intent)
             }
+        }
+    }
+
+    companion object {
+        fun getThemeColor(context: Context): Int {
+            val colors = intArrayOf(
+                0xFF00E676.toInt(), // Neon Green
+                0xFF2979FF.toInt(), // Electric Blue
+                0xFFFFC400.toInt(), // Amber Gold
+                0xFF7C4DFF.toInt(), // Deep Purple
+                0xFFFF4081.toInt(), // Hot Pink
+                0xFF888888.toInt(), // Grey
+                0xFFFF5252.toInt(), // Red
+                0xFF1B5E20.toInt(), // Dark Green
+                0xFFFFFFFF.toInt()  // White
+            )
+            val index = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
+                .getInt("color_scheme", 0)
+            return if (index in colors.indices) colors[index] else colors[0]
         }
     }
 }
