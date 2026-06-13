@@ -14,7 +14,7 @@ android {
         applicationId = "com.example.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 25
+        versionCode = 26
         versionName = "2.3.0"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
