@@ -1,15 +1,34 @@
 package com.example.bitperfectplayer
 
+import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.fragment.app.FragmentActivity
+import kotlin.math.abs
 
 abstract class BaseActivity : FragmentActivity() {
-    protected val screensaverHandler = Handler(Looper.getMainLooper())
+
+    companion object {
+        private const val PREFS_APP           = "AppSettings"
+        private const val KEY_SCREENSAVER     = "screensaver_delay"
+        private const val SCREENSAVER_TAG     = "screensaver_overlay"
+        private const val SCREENSAVER_TEXT_TAG   = "screensaver_text"
+        private const val SCREENSAVER_CONT_TAG   = "screensaver_container"
+        private const val BOUNCE_STEP_PX      = 2
+        private const val BOUNCE_INTERVAL_MS  = 50L
+        private const val TEXT_SIZE_SP        = 32f
+    }
+
+    protected val screensaverHandler  = Handler(Looper.getMainLooper())
     protected val screensaverRunnable = Runnable { showScreensaver() }
-    protected var isScreensaverActive = false
+    protected var isScreensaverActive  = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -17,9 +36,7 @@ abstract class BaseActivity : FragmentActivity() {
 
     override fun onUserInteraction() {
         super.onUserInteraction()
-        if (isScreensaverActive) {
-            hideScreensaver()
-        }
+        if (isScreensaverActive) hideScreensaver()
         resetScreensaverTimer()
     }
 
@@ -35,79 +52,78 @@ abstract class BaseActivity : FragmentActivity() {
 
     protected fun resetScreensaverTimer() {
         screensaverHandler.removeCallbacks(screensaverRunnable)
-        val mins = getSharedPreferences("AppSettings", MODE_PRIVATE).getInt("screensaver_delay", 0)
+        val mins = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_SCREENSAVER, 0)
         if (mins != 0) {
-            val finalMins = Math.abs(mins)
-            screensaverHandler.postDelayed(screensaverRunnable, finalMins * 60 * 1000L)
+            screensaverHandler.postDelayed(screensaverRunnable, abs(mins) * 60_000L)
         }
     }
 
     protected open fun showScreensaver() {
         if (isFinishing || isDestroyed || isScreensaverActive) return
-        if (window.decorView.findViewWithTag<android.view.View>("screensaver_overlay") != null) return
-        
-        val mins = getSharedPreferences("AppSettings", MODE_PRIVATE).getInt("screensaver_delay", 0)
+        if (window.decorView.findViewWithTag<View>(SCREENSAVER_TAG) != null) return
+
+        val mins = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_SCREENSAVER, 0)
         if (mins == 0) return
 
         isScreensaverActive = true
-        val overlay = android.widget.FrameLayout(this)
-        overlay.tag = "screensaver_overlay"
-        overlay.setBackgroundColor(android.graphics.Color.BLACK)
-        overlay.isClickable = true
-        overlay.isFocusable = true
-        
-        val params = android.view.ViewGroup.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT
-        )
-        addContentView(overlay, params)
-        
+
+        // Full-screen black overlay
+        val overlay = FrameLayout(this).apply {
+            tag = SCREENSAVER_TAG
+            setBackgroundColor(Color.BLACK)
+            isClickable  = true
+            isFocusable  = true
+        }
+        addContentView(overlay, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        // Screen-off mode: just a black overlay, nothing more
         if (mins < 0) return
 
-        val container = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            gravity = android.view.Gravity.CENTER
-            tag = "screensaver_container"
+        // Bouncing content container
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity     = Gravity.CENTER
+            tag         = SCREENSAVER_CONT_TAG
         }
-        val containerParams = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        )
-        containerParams.gravity = android.view.Gravity.CENTER
+        val containerParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).also {
+            it.gravity = Gravity.CENTER
+        }
         overlay.addView(container, containerParams)
 
-        val textView = TextView(this)
-        textView.tag = "screensaver_text"
+        val textView = TextView(this).apply {
+            tag       = SCREENSAVER_TEXT_TAG
+            setTextColor(Color.LTGRAY)
+            textSize  = TEXT_SIZE_SP
+            gravity   = Gravity.CENTER
+        }
         updateScreensaverText(textView)
-        textView.setTextColor(android.graphics.Color.LTGRAY)
-        textView.textSize = 32f
-        textView.gravity = android.view.Gravity.CENTER
         container.addView(textView)
-        
+
         onScreensaverCreated(container)
-        
-        val handler = Handler(Looper.getMainLooper())
-        val moveRunnable = object : Runnable {
-            var dx = 2
-            var dy = 2
+
+        // Bouncing animation
+        val bounceHandler = Handler(Looper.getMainLooper())
+        bounceHandler.post(object : Runnable {
+            private var dx = BOUNCE_STEP_PX
+            private var dy = BOUNCE_STEP_PX
+
             override fun run() {
                 if (!isScreensaverActive) return
                 container.translationX += dx
                 container.translationY += dy
-                
-                val width = overlay.width
-                val height = overlay.height
-                if (width > 0 && height > 0) {
-                    if (container.x + container.width > width || container.x < 0) dx = -dx
-                    if (container.y + container.height > height || container.y < 0) dy = -dy
+
+                val ow = overlay.width
+                val oh = overlay.height
+                if (ow > 0 && oh > 0) {
+                    if (container.x + container.width > ow || container.x < 0) dx = -dx
+                    if (container.y + container.height > oh || container.y < 0) dy = -dy
                 }
-                handler.postDelayed(this, 50)
+                bounceHandler.postDelayed(this, BOUNCE_INTERVAL_MS)
             }
-        }
-        handler.post(moveRunnable)
+        })
     }
 
-    protected open fun onScreensaverCreated(container: android.view.ViewGroup) {}
+    protected open fun onScreensaverCreated(container: ViewGroup) {}
 
     protected open fun updateScreensaverText(textView: TextView) {
         textView.text = "Bitperfect Player"
@@ -115,9 +131,8 @@ abstract class BaseActivity : FragmentActivity() {
 
     protected fun hideScreensaver() {
         isScreensaverActive = false
-        val overlay = window.decorView.findViewWithTag<android.view.View>("screensaver_overlay")
-        if (overlay != null) {
-            (overlay.parent as? android.view.ViewGroup)?.removeView(overlay)
+        window.decorView.findViewWithTag<View>(SCREENSAVER_TAG)?.let { overlay ->
+            (overlay.parent as? ViewGroup)?.removeView(overlay)
         }
     }
 }

@@ -34,6 +34,8 @@ class MainFragment : BrowseSupportFragment() {
     private val KEY_AUTO_SCAN = "auto_scan"
     private val KEY_COLOR_SCHEME = "color_scheme"
     private val KEY_WAVEFORM_TYPE = "waveform_type"
+    private val KEY_NETWORK_BUFFER = "network_buffer"
+    private val KEY_AUTO_RECONNECT = "auto_reconnect"
     private var hasAttemptedResume = false
     private var lastSelectedRowId = -1L
     private var lastSelectedColumn = 0
@@ -75,19 +77,23 @@ class MainFragment : BrowseSupportFragment() {
             viewLifecycleOwner,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    val activity = activity as? MainActivity
-                    AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle("Exit")
-                        .setMessage("Are you sure you want to exit?")
-                        .setPositiveButton("Yes") { _, _ ->
-                            activity?.stopService(
-                                android.content.Intent(requireContext(), PlaybackService::class.java)
-                            )
-                            activity?.finishAffinity()
-                            System.exit(0)
-                        }
-                        .setNegativeButton("No", null)
-                        .show()
+                    if (!isShowingHeaders) {
+                        startHeadersTransition(true)
+                    } else {
+                        val activity = activity as? MainActivity
+                        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                            .setTitle("Exit")
+                            .setMessage("Are you sure you want to exit?")
+                            .setPositiveButton("Yes") { _, _ ->
+                                activity?.stopService(
+                                    android.content.Intent(requireContext(), PlaybackService::class.java)
+                                )
+                                activity?.finishAffinity()
+                                System.exit(0)
+                            }
+                            .setNegativeButton("No", null)
+                            .show()
+                    }
                 }
             }
         )
@@ -208,6 +214,7 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("Screensaver", "Delay: ${getScreensaverLabel()}"))
         settingsAdapter.add(createActionItem("Resume Playback", if (isResumeEnabled()) "Enabled" else "Disabled"))
         settingsAdapter.add(createActionItem("Recent Files", "Settings and cleanup"))
+        settingsAdapter.add(createActionItem("Network Settings", "Buffer and streaming options"))
         settingsAdapter.add(createActionItem("Scan Library", "Options: ${if (isAutoScanEnabled()) "Auto" else "Manual"}"))
         settingsAdapter.add(createActionItem("Waveform Type", "Current: ${getWaveformTypeName()}"))
         settingsAdapter.add(createActionItem("Player Color Scheme", "Current: ${getColorSchemeName()}"))
@@ -2220,6 +2227,43 @@ class MainFragment : BrowseSupportFragment() {
         refreshWithCurrentFocus()
     }
 
+    private fun showNetworkSettingsMenu() {
+        val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val isEnabled = prefs.getBoolean(KEY_NETWORK_BUFFER, true)
+        val isReconnectEnabled = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
+        val items = listOf(
+            DialogOptionItem(
+                if (isEnabled) "Enhanced Network Buffer: Enabled" else "Enhanced Network Buffer: Disabled",
+                R.drawable.ic_network
+            ),
+            DialogOptionItem(
+                if (isReconnectEnabled) "Auto Reconnect (Radio): Enabled" else "Auto Reconnect (Radio): Disabled",
+                R.drawable.ic_sync
+            )
+        )
+        val adapter = DialogOptionAdapter(requireContext(), items)
+        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Network Settings")
+            .setAdapter(adapter) { _, which ->
+                when (which) {
+                    0 -> {
+                        val current = prefs.getBoolean(KEY_NETWORK_BUFFER, true)
+                        prefs.edit().putBoolean(KEY_NETWORK_BUFFER, !current).apply()
+                        showNetworkSettingsMenu()
+                        refreshWithCurrentFocus()
+                    }
+                    1 -> {
+                        val current = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
+                        prefs.edit().putBoolean(KEY_AUTO_RECONNECT, !current).apply()
+                        showNetworkSettingsMenu()
+                        refreshWithCurrentFocus()
+                    }
+                }
+            }
+            .setNegativeButton("Back", null)
+            .show()
+    }
+
     private fun performLibraryScan() {
         Toast.makeText(requireContext(), "Scanning library...", Toast.LENGTH_SHORT).show()
         updatePlaylistRow()
@@ -2288,6 +2332,9 @@ class MainFragment : BrowseSupportFragment() {
             }
             actionId == "action:Recent Files" -> {
                 showRecentFilesMenu()
+            }
+            actionId == "action:Network Settings" -> {
+                showNetworkSettingsMenu()
             }
             actionId == "action:Music Folders" -> {
                 manageMusicFolders()

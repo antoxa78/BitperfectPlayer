@@ -13,6 +13,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -22,27 +23,41 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 
 class MainActivity : BaseActivity() {
+
+    companion object {
+        private const val PREFS_APP        = "AppSettings"
+        private const val KEY_COLOR_SCHEME = "color_scheme"
+        private const val KEY_WAVEFORM     = "waveform_type"
+        private const val REQUEST_FILES    = 2001
+        private const val REQUEST_PERMS    = 1
+    }
+
     private var mediaController: MediaController? = null
     private var controllerFuture: ListenableFuture<MediaController>? = null
 
     private val pickFileLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        if (uris != null && uris.isNotEmpty()) {
-            addUrisToPlaylist(uris)
-        }
+        if (!uris.isNullOrEmpty()) addUrisToPlaylist(uris)
     }
+
+    // ---------------------------------------------------------------------------
+    // Lifecycle
+    // ---------------------------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        val prefs = getSharedPreferences("AppSettings", MODE_PRIVATE)
+        // Write defaults on first run only
+        val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
         if (!prefs.contains("screensaver_delay")) {
             prefs.edit()
-                .putInt("screensaver_delay", 1)
+                .putInt("screensaver_delay",   1)
                 .putBoolean("resume_playback", true)
-                .putBoolean("auto_scan", true)
-                .putInt("waveform_type", 4)
-                .putInt("color_scheme", 5)
+                .putBoolean("auto_scan",       true)
+                .putBoolean("network_buffer",  true)
+                .putBoolean("auto_reconnect",  true)
+                .putInt(KEY_WAVEFORM,          4)
+                .putInt(KEY_COLOR_SCHEME,      5)
                 .apply()
         }
 
@@ -54,18 +69,12 @@ class MainActivity : BaseActivity() {
             try {
                 mediaController = controllerFuture?.get()
                 mediaController?.addListener(object : Player.Listener {
-                    override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
-                        refreshScreensaver()
-                    }
-                    override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        refreshScreensaver()
-                    }
-                    override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
-                        refreshScreensaver()
-                    }
+                    override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) { refreshScreensaver() }
+                    override fun onIsPlayingChanged(isPlaying: Boolean)               { refreshScreensaver() }
+                    override fun onTracksChanged(tracks: androidx.media3.common.Tracks) { refreshScreensaver() }
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
-                            screensaverHandler.postDelayed({ refreshScreensaver() }, 2000)
+                            screensaverHandler.postDelayed({ refreshScreensaver() }, 2_000)
                         }
                     }
                 })
@@ -75,18 +84,24 @@ class MainActivity : BaseActivity() {
         }, MoreExecutors.directExecutor())
     }
 
+    override fun onDestroy() {
+        controllerFuture?.let { MediaController.releaseFuture(it) }
+        super.onDestroy()
+    }
+
+    fun getController(): MediaController? = mediaController
+
+    // ---------------------------------------------------------------------------
+    // Screensaver
+    // ---------------------------------------------------------------------------
+
     private fun refreshScreensaver() {
-        if (isScreensaverActive) {
-            val screensaverText = window.decorView.findViewWithTag<TextView>("screensaver_text")
-            if (screensaverText != null) {
-                updateScreensaverText(screensaverText)
-            }
-            val screensaverWaveform = window.decorView.findViewWithTag<AnimatedWaveformView>("screensaver_waveform")
-            screensaverWaveform?.setPlaying(mediaController?.isPlaying == true)
-            val waveType = getSharedPreferences("AppSettings", MODE_PRIVATE).getInt("waveform_type", 0)
-            screensaverWaveform?.setWaveformType(waveType)
-            screensaverWaveform?.setColor(getThemeColor())
-        }
+        if (!isScreensaverActive) return
+        window.decorView.findViewWithTag<TextView>("screensaver_text")?.let { updateScreensaverText(it) }
+        val waveform = window.decorView.findViewWithTag<AnimatedWaveformView>("screensaver_waveform")
+        waveform?.setPlaying(mediaController?.isPlaying == true)
+        waveform?.setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM, 0))
+        waveform?.setColor(getThemeColor())
     }
 
     override fun updateScreensaverText(textView: TextView) {
@@ -95,86 +110,65 @@ class MainActivity : BaseActivity() {
             textView.text = "Bitperfect Player"
             return
         }
-        
-        val metadata = controller.mediaMetadata
-        val title = metadata.title?.toString() ?: "Bitperfect Player"
-        val artist = metadata.artist?.toString() ?: ""
-        
+        val title  = controller.mediaMetadata.title?.toString() ?: "Bitperfect Player"
+        val artist = controller.mediaMetadata.artist?.toString() ?: ""
         textView.text = if (artist.isNotEmpty()) "Now Playing:\n$title\n$artist" else "Now Playing:\n$title"
         textView.textAlignment = android.view.View.TEXT_ALIGNMENT_CENTER
     }
 
-    private fun getThemeColor(): Int {
-        val colors = intArrayOf(
-            0xFF00E676.toInt(), // Neon Green
-            0xFF2979FF.toInt(), // Electric Blue
-            0xFFFFC400.toInt(), // Amber Gold
-            0xFF7C4DFF.toInt(), // Deep Purple
-            0xFFFF4081.toInt(), // Hot Pink
-            0xFF888888.toInt(), // Grey
-            0xFFFF5252.toInt(), // Red
-            0xFF1B5E20.toInt(), // Dark Green
-            0xFFFFFFFF.toInt()  // White
-        )
-        val index = getSharedPreferences("AppSettings", MODE_PRIVATE).getInt("color_scheme", 0)
-        return if (index in colors.indices) colors[index] else colors[0]
-    }
-
     override fun onScreensaverCreated(container: android.view.ViewGroup) {
-        val waveform = AnimatedWaveformView(this).apply {
+        val density = resources.displayMetrics.density
+        AnimatedWaveformView(this).apply {
             tag = "screensaver_waveform"
-            val density = resources.displayMetrics.density
             layoutParams = android.widget.LinearLayout.LayoutParams(
                 (400 * density).toInt(),
                 (64 * density).toInt()
-            ).apply {
-                topMargin = (24 * density).toInt()
-            }
+            ).also { it.topMargin = (24 * density).toInt() }
             setPlaying(mediaController?.isPlaying == true)
-            val waveType = getSharedPreferences("AppSettings", MODE_PRIVATE).getInt("waveform_type", 0)
-            setWaveformType(waveType)
+            setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM, 0))
             setColor(getThemeColor())
+            container.addView(this)
         }
-        container.addView(waveform)
     }
+
+    private fun getThemeColor(): Int {
+        val index = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
+        return if (index in CardPresenter.THEME_COLORS.indices)
+            CardPresenter.THEME_COLORS[index]
+        else
+            CardPresenter.THEME_COLORS[0]
+    }
+
+    // ---------------------------------------------------------------------------
+    // Playlist management
+    // ---------------------------------------------------------------------------
 
     private fun addUrisToPlaylist(uris: List<Uri>) {
         val controller = mediaController ?: return
-        
+
         Thread {
             val allItems = mutableListOf<MediaItem>()
             for (uri in uris) {
                 val fileName = uri.lastPathSegment?.lowercase() ?: ""
                 when {
-                    fileName.endsWith(".m3u") || fileName.endsWith(".m3u8") -> {
-                        allItems.addAll(parseM3u(uri))
-                    }
-                    fileName.endsWith(".pls") -> {
-                        allItems.addAll(parsePls(uri))
-                    }
-                    else -> {
-                        allItems.add(createMediaItem(uri))
-                    }
+                    fileName.endsWith(".m3u") || fileName.endsWith(".m3u8") -> allItems.addAll(parseM3u(uri))
+                    fileName.endsWith(".pls")                               -> allItems.addAll(parsePls(uri))
+                    else                                                    -> allItems.add(createMediaItem(uri))
                 }
             }
 
             runOnUiThread {
-                if (allItems.isNotEmpty()) {
-                    // Collect current items and add new ones to avoid issues with addMediaItems on some devices
-                    val currentItems = mutableListOf<MediaItem>()
-                    for (i in 0 until controller.mediaItemCount) {
-                        currentItems.add(controller.getMediaItemAt(i))
-                    }
-                    currentItems.addAll(allItems)
-                    
-                    controller.setMediaItems(currentItems)
-                    
-                    if (controller.playbackState == Player.STATE_IDLE || controller.playbackState == Player.STATE_ENDED) {
-                        controller.prepare()
-                        controller.play()
-                    }
-                    Toast.makeText(this, "Playlist: ${currentItems.size} items total", Toast.LENGTH_SHORT).show()
+                if (allItems.isEmpty()) return@runOnUiThread
+                // Collect existing items and append new ones atomically to avoid per-add glitches
+                val existing = (0 until controller.mediaItemCount).map { controller.getMediaItemAt(it) }
+                val merged   = existing + allItems
+                controller.setMediaItems(merged)
+
+                if (controller.playbackState == Player.STATE_IDLE || controller.playbackState == Player.STATE_ENDED) {
+                    controller.prepare()
+                    controller.play()
                 }
+                Toast.makeText(this, "Playlist: ${merged.size} items total", Toast.LENGTH_SHORT).show()
             }
         }.start()
     }
@@ -182,22 +176,12 @@ class MainActivity : BaseActivity() {
     private fun createMediaItem(uri: Uri): MediaItem {
         try {
             contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        } catch (e: Exception) {}
-
-        val lower = uri.toString().lowercase()
-        val mimeType = when {
-            lower.endsWith(".flac") -> androidx.media3.common.MimeTypes.AUDIO_FLAC
-            lower.endsWith(".mp3") -> androidx.media3.common.MimeTypes.AUDIO_MPEG
-            lower.endsWith(".wav") -> androidx.media3.common.MimeTypes.AUDIO_WAV
-            lower.endsWith(".m4a") || lower.endsWith(".aac") -> androidx.media3.common.MimeTypes.AUDIO_AAC
-            lower.endsWith(".ogg") -> androidx.media3.common.MimeTypes.AUDIO_OGG
-            else -> null
-        }
+        } catch (_: Exception) {}
 
         return MediaItem.Builder()
             .setMediaId(uri.toString())
             .setUri(uri)
-            .setMimeType(mimeType)
+            .setMimeType(mimeTypeFor(uri.toString()))
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(uri.lastPathSegment ?: "Unknown")
@@ -206,16 +190,19 @@ class MainActivity : BaseActivity() {
             .build()
     }
 
+    // ---------------------------------------------------------------------------
+    // Playlist parsers
+    // ---------------------------------------------------------------------------
+
     fun parseM3u(uri: Uri, basePath: String? = null): List<MediaItem> {
-        try {
+        return try {
             contentResolver.openInputStream(uri)?.use { inputStream ->
-                val finalBasePath = basePath ?: if (uri.scheme == "file") uri.path?.substringBeforeLast("/") else null
-                return parseM3uFromStream(inputStream, finalBasePath)
-            }
+                val finalBase = basePath ?: if (uri.scheme == "file") uri.path?.substringBeforeLast("/") else null
+                parseM3uFromStream(inputStream, finalBase)
+            } ?: emptyList()
         } catch (e: Exception) {
-            e.printStackTrace()
+            e.printStackTrace(); emptyList()
         }
-        return emptyList()
     }
 
     fun parseM3uFromStream(inputStream: java.io.InputStream, basePath: String? = null): List<MediaItem> {
@@ -224,264 +211,199 @@ class MainActivity : BaseActivity() {
             val reader = BufferedReader(InputStreamReader(inputStream))
             var line: String?
             var currentTitle: String? = null
-            
+
             while (reader.readLine().also { line = it } != null) {
-                var trimmed = line!!.trim()
+                var trimmed = line!!.trim().removePrefix("\uFEFF")
                 if (trimmed.isEmpty()) continue
-                
-                // Handle UTF-8 BOM
-                if (trimmed.startsWith("\uFEFF")) {
-                    trimmed = trimmed.substring(1)
-                }
 
                 if (trimmed.startsWith("#EXTINF:")) {
-                    // Extract title after the comma
-                    val commaIndex = trimmed.indexOf(",")
-                    if (commaIndex != -1) {
-                        currentTitle = trimmed.substring(commaIndex + 1)
-                    }
+                    val comma = trimmed.indexOf(',')
+                    if (comma != -1) currentTitle = trimmed.substring(comma + 1)
                 } else if (!trimmed.startsWith("#")) {
-                    // Normalize backslashes for cross-platform compatibility
+                    // Normalise Windows path separators
                     val normalizedPath = trimmed.replace("\\", "/")
-                    var itemUriString = normalizedPath
-                    
-                    if (basePath != null && !normalizedPath.contains("://") && !normalizedPath.startsWith("/")) {
-                        if (basePath.contains("%2F") && !basePath.startsWith("file://")) {
-                            // Likely a SAF URI where / is encoded as %2F
-                            val encodedPath = Uri.encode(normalizedPath).replace("/", "%2F")
-                            itemUriString = if (basePath.endsWith("%2F")) basePath + encodedPath else "$basePath%2F$encodedPath"
-                        } else {
-                            if (basePath.endsWith("/")) itemUriString = basePath + normalizedPath else itemUriString = "$basePath/$normalizedPath"
-                        }
+                    val itemUriString  = resolveRelativePath(normalizedPath, basePath)
+                    val itemUri        = parseEntryUri(itemUriString, basePath) ?: run { currentTitle = null; continue }
+
+                    val metaBuilder = MediaMetadata.Builder()
+                    var finalTitle  = currentTitle ?: itemUri.lastPathSegment ?: trimmed
+                    if (finalTitle.contains(" - ")) {
+                        val parts = finalTitle.split(" - ", limit = 2)
+                        metaBuilder.setArtist(parts[0].trim())
+                        finalTitle = parts[1].trim()
                     }
 
-                    val itemUri = try {
-                        when {
-                            itemUriString.startsWith("/") -> Uri.fromFile(java.io.File(itemUriString))
-                            itemUriString.startsWith("file://") -> {
-                                val path = itemUriString.substring(7)
-                                Uri.fromFile(java.io.File(path))
-                            }
-                            itemUriString.startsWith("content://") ||
-                            itemUriString.startsWith("http://") || itemUriString.startsWith("https://") ||
-                            itemUriString.startsWith("smb://") -> Uri.parse(itemUriString)
-                            else -> if (basePath == null && itemUriString.startsWith("primary%3A")) {
-                                // Likely a partial SAF path, try to parse
-                                Uri.parse(itemUriString)
-                            } else null
-                        }
-                    } catch (e: Exception) { null }
-
-                    if (itemUri != null) {
-                        val lowercaseUrl = itemUri.toString().lowercase()
-                        val mimeType = when {
-                            lowercaseUrl.endsWith(".flac") -> androidx.media3.common.MimeTypes.AUDIO_FLAC
-                            lowercaseUrl.endsWith(".mp3") -> androidx.media3.common.MimeTypes.AUDIO_MPEG
-                            lowercaseUrl.endsWith(".wav") -> androidx.media3.common.MimeTypes.AUDIO_WAV
-                            lowercaseUrl.endsWith(".m4a") || lowercaseUrl.endsWith(".aac") -> androidx.media3.common.MimeTypes.AUDIO_AAC
-                            lowercaseUrl.endsWith(".ogg") -> androidx.media3.common.MimeTypes.AUDIO_OGG
-                            else -> null
-                        }
-
-                        val metadataBuilder = MediaMetadata.Builder()
-                        var finalTitle = currentTitle ?: itemUri.lastPathSegment ?: trimmed
-                        
-                        if (finalTitle.contains(" - ")) {
-                            val parts = finalTitle.split(" - ", limit = 2)
-                            metadataBuilder.setArtist(parts[0].trim())
-                            finalTitle = parts[1].trim()
-                        }
-                        
-                        items.add(
-                            MediaItem.Builder()
-                                .setMediaId(itemUri.toString())
-                                .setUri(itemUri)
-                                .setMimeType(mimeType)
-                                .setMediaMetadata(metadataBuilder.setTitle(finalTitle).build())
-                                .build()
-                        )
-                    }
-                    currentTitle = null // Reset for next item
+                    items.add(
+                        MediaItem.Builder()
+                            .setMediaId(itemUri.toString())
+                            .setUri(itemUri)
+                            .setMimeType(mimeTypeFor(itemUri.toString()))
+                            .setMediaMetadata(metaBuilder.setTitle(finalTitle).build())
+                            .build()
+                    )
+                    currentTitle = null
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
         return items
     }
 
     fun parsePls(uri: Uri, basePath: String? = null): List<MediaItem> {
-        try {
+        return try {
             contentResolver.openInputStream(uri)?.use { inputStream ->
-                val finalBasePath = basePath ?: if (uri.scheme == "file") uri.path?.substringBeforeLast("/") else null
-                return parsePlsFromStream(inputStream, finalBasePath)
-            }
+                val finalBase = basePath ?: if (uri.scheme == "file") uri.path?.substringBeforeLast("/") else null
+                parsePlsFromStream(inputStream, finalBase)
+            } ?: emptyList()
         } catch (e: Exception) {
-            e.printStackTrace()
+            e.printStackTrace(); emptyList()
         }
-        return emptyList()
     }
 
     fun parsePlsFromStream(inputStream: java.io.InputStream, basePath: String? = null): List<MediaItem> {
         val items = mutableListOf<MediaItem>()
         try {
             val reader = BufferedReader(InputStreamReader(inputStream))
-            val props = linkedMapOf<String, String>()
+            val props  = linkedMapOf<String, String>()
             var line: String?
             while (reader.readLine().also { line = it } != null) {
-                var trimmed = line!!.trim()
+                var trimmed = line!!.trim().removePrefix("\uFEFF")
                 if (trimmed.isEmpty() || trimmed.startsWith("[")) continue
-                
-                // Handle UTF-8 BOM
-                if (trimmed.startsWith("\uFEFF")) {
-                    trimmed = trimmed.substring(1)
-                }
-
-                val eq = trimmed.indexOf("=")
-                if (eq != -1) {
-                    val key = trimmed.substring(0, eq).trim().lowercase()
-                    val value = trimmed.substring(eq + 1).trim()
-                    props[key] = value
-                }
+                val eq = trimmed.indexOf('=')
+                if (eq != -1) props[trimmed.substring(0, eq).trim().lowercase()] = trimmed.substring(eq + 1).trim()
             }
+
             val count = props.remove("numberofentries")?.toIntOrNull() ?: 0
             for (i in 1..count) {
                 val file = props.remove("file$i") ?: continue
-                // Normalize backslashes
                 val normalizedPath = file.replace("\\", "/")
-                var itemUriString = normalizedPath
-                
-                if (basePath != null && !normalizedPath.contains("://") && !normalizedPath.startsWith("/")) {
-                    if (basePath.contains("%2F") && !basePath.startsWith("file://")) {
-                        val encodedPath = Uri.encode(normalizedPath).replace("/", "%2F")
-                        itemUriString = if (basePath.endsWith("%2F")) basePath + encodedPath else "$basePath%2F$encodedPath"
-                    } else {
-                        if (basePath.endsWith("/")) itemUriString = basePath + normalizedPath else itemUriString = "$basePath/$normalizedPath"
-                    }
-                }
+                val itemUriString  = resolveRelativePath(normalizedPath, basePath)
+                val itemUri        = parseEntryUri(itemUriString, basePath) ?: continue
 
-                val itemUri = try {
-                    when {
-                        itemUriString.startsWith("/") -> Uri.fromFile(java.io.File(itemUriString))
-                        itemUriString.startsWith("file://") -> {
-                            val path = itemUriString.substring(7)
-                            Uri.fromFile(java.io.File(path))
-                        }
-                        itemUriString.startsWith("content://") ||
-                        itemUriString.startsWith("http://") || itemUriString.startsWith("https://") ||
-                        itemUriString.startsWith("smb://") -> Uri.parse(itemUriString)
-                        else -> null
-                    }
-                } catch (e: Exception) { null }
+                var finalTitle = props.remove("title$i")
+                    ?: itemUri.lastPathSegment
+                    ?: itemUriString.substringAfterLast("/").substringBeforeLast(".")
+                props.remove("length$i") // consume but ignore
 
-                if (itemUri != null) {
-                    val title = props.remove("title$i") ?: itemUri.lastPathSegment ?: itemUriString.substringAfterLast("/").substringBeforeLast(".")
-                    val length = props.remove("length$i")
-                    val lowercaseUrl = itemUri.toString().lowercase()
-                    val mimeType = when {
-                        lowercaseUrl.endsWith(".flac") -> androidx.media3.common.MimeTypes.AUDIO_FLAC
-                        lowercaseUrl.endsWith(".mp3") -> androidx.media3.common.MimeTypes.AUDIO_MPEG
-                        lowercaseUrl.endsWith(".wav") -> androidx.media3.common.MimeTypes.AUDIO_WAV
-                        lowercaseUrl.endsWith(".m4a") || lowercaseUrl.endsWith(".aac") -> androidx.media3.common.MimeTypes.AUDIO_AAC
-                        lowercaseUrl.endsWith(".ogg") -> androidx.media3.common.MimeTypes.AUDIO_OGG
-                        else -> null
-                    }
-                    val metadataBuilder = MediaMetadata.Builder()
-                    var finalTitle = title
-                    if (finalTitle.contains(" - ")) {
-                        val parts = finalTitle.split(" - ", limit = 2)
-                        metadataBuilder.setArtist(parts[0].trim())
-                        finalTitle = parts[1].trim()
-                    }
-                    items.add(
-                        MediaItem.Builder()
-                            .setMediaId(itemUri.toString())
-                            .setUri(itemUri)
-                            .setMimeType(mimeType)
-                            .setMediaMetadata(metadataBuilder.setTitle(finalTitle).build())
-                            .build()
-                    )
+                val metaBuilder = MediaMetadata.Builder()
+                if (finalTitle.contains(" - ")) {
+                    val parts = finalTitle.split(" - ", limit = 2)
+                    metaBuilder.setArtist(parts[0].trim())
+                    finalTitle = parts[1].trim()
                 }
+                items.add(
+                    MediaItem.Builder()
+                        .setMediaId(itemUri.toString())
+                        .setUri(itemUri)
+                        .setMimeType(mimeTypeFor(itemUri.toString()))
+                        .setMediaMetadata(metaBuilder.setTitle(finalTitle).build())
+                        .build()
+                )
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
         return items
     }
 
+    // ---------------------------------------------------------------------------
+    // File picker (legacy ACTION_GET_CONTENT fallback used by some Android TV devices)
+    // ---------------------------------------------------------------------------
+
     fun pickFiles() {
         try {
-            val intent = android.content.Intent(android.content.Intent.ACTION_GET_CONTENT)
-            intent.type = "audio/*"
-            intent.putExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, true)
-            intent.addCategory(android.content.Intent.CATEGORY_OPENABLE)
-            
-            // Define MIME types explicitly to include playlists
-            val mimeTypes = arrayOf(
-                "audio/*", 
-                "application/octet-stream", 
-                "application/x-mpegurl", 
-                "audio/mpegurl",
-                "audio/x-mpegurl"
-            )
-            intent.putExtra(android.content.Intent.EXTRA_MIME_TYPES, mimeTypes)
-            
-            startActivityForResult(intent, 2001)
+            val intent = android.content.Intent(android.content.Intent.ACTION_GET_CONTENT).apply {
+                type = "audio/*"
+                putExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, true)
+                addCategory(android.content.Intent.CATEGORY_OPENABLE)
+                putExtra(
+                    android.content.Intent.EXTRA_MIME_TYPES,
+                    arrayOf("audio/*", "application/octet-stream", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl")
+                )
+            }
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, REQUEST_FILES)
         } catch (e: Exception) {
             Toast.makeText(this, "File manager not found.", Toast.LENGTH_LONG).show()
         }
     }
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 2001 && resultCode == RESULT_OK) {
+        if (requestCode == REQUEST_FILES && resultCode == RESULT_OK) {
             val uris = mutableListOf<Uri>()
-            data?.let {
-                if (it.clipData != null) {
-                    val count = it.clipData!!.itemCount
-                    for (i in 0 until count) {
-                        uris.add(it.clipData!!.getItemAt(i).uri)
-                    }
-                } else if (it.data != null) {
-                    uris.add(it.data!!)
-                }
-            }
-            if (uris.isNotEmpty()) {
-                addUrisToPlaylist(uris)
-            }
+            data?.clipData?.let { clip -> repeat(clip.itemCount) { uris.add(clip.getItemAt(it).uri) } }
+                ?: data?.data?.let { uris.add(it) }
+            if (uris.isNotEmpty()) addUrisToPlaylist(uris)
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Permissions
+    // ---------------------------------------------------------------------------
+
     private fun checkPermissions() {
-        val permissions = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-        }
+        val needed = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.READ_MEDIA_AUDIO)
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+        }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
 
-        val toRequest = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (toRequest.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, toRequest.toTypedArray(), 1)
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQUEST_PERMS)
         }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        val fragment = supportFragmentManager.findFragmentById(R.id.main_browse_fragment) as? MainFragment
-        fragment?.refreshWithCurrentFocus()
+        (supportFragmentManager.findFragmentById(R.id.main_browse_fragment) as? MainFragment)
+            ?.refreshWithCurrentFocus()
     }
 
-    override fun onDestroy() {
-        controllerFuture?.let {
-            MediaController.releaseFuture(it)
+    // ---------------------------------------------------------------------------
+    // Private helpers
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Resolves a relative playlist entry path against [basePath], handling both
+     * regular filesystem paths and SAF (Storage Access Framework) URIs.
+     */
+    private fun resolveRelativePath(path: String, basePath: String?): String {
+        if (basePath == null || path.contains("://") || path.startsWith("/")) return path
+        return when {
+            basePath.contains("%2F") && !basePath.startsWith("file://") -> {
+                val encoded = Uri.encode(path).replace("/", "%2F")
+                if (basePath.endsWith("%2F")) "$basePath$encoded" else "$basePath%2F$encoded"
+            }
+            basePath.endsWith("/") -> "$basePath$path"
+            else -> "$basePath/$path"
         }
-        super.onDestroy()
     }
-    
-    fun getController(): MediaController? = mediaController
+
+    private fun parseEntryUri(uriString: String, basePath: String?): Uri? = try {
+        when {
+            uriString.startsWith("/")          -> Uri.fromFile(java.io.File(uriString))
+            uriString.startsWith("file://")    -> Uri.fromFile(java.io.File(uriString.substring(7)))
+            uriString.startsWith("content://") ||
+            uriString.startsWith("http://")    ||
+            uriString.startsWith("https://")   ||
+            uriString.startsWith("smb://")     -> Uri.parse(uriString)
+            // Last-ditch attempt: partial SAF path
+            basePath == null && uriString.startsWith("primary%3A") -> Uri.parse(uriString)
+            else -> null
+        }
+    } catch (e: Exception) { null }
+
+    private fun mimeTypeFor(uriString: String): String? {
+        val lower = uriString.lowercase()
+        return when {
+            lower.endsWith(".flac")               -> MimeTypes.AUDIO_FLAC
+            lower.endsWith(".mp3")                -> MimeTypes.AUDIO_MPEG
+            lower.endsWith(".wav")                -> MimeTypes.AUDIO_WAV
+            lower.endsWith(".m4a") || lower.endsWith(".aac") -> MimeTypes.AUDIO_AAC
+            lower.endsWith(".ogg")                -> MimeTypes.AUDIO_OGG
+            else                                  -> null
+        }
+    }
 }
