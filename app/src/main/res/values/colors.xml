@@ -1,10 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="purple_200">#FFBB86FC</color>
-    <color name="purple_500">#FF6200EE</color>
-    <color name="purple_700">#FF3700B3</color>
-    <color name="teal_200">#FF03DAC5</color>
-    <color name="teal_700">#FF018786</color>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
+    <!-- App brand / accent colours -->
+    <color name="accent_green">#FF00E676</color>
+    <color name="accent_blue">#FF2979FF</color>
+    <color name="accent_amber">#FFFFC400</color>
+    <color name="accent_purple">#FF7C4DFF</color>
+    <color name="accent_pink">#FFFF4081</color>
+    <color name="accent_grey">#FF888888</color>
+    <color name="accent_red">#FFFF5252</color>
+
+    <!-- Background shades -->
+    <color name="bg_dark">#FF121212</color>
+    <color name="bg_pure_black">#FF000000</color>
+
+    <!-- Text -->
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#FFAAAAAA</color>
+
+    <!-- Leanback sidebar brand (default) -->
+    <color name="brand_color">#FF1B5E20</color>
 </resources>

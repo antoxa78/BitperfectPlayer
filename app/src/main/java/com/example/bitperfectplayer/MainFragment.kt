@@ -9,7 +9,6 @@ import android.view.View
 import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
-import androidx.core.content.ContextCompat
 import androidx.leanback.app.BrowseSupportFragment
 import androidx.leanback.app.RowsSupportFragment
 import androidx.leanback.widget.*
@@ -121,8 +120,8 @@ class MainFragment : BrowseSupportFragment() {
         title = "Bitperfect Player"
         headersState = HEADERS_ENABLED
         isHeadersTransitionOnBackEnabled = true
-        // Main menu uses a fixed standard color regardless of theme
-        brandColor = ContextCompat.getColor(requireContext(), R.color.purple_700)
+        // Sidebar brand color follows the current color scheme
+        brandColor = getThemeColor(requireContext())
     }
 
     fun refreshRows(targetRowId: Long = -1L, selectedColumn: Int = -1) {
@@ -2276,10 +2275,10 @@ class MainFragment : BrowseSupportFragment() {
         val versionName = try {
             requireContext().packageManager.getPackageInfo(requireContext().packageName, 0).versionName
         } catch (e: Exception) { "Unknown" }
-        
+
         val buildDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-            .format(java.util.Date())
-        
+            .format(java.util.Date(BuildConfig.BUILD_TIME))
+
         val buildTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
             .format(java.util.Date(BuildConfig.BUILD_TIME))
 
@@ -2290,7 +2289,7 @@ class MainFragment : BrowseSupportFragment() {
             layoutParams = android.widget.LinearLayout.LayoutParams(logoSize, logoSize)
         }
         val textView = android.widget.TextView(context).apply {
-            text = "Release: $versionName\nBuild Date: $buildDate\nBuild Time: $buildTime\n\nGitHub: https://github.com/antoxa78/Bitperfect-Player\n\nA high-fidelity music player for Android TV."
+            text = "Release: $versionName\nBuild Date: $buildDate\nBuild Time: $buildTime\n\nGitHub: https://github.com/antoxa78/BitperfectPlayer\n\nA high-fidelity music player for Android TV."
             textSize = 14f
             setPadding(16, 16, 16, 16)
         }

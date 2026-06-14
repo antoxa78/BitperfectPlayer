@@ -5,43 +5,43 @@
     android:orientation="vertical"
     android:padding="24dp">
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Add SMB Source"
-        android:textSize="20sp"
-        android:textStyle="bold"
-        android:layout_marginBottom="16dp"/>
-
     <EditText
         android:id="@+id/edit_ip"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="IP Address (e.g. 192.168.1.100)"
+        android:hint="@string/smb_ip_hint"
         android:inputType="text"
-        android:layout_marginBottom="8dp"/>
+        android:layout_marginBottom="8dp"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#888888" />
 
     <EditText
         android:id="@+id/edit_share_name"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Share Name (e.g. Music)"
+        android:hint="@string/smb_share_hint"
         android:inputType="text"
-        android:layout_marginBottom="8dp"/>
+        android:layout_marginBottom="8dp"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#888888" />
 
     <EditText
         android:id="@+id/edit_username"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Username"
+        android:hint="@string/smb_username_hint"
         android:inputType="text"
-        android:layout_marginBottom="8dp"/>
+        android:layout_marginBottom="8dp"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#888888" />
 
     <EditText
         android:id="@+id/edit_password"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Password"
-        android:inputType="textPassword" />
+        android:hint="@string/smb_password_hint"
+        android:inputType="textPassword"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#888888" />
 
 </LinearLayout>
