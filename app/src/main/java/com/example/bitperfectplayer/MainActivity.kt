@@ -6,11 +6,15 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ImageSpan
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
@@ -110,9 +114,36 @@ class MainActivity : BaseActivity() {
             textView.text = "Bitperfect Player"
             return
         }
-        val title  = controller.mediaMetadata.title?.toString() ?: "Bitperfect Player"
-        val artist = controller.mediaMetadata.artist?.toString() ?: ""
-        textView.text = if (artist.isNotEmpty()) "Now Playing:\n$title\n$artist" else "Now Playing:\n$title"
+        val metadata = controller.mediaMetadata
+        val title  = metadata.title?.toString() ?: "Bitperfect Player"
+        val artist = metadata.artist?.toString() ?: ""
+        val album = metadata.albumTitle?.toString() ?: ""
+
+        val sb = SpannableStringBuilder()
+        sb.append("Now Playing:\n\n")
+
+        val iconColor = android.graphics.Color.LTGRAY
+        val iconSize = (textView.textSize * 1.2f).toInt()
+
+        fun appendRow(text: String, iconRes: Int) {
+            if (text.isBlank()) return
+            val start = sb.length
+            sb.append("  ") // placeholder
+            val drawable = androidx.core.content.ContextCompat.getDrawable(this, iconRes)?.mutate()?.apply {
+                setTint(iconColor)
+                setBounds(0, 0, iconSize, iconSize)
+            }
+            if (drawable != null) {
+                sb.setSpan(ImageSpan(drawable, ImageSpan.ALIGN_BOTTOM), start, start + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            sb.append(text).append("\n")
+        }
+
+        appendRow(title, R.drawable.ic_audio)
+        appendRow(artist, R.drawable.ic_artist)
+        appendRow(album, R.drawable.ic_album_art)
+
+        textView.text = sb
         textView.textAlignment = android.view.View.TEXT_ALIGNMENT_CENTER
     }
 
@@ -153,6 +184,7 @@ class MainActivity : BaseActivity() {
                 when {
                     fileName.endsWith(".m3u") || fileName.endsWith(".m3u8") -> allItems.addAll(parseM3u(uri))
                     fileName.endsWith(".pls")                               -> allItems.addAll(parsePls(uri))
+                    fileName.endsWith(".cue")                               -> allItems.addAll(parseCue(uri))
                     else                                                    -> allItems.add(createMediaItem(uri))
                 }
             }
@@ -403,7 +435,110 @@ class MainActivity : BaseActivity() {
             lower.endsWith(".wav")                -> MimeTypes.AUDIO_WAV
             lower.endsWith(".m4a") || lower.endsWith(".aac") -> MimeTypes.AUDIO_AAC
             lower.endsWith(".ogg")                -> MimeTypes.AUDIO_OGG
+            lower.endsWith(".ape")                -> "audio/x-ape"
             else                                  -> null
         }
+    }
+
+    fun parseCue(uri: Uri): List<MediaItem> {
+        return try {
+            contentResolver.openInputStream(uri)?.use { inputStream ->
+                val basePath = if (uri.scheme == "file") uri.path?.substringBeforeLast("/") else uri.toString().substringBeforeLast("%2F")
+                parseCueFromStream(inputStream, basePath)
+            } ?: emptyList()
+        } catch (e: Exception) {
+            e.printStackTrace(); emptyList()
+        }
+    }
+
+    fun parseCueFromStream(inputStream: java.io.InputStream, basePath: String?): List<MediaItem> {
+        val items = mutableListOf<MediaItem>()
+        try {
+            val reader = BufferedReader(InputStreamReader(inputStream))
+            var line: String?
+            var currentFile: String? = null
+            var albumTitle: String? = null
+            var albumArtist: String? = null
+            
+            data class CueTrack(val number: Int, var title: String? = null, var artist: String? = null, var startTimeMs: Long = 0)
+            val tracks = mutableListOf<CueTrack>()
+            var currentTrack: CueTrack? = null
+
+            while (reader.readLine().also { line = it } != null) {
+                val trimmed = line!!.trim().removePrefix("\uFEFF")
+                val upper = trimmed.uppercase()
+
+                when {
+                    upper.startsWith("FILE") -> {
+                        currentFile = trimmed.substringAfter("\"").substringBeforeLast("\"")
+                    }
+                    upper.startsWith("TITLE") && currentTrack == null -> {
+                        albumTitle = trimmed.substringAfter("\"").substringBeforeLast("\"")
+                    }
+                    upper.startsWith("PERFORMER") && currentTrack == null -> {
+                        albumArtist = trimmed.substringAfter("\"").substringBeforeLast("\"")
+                    }
+                    upper.startsWith("TRACK") -> {
+                        val num = trimmed.split(" ")[1].toIntOrNull() ?: 0
+                        currentTrack = CueTrack(num)
+                        tracks.add(currentTrack)
+                    }
+                    upper.startsWith("TITLE") && currentTrack != null -> {
+                        currentTrack.title = trimmed.substringAfter("\"").substringBeforeLast("\"")
+                    }
+                    upper.startsWith("PERFORMER") && currentTrack != null -> {
+                        currentTrack.artist = trimmed.substringAfter("\"").substringBeforeLast("\"")
+                    }
+                    upper.startsWith("INDEX 01") && currentTrack != null -> {
+                        val timeStr = trimmed.substringAfter("INDEX 01").trim()
+                        currentTrack.startTimeMs = parseCueTime(timeStr)
+                    }
+                }
+            }
+
+            if (currentFile != null && tracks.isNotEmpty()) {
+                val audioUriString = resolveRelativePath(currentFile, basePath)
+                val audioUri = parseEntryUri(audioUriString, basePath)
+                
+                if (audioUri != null) {
+                    for (i in tracks.indices) {
+                        val track = tracks[i]
+                        val nextTrackStart = if (i + 1 < tracks.size) tracks[i+1].startTimeMs else C.TIME_UNSET
+                        
+                        val metaBuilder = MediaMetadata.Builder()
+                            .setTitle(track.title ?: "Track ${track.number}")
+                            .setArtist(track.artist ?: albumArtist ?: "Unknown Artist")
+                            .setAlbumTitle(albumTitle ?: "Unknown Album")
+                        
+                        val clippingBuilder = MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(track.startTimeMs)
+                        if (nextTrackStart != C.TIME_UNSET) {
+                            clippingBuilder.setEndPositionMs(nextTrackStart)
+                        }
+
+                        items.add(
+                            MediaItem.Builder()
+                                .setMediaId("${audioUri}_${track.number}")
+                                .setUri(audioUri)
+                                .setMimeType(mimeTypeFor(audioUri.toString()))
+                                .setMediaMetadata(metaBuilder.build())
+                                .setClippingConfiguration(clippingBuilder.build())
+                                .build()
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+        return items
+    }
+
+    private fun parseCueTime(timeStr: String): Long {
+        // MM:SS:FF where FF is frames (1/75th of a second)
+        val parts = timeStr.split(":")
+        if (parts.size != 3) return 0
+        val m = parts[0].toLongOrNull() ?: 0
+        val s = parts[1].toLongOrNull() ?: 0
+        val f = parts[2].toLongOrNull() ?: 0
+        return (m * 60 * 1000) + (s * 1000) + (f * 1000 / 75)
     }
 }

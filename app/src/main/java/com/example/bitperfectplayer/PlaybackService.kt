@@ -107,6 +107,25 @@ class PlaybackService : MediaSessionService() {
     }
 
     /**
+     * Receives ACTION_SCREEN_ON (Shield waking from sleep).
+     * After sleep the USB DAC HAL session is invalid — ExoPlayer's audio
+     * renderer throws MediaCodecAudioRenderer error (format_supported=YES)
+     * because the format is fine but the audio device isn't ready yet.
+     * We wait USB_SETTLE_MS for the DAC to re-enumerate, then force a sink reset.
+     */
+    private val screenWakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_SCREEN_ON) {
+                Log.i(TAG, "Screen on (wake from sleep) — scheduling DAC reset in ${USB_SETTLE_MS}ms")
+                mainHandler.postDelayed(
+                    { checkAndResetUsbAudio("screen wake") },
+                    USB_SETTLE_MS
+                )
+            }
+        }
+    }
+
+    /**
      * If a live USB DAC is present, resets the audio sink to force bit-perfect re-negotiation.
      */
     fun checkAndResetUsbAudio(reason: String = "manual") {
@@ -223,6 +242,28 @@ class PlaybackService : MediaSessionService() {
         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
             Log.e(TAG, "Player error: ${error.errorCodeName} — ${error.message}", error)
             val player = mediaSession?.player ?: return
+
+            // MediaCodecAudioRenderer error after sleep/wake: the USB DAC HAL session
+            // is invalid even though format_supported=YES. Reset the audio sink and
+            // resume playback — no manual intervention needed.
+            val cause = error.cause
+            val isAudioRendererError =
+                error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
+                error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED ||
+                cause?.javaClass?.name?.contains("AudioSink") == true ||
+                cause?.javaClass?.name?.contains("AudioTrack") == true ||
+                error.message?.contains("MediaCodecAudioRenderer") == true ||
+                error.message?.contains("AudioSink") == true
+
+            if (isAudioRendererError && retryCount < 2) {
+                retryCount++
+                Log.i(TAG, "Audio renderer error — resetting DAC sink (attempt $retryCount)")
+                mainHandler.postDelayed({
+                    checkAndResetUsbAudio("renderer error recovery")
+                }, USB_SETTLE_MS)
+                return
+            }
+
             val autoReconnect = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
                 .getBoolean(KEY_AUTO_RECONNECT, true)
             val isStream = player.currentMediaItem?.mediaId
@@ -279,6 +320,9 @@ class PlaybackService : MediaSessionService() {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         })
 
+        // Listen for screen-on (Shield waking from sleep) to auto-reset the DAC
+        registerReceiver(screenWakeReceiver, IntentFilter(Intent.ACTION_SCREEN_ON))
+
         // On startup: if a USB DAC is already connected, reset the sink so
         // Android HAL negotiates bit-perfect output from the very first track.
         mainHandler.postDelayed({ checkAndResetUsbAudio("startup") }, USB_SETTLE_MS)
@@ -291,6 +335,7 @@ class PlaybackService : MediaSessionService() {
         saveCurrentPosition()
         mainHandler.removeCallbacksAndMessages(null)
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(screenWakeReceiver) } catch (_: Exception) {}
         mediaSession?.run { player.release(); release() }
         super.onDestroy()
     }
@@ -314,6 +359,15 @@ class PlaybackService : MediaSessionService() {
                         put("mediaId", item.mediaId)
                         put("title",   item.mediaMetadata.title?.toString()  ?: "")
                         put("artist",  item.mediaMetadata.artist?.toString() ?: "")
+                        put("uri",     item.localConfiguration?.uri?.toString() ?: item.mediaId)
+                        
+                        val clip = item.clippingConfiguration
+                        if (clip.startPositionMs > 0) {
+                            put("start", clip.startPositionMs)
+                        }
+                        if (clip.endPositionMs != androidx.media3.common.C.TIME_UNSET && clip.endPositionMs != androidx.media3.common.C.LENGTH_UNSET.toLong()) {
+                            put("end", clip.endPositionMs)
+                        }
                     })
                 }
             }
