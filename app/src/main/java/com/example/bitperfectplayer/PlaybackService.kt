@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -59,8 +61,8 @@ class PlaybackService : MediaSessionService() {
 
         private const val RECENT_LIST_MAX      = 20
 
-        private const val USB_SETTLE_MS        = 1_500L
-        private const val USB_RESET_GAP_MS     = 400L
+        private const val USB_SETTLE_MS        = 2_000L
+        private const val USB_RESET_GAP_MS     = 500L
 
         // ── USB DAC detection ─────────────────────────────────────────────────
         /**
@@ -127,15 +129,30 @@ class PlaybackService : MediaSessionService() {
 
     /**
      * If a live USB DAC is present, resets the audio sink to force bit-perfect re-negotiation.
+     * Verification against AudioManager ensures the system has fully recognized the device.
      */
-    fun checkAndResetUsbAudio(reason: String = "manual") {
-        val dac = findUsbAudioDevice(this)
-        if (dac != null) {
-            Log.i(TAG, "USB DAC live: '${dac.deviceName}' — resetting sink [$reason]")
-            resetAudioSink()
-        } else {
+    fun checkAndResetUsbAudio(reason: String = "manual", forcePlay: Boolean = false) {
+        val usbDac = findUsbAudioDevice(this)
+        if (usbDac == null) {
             Log.d(TAG, "No live USB DAC found [$reason]")
+            return
         }
+
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val audioDac = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
+            it.type == AudioDeviceInfo.TYPE_USB_DEVICE    ||
+            it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        }
+
+        if (audioDac == null) {
+            Log.w(TAG, "USB DAC found by UsbManager but NOT by AudioManager yet. Retrying in 500ms…")
+            mainHandler.postDelayed({ checkAndResetUsbAudio("$reason (retry)", forcePlay) }, 500)
+            return
+        }
+
+        Log.i(TAG, "USB DAC live and recognized by system: '${usbDac.deviceName}' — resetting sink [$reason]")
+        resetAudioSink(forcePlay)
     }
 
     private var mediaSession: MediaSession? = null
@@ -159,34 +176,48 @@ class PlaybackService : MediaSessionService() {
     }
 
     /**
-     * Tears down ExoPlayer's AudioTrack (closing the HAL session) and
-     * immediately rebuilds it, forcing Android to re-negotiate bit-perfect
-     * output parameters with the DAC.
+     * Tears down the current ExoPlayer instance and immediately rebuilds it.
+     * This forces Android to re-negotiate bit-perfect output parameters with
+     * the DAC and ensures any stale HAL sessions or resamplers are cleared.
      *
      * Current queue, position, and play-state are fully restored.
      */
-    fun resetAudioSink() {
-        val player = mediaSession?.player as? ExoPlayer ?: return
+    fun resetAudioSink(forcePlay: Boolean = false) {
+        val oldPlayer = mediaSession?.player as? ExoPlayer ?: return
 
-        val wasPlaying = player.isPlaying
-        val index      = player.currentMediaItemIndex
-        val position   = player.currentPosition
-        val items      = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) }
+        val wasPlaying = forcePlay || oldPlayer.playWhenReady
+        val index      = oldPlayer.currentMediaItemIndex
+        val position   = oldPlayer.currentPosition
+        val items      = (0 until oldPlayer.mediaItemCount).map { oldPlayer.getMediaItemAt(it) }
 
-        Log.i(TAG, "Resetting audio sink [playing=$wasPlaying idx=$index pos=$position]")
+        Log.i(TAG, "Force-recreating player for audio sink reset [playing=$wasPlaying idx=$index pos=$position]")
 
-        // Pause + stop releases the AudioTrack → HAL session is closed
-        player.pause()
-        player.stop()
+        oldPlayer.stop()
+        oldPlayer.release()
 
         mainHandler.postDelayed({
-            val p = mediaSession?.player as? ExoPlayer ?: return@postDelayed
-            if (items.isNotEmpty()) {
-                p.setMediaItems(items, index, position)
-                p.prepare()
-                if (wasPlaying) p.play()
+            val newPlayer = buildPlayer()
+            
+            // Guided routing: explicitly set the preferred device if a DAC is present
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val audioDac = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_USB_DEVICE    ||
+                it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                it.type == AudioDeviceInfo.TYPE_USB_HEADSET
             }
-            Log.i(TAG, "Audio sink reset complete")
+            if (audioDac != null) {
+                Log.d(TAG, "Setting preferred device: ${audioDac.productName}")
+                newPlayer.setPreferredAudioDevice(audioDac)
+            }
+
+            mediaSession?.player = newPlayer
+
+            if (items.isNotEmpty()) {
+                newPlayer.setMediaItems(items, index, position)
+                newPlayer.prepare()
+                newPlayer.playWhenReady = wasPlaying
+            }
+            Log.i(TAG, "Audio sink reset complete (new player instance)")
         }, USB_RESET_GAP_MS)
     }
 
@@ -255,11 +286,11 @@ class PlaybackService : MediaSessionService() {
                 error.message?.contains("MediaCodecAudioRenderer") == true ||
                 error.message?.contains("AudioSink") == true
 
-            if (isAudioRendererError && retryCount < 2) {
+            if (isAudioRendererError && retryCount < 3) {
                 retryCount++
-                Log.i(TAG, "Audio renderer error — resetting DAC sink (attempt $retryCount)")
+                Log.i(TAG, "Audio renderer error — resetting DAC sink and forcing play (attempt $retryCount)")
                 mainHandler.postDelayed({
-                    checkAndResetUsbAudio("renderer error recovery")
+                    checkAndResetUsbAudio("renderer error recovery", forcePlay = true)
                 }, USB_SETTLE_MS)
                 return
             }
