@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/now_playing_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -12,13 +13,14 @@
 
     <ImageView
         android:id="@+id/img_track_icon"
-        android:layout_width="80dp"
-        android:layout_height="80dp"
-        android:layout_marginBottom="16dp"
+        android:layout_width="130dp"
+        android:layout_height="130dp"
+        android:layout_marginBottom="10dp"
         android:src="@drawable/ic_audio"
-        android:contentDescription="Track Icon" />
+        android:scaleType="centerCrop"
+        android:contentDescription="Album Art" />
 
-    <TextView
+    <androidx.appcompat.widget.AppCompatTextView
         android:id="@+id/text_title"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -29,9 +31,12 @@
         android:maxLines="1"
         android:ellipsize="end"
         android:gravity="center"
-        android:letterSpacing="0.01" />
+        android:letterSpacing="0.01"
+        android:drawablePadding="10dp"
+        app:drawableStartCompat="@drawable/ic_audio"
+        app:drawableTint="@color/text_primary" />
 
-    <TextView
+    <androidx.appcompat.widget.AppCompatTextView
         android:id="@+id/text_artist"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -41,9 +46,12 @@
         android:textSize="18sp"
         android:maxLines="1"
         android:ellipsize="end"
-        android:gravity="center" />
+        android:gravity="center"
+        android:drawablePadding="8dp"
+        app:drawableStartCompat="@drawable/ic_artist"
+        app:drawableTint="#CCFFFFFF" />
 
-    <TextView
+    <androidx.appcompat.widget.AppCompatTextView
         android:id="@+id/text_album"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -54,7 +62,10 @@
         android:textStyle="italic"
         android:maxLines="1"
         android:ellipsize="end"
-        android:gravity="center" />
+        android:gravity="center"
+        android:drawablePadding="6dp"
+        app:drawableStartCompat="@drawable/ic_album_art"
+        app:drawableTint="@color/text_secondary" />
 
     <TextView
         android:id="@+id/text_playlist_pos"
@@ -70,7 +81,7 @@
         android:id="@+id/text_bitrate"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
+        android:layout_marginTop="6dp"
         android:text="--- kbps | -- kHz"
         android:textColor="@color/text_primary"
         android:textSize="12sp"
@@ -81,7 +92,7 @@
         android:id="@+id/animated_waveform"
         android:layout_width="600dp"
         android:layout_height="56dp"
-        android:layout_marginTop="14dp" />
+        android:layout_marginTop="8dp" />
 
     <SeekBar
         android:id="@+id/seek_bar"
@@ -118,9 +129,9 @@
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="20dp"
+        android:layout_marginTop="16dp"
         android:orientation="horizontal"
-        android:gravity="center_vertical"
+        android:gravity="center"
         android:clipChildren="false"
         android:clipToPadding="false"
         android:padding="4dp">
@@ -129,7 +140,6 @@
             android:id="@+id/btn_shuffle"
             android:layout_width="56dp"
             android:layout_height="56dp"
-            android:layout_marginEnd="8dp"
             android:background="@drawable/control_button_bg"
             android:src="@drawable/ic_shuffle"
             android:contentDescription="Shuffle"
@@ -140,9 +150,24 @@
             android:alpha="0.5" />
 
         <ImageButton
+            android:id="@+id/btn_repeat"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/control_button_bg"
+            android:src="@drawable/ic_repeat"
+            android:contentDescription="Repeat"
+            android:focusable="true"
+            android:padding="14dp"
+            android:scaleType="fitCenter"
+            android:tint="@color/text_primary"
+            android:alpha="0.5" />
+
+        <ImageButton
             android:id="@+id/btn_prev"
             android:layout_width="56dp"
             android:layout_height="56dp"
+            android:layout_marginStart="8dp"
             android:background="@drawable/control_button_bg"
             android:src="@drawable/ic_skip_prev"
             android:contentDescription="Previous"
@@ -177,20 +202,6 @@
             android:tint="@color/text_primary" />
 
         <ImageButton
-            android:id="@+id/btn_repeat"
-            android:layout_width="56dp"
-            android:layout_height="56dp"
-            android:layout_marginStart="8dp"
-            android:background="@drawable/control_button_bg"
-            android:src="@drawable/ic_repeat"
-            android:contentDescription="Repeat"
-            android:focusable="true"
-            android:padding="14dp"
-            android:scaleType="fitCenter"
-            android:tint="@color/text_primary"
-            android:alpha="0.5" />
-
-        <ImageButton
             android:id="@+id/btn_playlist"
             android:layout_width="56dp"
             android:layout_height="56dp"
@@ -203,14 +214,11 @@
             android:scaleType="fitCenter"
             android:tint="@color/text_primary" />
 
-        <!-- USB DAC reset button — glows at full opacity when a DAC is connected,
-             dims to 30% when none is detected. Tap = reset sink, Long-press = device info.
-             Tint is applied at runtime to match the selected color scheme. -->
         <ImageButton
             android:id="@+id/btn_dac_reset"
             android:layout_width="56dp"
             android:layout_height="56dp"
-            android:layout_marginStart="16dp"
+            android:layout_marginStart="8dp"
             android:background="@drawable/control_button_bg"
             android:src="@drawable/ic_dac"
             android:contentDescription="Reset USB DAC"

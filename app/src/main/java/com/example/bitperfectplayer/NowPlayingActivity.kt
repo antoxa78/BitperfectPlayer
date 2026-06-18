@@ -2,17 +2,24 @@ package com.example.bitperfectplayer
 
 import android.content.ComponentName
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
+import androidx.core.content.ContextCompat
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ImageSpan
 import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
@@ -24,6 +31,10 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 class NowPlayingActivity : BaseActivity() {
 
@@ -49,6 +60,17 @@ class NowPlayingActivity : BaseActivity() {
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var animatedWaveform: AnimatedWaveformView
+
+    // Album art: track last fetched key to avoid redundant network requests
+    private var lastArtKey: String = ""
+    private val artHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .followRedirects(true)       // CAA /front-250 is a 302 redirect to actual image
+            .followSslRedirects(true)
+            .build()
+    }
 
     private lateinit var textTitle: TextView
     private lateinit var textArtist: TextView
@@ -112,6 +134,25 @@ class NowPlayingActivity : BaseActivity() {
         btnShuffle       = findViewById(R.id.btn_shuffle)
         btnRepeat        = findViewById(R.id.btn_repeat)
         btnDacReset      = findViewById(R.id.btn_dac_reset)
+
+        // Ensure compound drawables are visible and tinted
+        setupCompoundDrawables()
+    }
+
+    private fun setupCompoundDrawables() {
+        val colorPrimary = ContextCompat.getColor(this, R.color.text_primary)
+        val colorSecondary = ContextCompat.getColor(this, R.color.text_secondary)
+        val colorArtist = Color.parseColor("#CCFFFFFF")
+
+        fun setTintedDrawable(tv: TextView, drawableRes: Int, color: Int) {
+            val drawable = ContextCompat.getDrawable(this, drawableRes)?.mutate()
+            drawable?.setTint(color)
+            tv.setCompoundDrawablesWithIntrinsicBounds(drawable, null, null, null)
+        }
+
+        setTintedDrawable(textTitle, R.drawable.ic_audio, colorPrimary)
+        setTintedDrawable(textArtist, R.drawable.ic_artist, colorArtist)
+        setTintedDrawable(textAlbum, R.drawable.ic_album_art, colorSecondary)
     }
 
     private fun setupSeekBar() {
@@ -312,22 +353,54 @@ class NowPlayingActivity : BaseActivity() {
         val itemMeta   = controller.currentMediaItem?.mediaMetadata
         var title  = metadata.title?.toString() ?: itemMeta?.title?.toString() ?: metadata.displayTitle?.toString() ?: "Bitperfect Player"
         var artist = metadata.artist?.toString() ?: itemMeta?.artist?.toString() ?: metadata.albumArtist?.toString() ?: ""
+        var album = metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString() ?: ""
+
         val delims = arrayOf(" - ", " – ", " — ", " : ", " | ")
         if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true)) {
             for (d in delims) { if (title.contains(d)) { val p = title.split(d, limit=2); artist = p[0].trim(); title = p[1].trim(); break } }
         }
         val station = metadata.station?.toString() ?: itemMeta?.station?.toString()
         if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true)) artist = station ?: ""
-        val sb = StringBuilder("Now Playing:\n").append(title)
-        if (artist.isNotEmpty() && !artist.equals("Unknown Artist", ignoreCase = true) && artist != title)
-            sb.append('\n').append(artist)
-        if (!station.isNullOrBlank() && station != artist && station != title)
-            sb.append("\n(").append(station).append(')')
+
+        val sb = SpannableStringBuilder()
+        sb.append("Now Playing:\n\n")
+
+        val iconColor = Color.LTGRAY
+        val iconSize = (textView.textSize * 1.2f).toInt()
+
+        fun appendRow(text: String, iconRes: Int) {
+            if (text.isBlank()) return
+            val start = sb.length
+            sb.append("  ") // placeholder for icon
+            val drawable = ContextCompat.getDrawable(this, iconRes)?.mutate()?.apply {
+                setTint(iconColor)
+                setBounds(0, 0, iconSize, iconSize)
+            }
+            if (drawable != null) {
+                sb.setSpan(ImageSpan(drawable, ImageSpan.ALIGN_BOTTOM), start, start + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            sb.append(text).append("\n")
+        }
+
+        appendRow(title, R.drawable.ic_audio)
+        appendRow(artist, R.drawable.ic_artist)
+        appendRow(album, R.drawable.ic_album_art)
+
+        if (!station.isNullOrBlank() && station != artist && station != title) {
+            sb.append("(").append(station).append(")\n")
+        }
+
         controller.currentTracks.groups.forEach { g ->
             if (g.type == C.TRACK_TYPE_AUDIO && g.isSelected)
-                for (i in 0 until g.length) { if (g.isTrackSelected(i)) { buildFormatInfo(g.getTrackFormat(i))?.let { sb.append('\n').append(it) }; break } }
+                for (i in 0 until g.length) {
+                    if (g.isTrackSelected(i)) {
+                        buildFormatInfo(g.getTrackFormat(i))?.let { sb.append("\n").append(it) }
+                        break
+                    }
+                }
         }
-        textView.text = sb.toString(); textView.textAlignment = android.view.View.TEXT_ALIGNMENT_CENTER
+        textView.text = sb
+        textView.textAlignment = android.view.View.TEXT_ALIGNMENT_CENTER
     }
 
     // ── UI updates ────────────────────────────────────────────────────────────
@@ -393,9 +466,7 @@ class NowPlayingActivity : BaseActivity() {
         textPlaylistPos.text = "${controller.currentMediaItemIndex + 1} / ${controller.mediaItemCount}"
 
         val uri = mediaItem?.mediaId ?: ""
-        val iconRes = when { uri.startsWith("smb://") -> R.drawable.ic_network; uri.startsWith("content://") -> R.drawable.ic_folder; else -> R.drawable.ic_audio }
-        imgTrackIcon.setImageResource(iconRes)
-        if (iconRes == R.drawable.ic_audio) imgTrackIcon.setColorFilter(getThemeColor()) else imgTrackIcon.clearColorFilter()
+        loadAlbumArt(dispArtist, metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString(), dispTrack)
 
         btnPlayPause.setImageResource(if (controller.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
         updateShuffleRepeatUI()
@@ -422,6 +493,148 @@ class NowPlayingActivity : BaseActivity() {
             }
         }
     }
+
+    // ── Album art ─────────────────────────────────────────────────────────────
+
+    /**
+     * Fetches album art and displays it in imgTrackIcon.
+     * Skips network if artist+album key is unchanged since last successful fetch.
+     *
+     * Priority:
+     *  1. Embedded artwork in MediaMetadata.artworkData (ExoPlayer reads ID3/FLAC tags)
+     *  2. MusicBrainz release search → Cover Art Archive (redirects followed automatically)
+     *  3. iTunes Search API (free, no key)
+     *  4. Fallback: ic_audio icon tinted with theme color
+     */
+    private fun loadAlbumArt(artist: String, album: String?, track: String) {
+        val artKey = "$artist|${album ?: track}"
+        if (artKey == lastArtKey) return
+        lastArtKey = artKey
+
+        // 1 — Embedded artwork from ExoPlayer (ID3v2 APIC / FLAC PICTURE tag)
+        val artworkData = mediaController?.mediaMetadata?.artworkData
+            ?: mediaController?.currentMediaItem?.mediaMetadata?.artworkData
+        if (artworkData != null && artworkData.isNotEmpty()) {
+            val bmp = BitmapFactory.decodeByteArray(artworkData, 0, artworkData.size)
+            if (bmp != null) {
+                imgTrackIcon.scaleType = ImageView.ScaleType.CENTER_CROP
+                imgTrackIcon.setImageBitmap(bmp)
+                imgTrackIcon.clearColorFilter()
+                return
+            }
+        }
+
+        // Placeholder while loading
+        imgTrackIcon.scaleType = ImageView.ScaleType.FIT_CENTER
+        imgTrackIcon.setImageResource(R.drawable.ic_audio)
+        imgTrackIcon.setColorFilter(getThemeColor())
+
+        if (artist.isBlank() || artist.equals("Unknown Artist", ignoreCase = true)) return
+
+        // Capture key so closure can detect stale results after track change
+        val capturedKey = artKey
+
+        Thread {
+            val bitmap = fetchFromMusicBrainz(artist, album, track)
+                ?: fetchFromItunes(artist, album ?: track)
+
+            runOnUiThread {
+                if (capturedKey != lastArtKey) return@runOnUiThread   // track changed while fetching
+                if (bitmap != null) {
+                    imgTrackIcon.scaleType = ImageView.ScaleType.CENTER_CROP
+                    imgTrackIcon.setImageBitmap(bitmap)
+                    imgTrackIcon.clearColorFilter()
+                } else {
+                    imgTrackIcon.scaleType = ImageView.ScaleType.FIT_CENTER
+                    imgTrackIcon.setImageResource(R.drawable.ic_audio)
+                    imgTrackIcon.setColorFilter(getThemeColor())
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * MusicBrainz release search → Cover Art Archive.
+     * CAA /front-250 returns HTTP 307 redirect; OkHttp follows it automatically.
+     */
+    private fun fetchFromMusicBrainz(artist: String, album: String?, track: String): Bitmap? {
+        return try {
+            val query = if (!album.isNullOrBlank())
+                "release:\"${album.mbEscape()}\" AND artist:\"${artist.mbEscape()}\""
+            else
+                "recording:\"${track.mbEscape()}\" AND artist:\"${artist.mbEscape()}\""
+
+            val searchUrl = "https://musicbrainz.org/ws/2/release/?query=${Uri.encode(query)}&limit=5&fmt=json"
+            val mbJson = artGet(searchUrl, "application/json") ?: return null
+
+            val releases = JSONObject(mbJson).optJSONArray("releases") ?: return null
+            if (releases.length() == 0) return null
+
+            var bestMbid: String? = null
+            var bestScore = -1
+            for (i in 0 until releases.length()) {
+                val rel = releases.getJSONObject(i)
+                val score = rel.optInt("score", 0)
+                if (score > bestScore) { bestScore = score; bestMbid = rel.optString("id").takeIf { it.isNotBlank() } }
+            }
+            if (bestMbid.isNullOrBlank()) return null
+
+            // /front-250 redirects to the real image — OkHttp follows automatically
+            val caaUrl = "https://coverartarchive.org/release/$bestMbid/front-250"
+            val imgBytes = artGetBytes(caaUrl) ?: return null
+            BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
+        } catch (e: Exception) {
+            Log.d("AlbumArt", "MusicBrainz failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * iTunes Search API — free, no key, returns 100×100 artwork URL that can be
+     * upscaled to 600×600 by replacing the size suffix.
+     */
+    private fun fetchFromItunes(artist: String, albumOrTrack: String): Bitmap? {
+        return try {
+            val term = Uri.encode("$artist $albumOrTrack")
+            val url = "https://itunes.apple.com/search?term=$term&media=music&entity=album&limit=5"
+            val json = artGet(url, "application/json") ?: return null
+            val results = JSONObject(json).optJSONArray("results") ?: return null
+            if (results.length() == 0) return null
+
+            // artwork URL is e.g. "…/100x100bb.jpg" — replace with 600x600
+            val artUrl = results.getJSONObject(0)
+                .optString("artworkUrl100").takeIf { it.isNotBlank() }
+                ?.replace("100x100bb", "600x600bb") ?: return null
+
+            val imgBytes = artGetBytes(artUrl) ?: return null
+            BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
+        } catch (e: Exception) {
+            Log.d("AlbumArt", "iTunes failed: ${e.message}")
+            null
+        }
+    }
+
+    /** GET request returning response body as String, or null on non-2xx. */
+    private fun artGet(url: String, accept: String): String? {
+        val req = Request.Builder().url(url)
+            .header("User-Agent", "BitperfectPlayer/2.3 (https://github.com/antoxa78/BitperfectPlayer)")
+            .header("Accept", accept)
+            .build()
+        val resp = artHttpClient.newCall(req).execute()
+        return if (resp.isSuccessful) resp.body?.string() else null
+    }
+
+    /** GET request returning response body as ByteArray, or null on non-2xx. */
+    private fun artGetBytes(url: String): ByteArray? {
+        val req = Request.Builder().url(url)
+            .header("User-Agent", "BitperfectPlayer/2.3 (https://github.com/antoxa78/BitperfectPlayer)")
+            .build()
+        val resp = artHttpClient.newCall(req).execute()
+        return if (resp.isSuccessful) resp.body?.bytes() else null
+    }
+
+    /** Escapes Lucene special characters for MusicBrainz query strings. */
+    private fun String.mbEscape() = this.replace("\"", "\\\"").take(100)
 
     private fun updateShuffleRepeatUI() {
         val c = mediaController ?: return
@@ -569,13 +782,14 @@ class NowPlayingActivity : BaseActivity() {
         val toast = Toast.makeText(this, "Processing files…", Toast.LENGTH_SHORT); toast.show()
         Thread {
             val items = mutableListOf<MediaItem>()
-            val isPl = !root.isDirectory && isPlayable(root.name) && root.name.lowercase().run { endsWith(".m3u")||endsWith(".m3u8")||endsWith(".pls") }
+            val isPl = !root.isDirectory && isPlayable(root.name) && root.name.lowercase().run { endsWith(".m3u")||endsWith(".m3u8")||endsWith(".pls")||endsWith(".cue") }
             fun scan(f: java.io.File) {
                 if (f.isDirectory) { f.listFiles()?.forEach { scan(it) }; return }
                 if (!isPlayable(f.name)) return
                 val lo = f.name.lowercase(); val fu = android.net.Uri.fromFile(f)
                 when {
                     lo.endsWith(".m3u")||lo.endsWith(".m3u8") -> { val p = try { java.io.FileInputStream(f).use { parseM3uLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
+                    lo.endsWith(".cue") -> { val p = try { java.io.FileInputStream(f).use { parseCueLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
                     lo.endsWith(".pls") -> { val p = try { java.io.FileInputStream(f).use { parsePlsLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
                     else -> items.add(buildMediaItem(f, fu))
                 }
@@ -613,6 +827,44 @@ class NowPlayingActivity : BaseActivity() {
         } catch (e: Exception) { e.printStackTrace() }; return items
     }
 
+    private fun parseCueLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> {
+        val items = mutableListOf<MediaItem>()
+        val bp = base?.toString()?.substringBeforeLast("/")
+        try {
+            val r = java.io.BufferedReader(java.io.InputStreamReader(s))
+            var line: String?; var curFile: String? = null; var albT: String? = null; var albA: String? = null
+            class Trk(val num: Int, var t: String? = null, var a: String? = null, var start: Long = 0)
+            val trks = mutableListOf<Trk>(); var curTrk: Trk? = null
+            while (r.readLine().also { line = it } != null) {
+                val t = line!!.trim().removePrefix("\uFEFF"); val u = t.uppercase()
+                when {
+                    u.startsWith("FILE") -> curFile = t.substringAfter("\"").substringBeforeLast("\"")
+                    u.startsWith("TITLE") && curTrk == null -> albT = t.substringAfter("\"").substringBeforeLast("\"")
+                    u.startsWith("PERFORMER") && curTrk == null -> albA = t.substringAfter("\"").substringBeforeLast("\"")
+                    u.startsWith("TRACK") -> { curTrk = Trk(t.split(" ")[1].toIntOrNull() ?: 0); trks.add(curTrk) }
+                    u.startsWith("TITLE") && curTrk != null -> curTrk.t = t.substringAfter("\"").substringBeforeLast("\"")
+                    u.startsWith("PERFORMER") && curTrk != null -> curTrk.a = t.substringAfter("\"").substringBeforeLast("\"")
+                    u.startsWith("INDEX 01") && curTrk != null -> {
+                        val ts = t.substringAfter("INDEX 01").trim().split(":")
+                        if (ts.size == 3) curTrk.start = (ts[0].toLong() * 60000) + (ts[1].toLong() * 1000) + (ts[2].toLong() * 1000 / 75)
+                    }
+                }
+            }
+            if (curFile != null && trks.isNotEmpty()) {
+                val au = resolvePlaylistEntry(curFile, bp)
+                if (au != null) {
+                    for (i in trks.indices) {
+                        val trk = trks[i]; val next = if (i + 1 < trks.size) trks[i+1].start else C.TIME_UNSET
+                        val m = MediaMetadata.Builder().setTitle(trk.t ?: "Track ${trk.num}").setArtist(trk.a ?: albA ?: "Unknown Artist").setAlbumTitle(albT ?: "Unknown Album")
+                        val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(trk.start)
+                        if (next != C.TIME_UNSET) clip.setEndPositionMs(next)
+                        items.add(MediaItem.Builder().setMediaId("${au}_${trk.num}").setUri(au).setMimeType(mimeTypeFor(au.toString())).setMediaMetadata(m.build()).setClippingConfiguration(clip.build()).build())
+                    }
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }; return items
+    }
+
     private fun resolvePlaylistEntry(path: String, base: String?): Uri? {
         var r = path; if (base!=null && !path.contains("://") && !path.startsWith("/")) r = if (base.endsWith("/")) "$base$path" else "$base/$path"
         return try { when { r.startsWith("/") -> Uri.fromFile(java.io.File(r)); r.startsWith("file://") -> Uri.fromFile(java.io.File(r.substring(7))); r.startsWith("content://")||r.startsWith("http://")||r.startsWith("https://")||r.startsWith("smb://") -> Uri.parse(r); else -> null } } catch (e: Exception) { null }
@@ -628,11 +880,24 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun buildMediaItem(f: java.io.File, uri: Uri): MediaItem {
         val lo = f.name.lowercase()
-        val mime = when { lo.endsWith(".flac") -> MimeTypes.AUDIO_FLAC; lo.endsWith(".mp3") -> MimeTypes.AUDIO_MPEG; lo.endsWith(".wav") -> MimeTypes.AUDIO_WAV; lo.endsWith(".m4a")||lo.endsWith(".aac") -> MimeTypes.AUDIO_AAC; lo.endsWith(".ogg") -> MimeTypes.AUDIO_OGG; else -> null }
+        val mime = mimeTypeFor(lo)
         return MediaItem.Builder().setMediaId(uri.toString()).setUri(uri).setMimeType(mime).setMediaMetadata(MediaMetadata.Builder().setTitle(f.name.substringBeforeLast(".")).build()).build()
     }
 
-    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls").any { name.lowercase().endsWith(it) }
+    private fun mimeTypeFor(uriString: String): String? {
+        val lo = uriString.lowercase()
+        return when {
+            lo.endsWith(".flac") -> MimeTypes.AUDIO_FLAC
+            lo.endsWith(".mp3") -> MimeTypes.AUDIO_MPEG
+            lo.endsWith(".wav") -> MimeTypes.AUDIO_WAV
+            lo.endsWith(".m4a")||lo.endsWith(".aac") -> MimeTypes.AUDIO_AAC
+            lo.endsWith(".ogg") -> MimeTypes.AUDIO_OGG
+            lo.endsWith(".ape") -> "audio/x-ape"
+            else -> null
+        }
+    }
+
+    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape").any { name.lowercase().endsWith(it) }
 
     private fun getThemeColor(): Int {
         val idx = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
