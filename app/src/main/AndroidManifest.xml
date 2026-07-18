@@ -25,14 +25,15 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Leanback"
-        android:banner="@mipmap/ic_launcher"
+        android:banner="@drawable/ic_tv_banner"
+        android:logo="@mipmap/ic_launcher_alien"
         android:largeHeap="true"
         android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:logo="@mipmap/ic_launcher"
+            android:logo="@mipmap/ic_launcher_alien"
             android:screenOrientation="landscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -12,6 +12,8 @@ import androidx.activity.OnBackPressedCallback
 import androidx.leanback.app.BrowseSupportFragment
 import androidx.leanback.app.RowsSupportFragment
 import androidx.leanback.widget.*
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import jcifs.smb.SmbFile
@@ -140,8 +142,10 @@ class MainFragment : BrowseSupportFragment() {
         title = "Bitperfect Player"
         headersState = HEADERS_ENABLED
         isHeadersTransitionOnBackEnabled = true
-        // Sidebar brand color follows the current color scheme
-        brandColor = getThemeColor(requireContext())
+        // Sidebar brand color: use the theme accent color as sidebar background,
+        // but for light/white schemes the sidebar must stay dark so white header
+        // text remains readable.
+        brandColor = getSidebarColor(requireContext())
     }
 
     fun refreshRows(targetRowId: Long = -1L, selectedColumn: Int = -1) {
@@ -263,12 +267,14 @@ class MainFragment : BrowseSupportFragment() {
                 val user = obj.optString("user", "")
                 val pass = obj.optString("pass", "")
                 
+                // Encode share name and credentials for a valid SMB URL
+                val encShare = Uri.encode(share)
                 val uri = if (user.isNotEmpty()) {
                     val encUser = Uri.encode(user)
                     val encPass = Uri.encode(pass)
-                    "smb://$encUser:$encPass@$ip/$share/"
+                    "smb://$encUser:$encPass@$ip/$encShare/"
                 } else {
-                    "smb://$ip/$share/"
+                    "smb://$ip/$encShare/"
                 }
                 adapter.add(createMediaItem("$share on $ip", "Network Share", uri))
             }
@@ -289,7 +295,7 @@ class MainFragment : BrowseSupportFragment() {
                 put("pass", pass)
             }
             jsonArray.put(newObj)
-            prefs.edit().putString(KEY_SHARES, jsonArray.toString()).apply()
+            prefs.edit { putString(KEY_SHARES, jsonArray.toString()) }
             refreshWithCurrentFocus()
         } catch (e: Exception) {
             e.printStackTrace()
@@ -496,7 +502,7 @@ class MainFragment : BrowseSupportFragment() {
                 if (uriStr.startsWith("content://")) {
                     findPlaylistsLocal(uriStr)
                 } else if (uriStr.startsWith("file://")) {
-                    val path = Uri.parse(uriStr).path
+                    val path = uriStr.toUri().path
                     if (path != null) findPlaylistsFile(path)
                 }
             }
@@ -510,7 +516,7 @@ class MainFragment : BrowseSupportFragment() {
                 fun scanRecursive(file: java.io.File) {
                     if (file.isDirectory) {
                         file.listFiles()?.forEach { scanRecursive(it) }
-                    } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) {
+                    } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue")) {
                         activity?.runOnUiThread {
                             playlistAdapter.add(createMediaItem(file.name, "Local Playlist", Uri.fromFile(file).toString()))
                         }
@@ -525,7 +531,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun findPlaylistsLocal(uriString: String) {
         val context = context ?: return
-        val rootUri = Uri.parse(uriString)
+        val rootUri = uriString.toUri()
         Thread {
             try {
                 fun scanRecursive(uri: Uri) {
@@ -550,7 +556,7 @@ class MainFragment : BrowseSupportFragment() {
                             
                             if (mime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
                                 scanRecursive(childUri)
-                            } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) {
+                            } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls") || name.lowercase().endsWith(".cue")) {
                                 activity?.runOnUiThread {
                                     playlistAdapter.add(createMediaItem(name, "Local Playlist", childUri.toString()))
                                 }
@@ -574,7 +580,7 @@ class MainFragment : BrowseSupportFragment() {
                     for (f in files) {
                         if (f.isDirectory) {
                             scanRecursive(f.path)
-                        } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8") || f.name.lowercase().endsWith(".pls")) {
+                        } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8") || f.name.lowercase().endsWith(".pls") || f.name.lowercase().endsWith(".cue")) {
                             val name = f.name
                             val path = f.path
                             activity?.runOnUiThread {
@@ -630,7 +636,14 @@ class MainFragment : BrowseSupportFragment() {
             .build()
     }
 
-    private fun createMediaItem(title: String, artist: String, uri: String): MediaItem {
+    private fun createMediaItem(
+        title: String,
+        artist: String,
+        uri: String,
+        mediaId: String? = null,
+        startMs: Long = 0,
+        endMs: Long = androidx.media3.common.C.TIME_UNSET
+    ): MediaItem {
         val metadataBuilder = MediaMetadata.Builder()
             .setTitle(title)
         
@@ -638,12 +651,22 @@ class MainFragment : BrowseSupportFragment() {
             metadataBuilder.setArtist(artist)
         }
 
-        return MediaItem.Builder()
-            .setMediaId(uri)
-            .setUri(Uri.parse(uri))
+        val builder = MediaItem.Builder()
+            .setMediaId(mediaId ?: uri)
+            .setUri(uri.toUri())
             .setMimeType(getMimeType(uri))
             .setMediaMetadata(metadataBuilder.build())
-            .build()
+
+        if (startMs > 0 || endMs != androidx.media3.common.C.TIME_UNSET) {
+            val clip = MediaItem.ClippingConfiguration.Builder()
+                .setStartPositionMs(startMs)
+            if (endMs != androidx.media3.common.C.TIME_UNSET) {
+                clip.setEndPositionMs(endMs)
+            }
+            builder.setClippingConfiguration(clip.build())
+        }
+
+        return builder.build()
     }
 
     private fun getMimeType(uri: String): String? {
@@ -654,6 +677,7 @@ class MainFragment : BrowseSupportFragment() {
             lower.endsWith(".wav") -> androidx.media3.common.MimeTypes.AUDIO_WAV
             lower.endsWith(".m4a") || lower.endsWith(".aac") -> androidx.media3.common.MimeTypes.AUDIO_AAC
             lower.endsWith(".ogg") -> androidx.media3.common.MimeTypes.AUDIO_OGG
+            lower.endsWith(".ape") -> "audio/x-ape"
             else -> null
         }
     }
@@ -670,7 +694,7 @@ class MainFragment : BrowseSupportFragment() {
                     } else if (item.mediaId.startsWith("content://")) {
                         addLocalToPlaylist(item.mediaId, item.mediaMetadata.title.toString(), replace = true)
                     } else if (item.mediaId.startsWith("file://")) {
-                        val file = java.io.File(Uri.parse(item.mediaId).path ?: "")
+                        val file = java.io.File(item.mediaId.toUri().path ?: "")
                         addFilesToPlaylist(file, replace = true)
                     }
                 } else if (item.mediaId.startsWith("smb://")) {
@@ -682,7 +706,7 @@ class MainFragment : BrowseSupportFragment() {
                     }
                 } else if (item.mediaId.startsWith("content://") || item.mediaId.startsWith("file://")) {
                     if (item.mediaId.startsWith("file://")) {
-                        browseFileStorage(Uri.parse(item.mediaId).path ?: "")
+                        browseFileStorage(item.mediaId.toUri().path ?: "")
                     } else {
                         browseLocalDirectory(item.mediaId)
                     }
@@ -752,7 +776,7 @@ class MainFragment : BrowseSupportFragment() {
                 val browseItems = sortedFiles.map { 
                     val isDir = it.isDirectory()
                     val icon = if (isDir) R.drawable.ic_folder 
-                              else if (it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8") || it.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist
+                              else if (it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8") || it.name.lowercase().endsWith(".pls") || it.name.lowercase().endsWith(".cue")) R.drawable.ic_playlist
                               else R.drawable.ic_audio
                     BrowseItem(it.name, it.path, icon, isDir)
                 }
@@ -799,7 +823,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun browseLocalDirectory(uriString: String) {
         val context = activity ?: return
-        val uri = Uri.parse(uriString)
+        val uri = uriString.toUri()
         val loadingToast = Toast.makeText(context, "Scanning folder...", Toast.LENGTH_SHORT)
         loadingToast.show()
 
@@ -838,12 +862,12 @@ class MainFragment : BrowseSupportFragment() {
                             // Filter thumbnails and hidden folders
                             if (name.startsWith(".") || name.contains("thumbnail", ignoreCase = true)) continue
                             
-                            // Only add if it contains music/playlists or subfolders
+                            // Only add if it contains music/playlists/cues or subfolders
                             if (hasPlayableContent(context, treeUri, id)) {
                                 items.add(BrowseItem(name, android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, id).toString(), R.drawable.ic_folder, true))
                             }
                         } else if (isPlayable(name)) {
-                            val icon = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
+                            val icon = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls") || name.lowercase().endsWith(".cue")) R.drawable.ic_playlist else R.drawable.ic_audio
                             items.add(BrowseItem(name, android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, id).toString(), icon, false))
                         }
                     }
@@ -964,7 +988,7 @@ class MainFragment : BrowseSupportFragment() {
             .setTitle(name)
             .setAdapter(adapter) { _, which ->
                 if (uriString.startsWith("file://")) {
-                    val file = java.io.File(Uri.parse(uriString).path ?: "")
+                    val file = java.io.File(uriString.toUri().path ?: "")
                     addFilesToPlaylist(file, which == 1)
                 } else {
                     addLocalToPlaylist(uriString, name, which == 1)
@@ -978,7 +1002,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val mainActivity = activity as? MainActivity
         val controller = mainActivity?.getController() ?: return
-        val rootUri = Uri.parse(uriString)
+        val rootUri = uriString.toUri()
 
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
@@ -1027,6 +1051,14 @@ class MainFragment : BrowseSupportFragment() {
                         } else {
                             itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
                         }
+                    } else if (lower.endsWith(".cue")) {
+                        val basePath = uri.toString().substringBeforeLast("%2F")
+                        val parsed = mainActivity.parseCue(uri) // parseCue doesn't take basePath in MainFragment currently, let's check
+                        if (parsed.isNotEmpty()) {
+                            itemsToAdd.addAll(parsed)
+                        } else {
+                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                        }
                     } else if (lower.endsWith(".pls")) {
                         val basePath = uri.toString().substringBeforeLast("%2F")
                         val parsed = mainActivity.parsePls(uri, basePath)
@@ -1051,6 +1083,13 @@ class MainFragment : BrowseSupportFragment() {
             if (lowerName.endsWith(".m3u") || lowerName.endsWith(".m3u8")) {
                 val basePath = rootUri.toString().substringBeforeLast("%2F")
                 val parsed = mainActivity.parseM3u(rootUri, basePath)
+                if (parsed.isNotEmpty()) {
+                    itemsToAdd.addAll(parsed)
+                } else {
+                    itemsToAdd.add(createMediaItem(name, "", rootUri.toString()))
+                }
+            } else if (lowerName.endsWith(".cue")) {
+                val parsed = mainActivity.parseCue(rootUri)
                 if (parsed.isNotEmpty()) {
                     itemsToAdd.addAll(parsed)
                 } else {
@@ -1146,7 +1185,7 @@ class MainFragment : BrowseSupportFragment() {
                 val mainActivity = activity as? MainActivity
                 val itemsToAdd = mutableListOf<MediaItem>()
                 val isPlaylistFile = !file.isDirectory() && isPlayable(file.name) &&
-                    (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls"))
+                    (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue"))
                 
                 fun scanRecursive(f: SmbFile) {
                     if (f.isDirectory()) {
@@ -1156,6 +1195,15 @@ class MainFragment : BrowseSupportFragment() {
                         if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                             f.getInputStream().use { 
                                 val parsed = mainActivity?.parseM3uFromStream(it, f.parent) ?: emptyList()
+                                if (parsed.isNotEmpty()) {
+                                    itemsToAdd.addAll(parsed)
+                                } else {
+                                    itemsToAdd.add(createMediaItem(f.name, "", f.path))
+                                }
+                            }
+                        } else if (lower.endsWith(".cue")) {
+                            f.getInputStream().use {
+                                val parsed = mainActivity?.parseCueFromStream(it, f.parent) ?: emptyList()
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
@@ -1233,7 +1281,7 @@ class MainFragment : BrowseSupportFragment() {
                     .setPositiveButton("Settings") { _, _ ->
                         try {
                             val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                            intent.data = Uri.parse("package:${context.packageName}")
+                            intent.data = "package:${context.packageName}".toUri()
                             startActivity(intent)
                         } catch (e: Exception) {
                             val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
@@ -1332,7 +1380,7 @@ class MainFragment : BrowseSupportFragment() {
                 .setPositiveButton("Settings") { _, _ ->
                     try {
                         val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                        intent.data = Uri.parse("package:${context.packageName}")
+                        intent.data = "package:${context.packageName}".toUri()
                         startActivity(intent)
                     } catch (e: Exception) {
                         val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
@@ -1389,7 +1437,7 @@ class MainFragment : BrowseSupportFragment() {
                     if (file.isDirectory) {
                         items.add(BrowseItem(file.name, file.absolutePath, R.drawable.ic_folder, true))
                     } else if (!isSelectionMode && isPlayable(file.name)) {
-                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
+                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue")) R.drawable.ic_playlist else R.drawable.ic_audio
                         items.add(BrowseItem(file.name, file.absolutePath, icon, false))
                     }
                 }
@@ -1540,7 +1588,7 @@ class MainFragment : BrowseSupportFragment() {
             .setTitle(name)
             .setAdapter(adapter) { _, which ->
                 if (uriString.startsWith("file://")) {
-                    val file = java.io.File(Uri.parse(uriString).path ?: "")
+                    val file = java.io.File(uriString.toUri().path ?: "")
                     addFilesToPlaylist(file, which == 1)
                 } else {
                     addLocalToPlaylist(uriString, name, which == 1)
@@ -1560,7 +1608,7 @@ class MainFragment : BrowseSupportFragment() {
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
             val isPlaylistFile = !root.isDirectory && isPlayable(root.name) &&
-                (root.name.lowercase().endsWith(".m3u") || root.name.lowercase().endsWith(".m3u8") || root.name.lowercase().endsWith(".pls"))
+                (root.name.lowercase().endsWith(".m3u") || root.name.lowercase().endsWith(".m3u8") || root.name.lowercase().endsWith(".pls") || root.name.lowercase().endsWith(".cue"))
             
             fun scanRecursive(file: java.io.File) {
                 if (file.isDirectory) {
@@ -1571,6 +1619,19 @@ class MainFragment : BrowseSupportFragment() {
                         try {
                             java.io.FileInputStream(file).use { stream ->
                                 val parsed = mainActivity?.parseM3uFromStream(stream, file.parent) ?: emptyList()
+                                if (parsed.isNotEmpty()) {
+                                    itemsToAdd.addAll(parsed)
+                                } else {
+                                    itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                                }
+                            }
+                        } catch (e: Exception) {
+                            itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                        }
+                    } else if (lower.endsWith(".cue")) {
+                        try {
+                            java.io.FileInputStream(file).use { stream ->
+                                val parsed = mainActivity?.parseCueFromStream(stream, file.parent) ?: emptyList()
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
@@ -1629,7 +1690,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape")
         return extensions.any { filename.lowercase().endsWith(it) }
     }
 
@@ -1889,14 +1950,14 @@ class MainFragment : BrowseSupportFragment() {
     private fun toggleResumePlayback() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_RESUME, false)
-        prefs.edit().putBoolean(KEY_RESUME, !current).apply()
+        prefs.edit { putBoolean(KEY_RESUME, !current) }
         refreshWithCurrentFocus()
     }
 
     private fun toggleRecentFiles() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_RECENT, true)
-        prefs.edit().putBoolean(KEY_RECENT, !current).apply()
+        prefs.edit { putBoolean(KEY_RECENT, !current) }
         refreshWithCurrentFocus()
     }
 
@@ -1990,12 +2051,12 @@ class MainFragment : BrowseSupportFragment() {
             val newObj = JSONObject().apply {
                 put("uri", uri)
                 put("isLocal", isLocal)
-                val rawName = Uri.parse(uri).lastPathSegment ?: uri
+                val rawName = uri.toUri().lastPathSegment ?: uri
                 val cleanName = if (rawName.contains(":")) rawName.substringAfterLast(":") else rawName
                 put("name", cleanName)
             }
             jsonArray.put(newObj)
-            prefs.edit().putString(KEY_MUSIC_FOLDERS, jsonArray.toString()).apply()
+            prefs.edit { putString(KEY_MUSIC_FOLDERS, jsonArray.toString()) }
             refreshWithCurrentFocus()
             Toast.makeText(requireContext(), "Folder added", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -2165,14 +2226,17 @@ class MainFragment : BrowseSupportFragment() {
             val smbFolders = JSONArray(smbJson)
             for (i in 0 until smbFolders.length()) {
                 val obj = smbFolders.getJSONObject(i)
+                val ip = obj.getString("ip")
+                val share = obj.getString("share")
+                val encShare = Uri.encode(share)
                 val folderObj = JSONObject().apply {
-                    put("uri", "smb://${obj.getString("ip")}/${obj.getString("share")}/")
+                    put("uri", "smb://$ip/$encShare/")
                     put("isLocal", false)
                     put("isSmb", true)
                     put("index", i)
                 }
                 folderObjects.add(folderObj)
-                browseItems.add(BrowseItem("[SMB] ${obj.getString("share")} on ${obj.getString("ip")}", folderObj.getString("uri"), R.drawable.ic_network, true))
+                browseItems.add(BrowseItem("[SMB] $share on $ip", folderObj.getString("uri"), R.drawable.ic_network, true))
             }
         } catch (e: Exception) {}
 
@@ -2208,7 +2272,7 @@ class MainFragment : BrowseSupportFragment() {
             for (i in 0 until jsonArray.length()) {
                 if (i != index) newArray.put(jsonArray.get(i))
             }
-            prefs.edit().putString(KEY_SHARES, newArray.toString()).apply()
+            prefs.edit { putString(KEY_SHARES, newArray.toString()) }
         } else {
             val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             val jsonArray = JSONArray(prefs.getString(KEY_MUSIC_FOLDERS, "[]"))
@@ -2219,7 +2283,7 @@ class MainFragment : BrowseSupportFragment() {
                     newArray.put(jsonArray.get(i))
                 }
             }
-            prefs.edit().putString(KEY_MUSIC_FOLDERS, newArray.toString()).apply()
+            prefs.edit { putString(KEY_MUSIC_FOLDERS, newArray.toString()) }
         }
         refreshWithCurrentFocus()
         Toast.makeText(requireContext(), "Folder removed", Toast.LENGTH_SHORT).show()
@@ -2237,18 +2301,22 @@ class MainFragment : BrowseSupportFragment() {
             for (i in 0 until queueArray.length()) {
                 val entry = queueArray.optJSONObject(i)
                 if (entry != null) {
-                    val uri = entry.optString("mediaId", "")
+                    val mId = entry.optString("mediaId", "")
+                    val uri = entry.optString("uri", mId)
                     val title = entry.optString("title", "")
                     val artist = entry.optString("artist", "")
+                    val start = entry.optLong("start", 0)
+                    val end = entry.optLong("end", androidx.media3.common.C.TIME_UNSET)
+                    
                     if (uri.isNotEmpty()) {
-                        items.add(createMediaItem(title, artist, uri))
+                        items.add(createMediaItem(title, artist, uri, mId, start, end))
                     }
                 } else {
                     val uri = queueArray.getString(i)
                     val segment = if (uri.startsWith("smb://")) {
                         Uri.decode(uri.substringAfterLast("/").takeIf { it.isNotEmpty() } ?: uri)
                     } else {
-                        Uri.parse(uri).lastPathSegment ?: uri
+                        uri.toUri().lastPathSegment ?: uri
                     }
                     val title = segment.substringBeforeLast(".")
                     items.add(createMediaItem(title, "", uri))
@@ -2273,7 +2341,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun clearRecentFiles() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        prefs.edit().putString("recent_list", "[]").apply()
+        prefs.edit { putString("recent_list", "[]") }
         refreshWithCurrentFocus()
         Toast.makeText(requireContext(), "Recent files cleared", Toast.LENGTH_SHORT).show()
     }
@@ -2343,7 +2411,7 @@ class MainFragment : BrowseSupportFragment() {
     private fun toggleAutoScan() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_AUTO_SCAN, false)
-        prefs.edit().putBoolean(KEY_AUTO_SCAN, !current).apply()
+        prefs.edit { putBoolean(KEY_AUTO_SCAN, !current) }
         refreshWithCurrentFocus()
     }
 
@@ -2368,13 +2436,13 @@ class MainFragment : BrowseSupportFragment() {
                 when (which) {
                     0 -> {
                         val current = prefs.getBoolean(KEY_NETWORK_BUFFER, true)
-                        prefs.edit().putBoolean(KEY_NETWORK_BUFFER, !current).apply()
+                        prefs.edit { putBoolean(KEY_NETWORK_BUFFER, !current) }
                         showNetworkSettingsMenu()
                         refreshWithCurrentFocus()
                     }
                     1 -> {
                         val current = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
-                        prefs.edit().putBoolean(KEY_AUTO_RECONNECT, !current).apply()
+                        prefs.edit { putBoolean(KEY_AUTO_RECONNECT, !current) }
                         showNetworkSettingsMenu()
                         refreshWithCurrentFocus()
                     }
@@ -2494,6 +2562,27 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     companion object {
+        fun getSidebarColor(context: Context): Int {
+            val index = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
+                .getInt("color_scheme", 0)
+            // For Pure Black schemes (indices 5-8) the sidebar stays pure black (#1a1a1a)
+            // so that white/light header text remains readable against a dark background.
+            // For all other schemes we tint the sidebar with the accent color as before.
+            return when (index) {
+                5, 6, 7, 8 -> 0xFF1A1A1A.toInt() // Pure Black variants → dark sidebar
+                else -> {
+                    val colors = intArrayOf(
+                        0xFF00E676.toInt(), // Neon Green
+                        0xFF2979FF.toInt(), // Electric Blue
+                        0xFFFFC400.toInt(), // Amber Gold
+                        0xFF7C4DFF.toInt(), // Deep Purple
+                        0xFFFF4081.toInt(), // Hot Pink
+                    )
+                    if (index in colors.indices) colors[index] else colors[0]
+                }
+            }
+        }
+
         fun getThemeColor(context: Context): Int {
             val colors = intArrayOf(
                 0xFF00E676.toInt(), // Neon Green
