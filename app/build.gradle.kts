@@ -15,7 +15,7 @@ android {
         minSdk = 28
         targetSdk = 36
         versionCode = 31
-        versionName = "2.5.1"
+        versionName = "2.5.2"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

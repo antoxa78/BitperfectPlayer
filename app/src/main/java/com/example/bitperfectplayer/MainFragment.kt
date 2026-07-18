@@ -12,6 +12,8 @@ import androidx.activity.OnBackPressedCallback
 import androidx.leanback.app.BrowseSupportFragment
 import androidx.leanback.app.RowsSupportFragment
 import androidx.leanback.widget.*
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import jcifs.smb.SmbFile
@@ -293,7 +295,7 @@ class MainFragment : BrowseSupportFragment() {
                 put("pass", pass)
             }
             jsonArray.put(newObj)
-            prefs.edit().putString(KEY_SHARES, jsonArray.toString()).apply()
+            prefs.edit { putString(KEY_SHARES, jsonArray.toString()) }
             refreshWithCurrentFocus()
         } catch (e: Exception) {
             e.printStackTrace()
@@ -500,7 +502,7 @@ class MainFragment : BrowseSupportFragment() {
                 if (uriStr.startsWith("content://")) {
                     findPlaylistsLocal(uriStr)
                 } else if (uriStr.startsWith("file://")) {
-                    val path = Uri.parse(uriStr).path
+                    val path = uriStr.toUri().path
                     if (path != null) findPlaylistsFile(path)
                 }
             }
@@ -529,7 +531,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun findPlaylistsLocal(uriString: String) {
         val context = context ?: return
-        val rootUri = Uri.parse(uriString)
+        val rootUri = uriString.toUri()
         Thread {
             try {
                 fun scanRecursive(uri: Uri) {
@@ -651,7 +653,7 @@ class MainFragment : BrowseSupportFragment() {
 
         val builder = MediaItem.Builder()
             .setMediaId(mediaId ?: uri)
-            .setUri(Uri.parse(uri))
+            .setUri(uri.toUri())
             .setMimeType(getMimeType(uri))
             .setMediaMetadata(metadataBuilder.build())
 
@@ -692,7 +694,7 @@ class MainFragment : BrowseSupportFragment() {
                     } else if (item.mediaId.startsWith("content://")) {
                         addLocalToPlaylist(item.mediaId, item.mediaMetadata.title.toString(), replace = true)
                     } else if (item.mediaId.startsWith("file://")) {
-                        val file = java.io.File(Uri.parse(item.mediaId).path ?: "")
+                        val file = java.io.File(item.mediaId.toUri().path ?: "")
                         addFilesToPlaylist(file, replace = true)
                     }
                 } else if (item.mediaId.startsWith("smb://")) {
@@ -704,7 +706,7 @@ class MainFragment : BrowseSupportFragment() {
                     }
                 } else if (item.mediaId.startsWith("content://") || item.mediaId.startsWith("file://")) {
                     if (item.mediaId.startsWith("file://")) {
-                        browseFileStorage(Uri.parse(item.mediaId).path ?: "")
+                        browseFileStorage(item.mediaId.toUri().path ?: "")
                     } else {
                         browseLocalDirectory(item.mediaId)
                     }
@@ -821,7 +823,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun browseLocalDirectory(uriString: String) {
         val context = activity ?: return
-        val uri = Uri.parse(uriString)
+        val uri = uriString.toUri()
         val loadingToast = Toast.makeText(context, "Scanning folder...", Toast.LENGTH_SHORT)
         loadingToast.show()
 
@@ -986,7 +988,7 @@ class MainFragment : BrowseSupportFragment() {
             .setTitle(name)
             .setAdapter(adapter) { _, which ->
                 if (uriString.startsWith("file://")) {
-                    val file = java.io.File(Uri.parse(uriString).path ?: "")
+                    val file = java.io.File(uriString.toUri().path ?: "")
                     addFilesToPlaylist(file, which == 1)
                 } else {
                     addLocalToPlaylist(uriString, name, which == 1)
@@ -1000,7 +1002,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val mainActivity = activity as? MainActivity
         val controller = mainActivity?.getController() ?: return
-        val rootUri = Uri.parse(uriString)
+        val rootUri = uriString.toUri()
 
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
@@ -1279,7 +1281,7 @@ class MainFragment : BrowseSupportFragment() {
                     .setPositiveButton("Settings") { _, _ ->
                         try {
                             val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                            intent.data = Uri.parse("package:${context.packageName}")
+                            intent.data = "package:${context.packageName}".toUri()
                             startActivity(intent)
                         } catch (e: Exception) {
                             val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
@@ -1378,7 +1380,7 @@ class MainFragment : BrowseSupportFragment() {
                 .setPositiveButton("Settings") { _, _ ->
                     try {
                         val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                        intent.data = Uri.parse("package:${context.packageName}")
+                        intent.data = "package:${context.packageName}".toUri()
                         startActivity(intent)
                     } catch (e: Exception) {
                         val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
@@ -1586,7 +1588,7 @@ class MainFragment : BrowseSupportFragment() {
             .setTitle(name)
             .setAdapter(adapter) { _, which ->
                 if (uriString.startsWith("file://")) {
-                    val file = java.io.File(Uri.parse(uriString).path ?: "")
+                    val file = java.io.File(uriString.toUri().path ?: "")
                     addFilesToPlaylist(file, which == 1)
                 } else {
                     addLocalToPlaylist(uriString, name, which == 1)
@@ -1948,14 +1950,14 @@ class MainFragment : BrowseSupportFragment() {
     private fun toggleResumePlayback() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_RESUME, false)
-        prefs.edit().putBoolean(KEY_RESUME, !current).apply()
+        prefs.edit { putBoolean(KEY_RESUME, !current) }
         refreshWithCurrentFocus()
     }
 
     private fun toggleRecentFiles() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_RECENT, true)
-        prefs.edit().putBoolean(KEY_RECENT, !current).apply()
+        prefs.edit { putBoolean(KEY_RECENT, !current) }
         refreshWithCurrentFocus()
     }
 
@@ -2049,12 +2051,12 @@ class MainFragment : BrowseSupportFragment() {
             val newObj = JSONObject().apply {
                 put("uri", uri)
                 put("isLocal", isLocal)
-                val rawName = Uri.parse(uri).lastPathSegment ?: uri
+                val rawName = uri.toUri().lastPathSegment ?: uri
                 val cleanName = if (rawName.contains(":")) rawName.substringAfterLast(":") else rawName
                 put("name", cleanName)
             }
             jsonArray.put(newObj)
-            prefs.edit().putString(KEY_MUSIC_FOLDERS, jsonArray.toString()).apply()
+            prefs.edit { putString(KEY_MUSIC_FOLDERS, jsonArray.toString()) }
             refreshWithCurrentFocus()
             Toast.makeText(requireContext(), "Folder added", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -2270,7 +2272,7 @@ class MainFragment : BrowseSupportFragment() {
             for (i in 0 until jsonArray.length()) {
                 if (i != index) newArray.put(jsonArray.get(i))
             }
-            prefs.edit().putString(KEY_SHARES, newArray.toString()).apply()
+            prefs.edit { putString(KEY_SHARES, newArray.toString()) }
         } else {
             val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             val jsonArray = JSONArray(prefs.getString(KEY_MUSIC_FOLDERS, "[]"))
@@ -2281,7 +2283,7 @@ class MainFragment : BrowseSupportFragment() {
                     newArray.put(jsonArray.get(i))
                 }
             }
-            prefs.edit().putString(KEY_MUSIC_FOLDERS, newArray.toString()).apply()
+            prefs.edit { putString(KEY_MUSIC_FOLDERS, newArray.toString()) }
         }
         refreshWithCurrentFocus()
         Toast.makeText(requireContext(), "Folder removed", Toast.LENGTH_SHORT).show()
@@ -2314,7 +2316,7 @@ class MainFragment : BrowseSupportFragment() {
                     val segment = if (uri.startsWith("smb://")) {
                         Uri.decode(uri.substringAfterLast("/").takeIf { it.isNotEmpty() } ?: uri)
                     } else {
-                        Uri.parse(uri).lastPathSegment ?: uri
+                        uri.toUri().lastPathSegment ?: uri
                     }
                     val title = segment.substringBeforeLast(".")
                     items.add(createMediaItem(title, "", uri))
@@ -2339,7 +2341,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun clearRecentFiles() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        prefs.edit().putString("recent_list", "[]").apply()
+        prefs.edit { putString("recent_list", "[]") }
         refreshWithCurrentFocus()
         Toast.makeText(requireContext(), "Recent files cleared", Toast.LENGTH_SHORT).show()
     }
@@ -2409,7 +2411,7 @@ class MainFragment : BrowseSupportFragment() {
     private fun toggleAutoScan() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_AUTO_SCAN, false)
-        prefs.edit().putBoolean(KEY_AUTO_SCAN, !current).apply()
+        prefs.edit { putBoolean(KEY_AUTO_SCAN, !current) }
         refreshWithCurrentFocus()
     }
 
@@ -2434,13 +2436,13 @@ class MainFragment : BrowseSupportFragment() {
                 when (which) {
                     0 -> {
                         val current = prefs.getBoolean(KEY_NETWORK_BUFFER, true)
-                        prefs.edit().putBoolean(KEY_NETWORK_BUFFER, !current).apply()
+                        prefs.edit { putBoolean(KEY_NETWORK_BUFFER, !current) }
                         showNetworkSettingsMenu()
                         refreshWithCurrentFocus()
                     }
                     1 -> {
                         val current = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
-                        prefs.edit().putBoolean(KEY_AUTO_RECONNECT, !current).apply()
+                        prefs.edit { putBoolean(KEY_AUTO_RECONNECT, !current) }
                         showNetworkSettingsMenu()
                         refreshWithCurrentFocus()
                     }

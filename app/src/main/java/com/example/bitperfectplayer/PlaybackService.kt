@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -40,12 +41,12 @@ class PlaybackService : MediaSessionService() {
 
     companion object {
         // ── Constants ─────────────────────────────────────────────────────────
-        private const val TAG                  = "PlaybackService"
-        private const val PREFS_APP            = "AppSettings"
-        private const val KEY_NETWORK_BUFFER   = "network_buffer"
-        private const val KEY_AUTO_RECONNECT   = "auto_reconnect"
-        private const val KEY_RESUME_PLAYBACK  = "resume_playback"
-        private const val KEY_RECENT_FILES     = "recent_files"
+        const val TAG                  = "PlaybackService"
+        const val PREFS_APP            = "AppSettings"
+        const val KEY_NETWORK_BUFFER   = "network_buffer"
+        const val KEY_AUTO_RECONNECT   = "auto_reconnect"
+        const val KEY_RESUME_PLAYBACK  = "resume_playback"
+        const val KEY_RECENT_FILES     = "recent_files"
 
         private const val HTTP_TIMEOUT_SECS    = 20L
         private const val USER_AGENT           = "BitperfectPlayer/1.1 (Android TV)"
@@ -170,8 +171,9 @@ class PlaybackService : MediaSessionService() {
     private fun saveCurrentPosition() {
         mediaSession?.player?.let { p ->
             if (p.playbackState != Player.STATE_IDLE)
-                getSharedPreferences(PREFS_APP, MODE_PRIVATE)
-                    .edit().putLong("last_played_pos", p.currentPosition).apply()
+                getSharedPreferences(PREFS_APP, MODE_PRIVATE).edit {
+                    putLong("last_played_pos", p.currentPosition)
+                }
         }
     }
 
@@ -382,16 +384,16 @@ class PlaybackService : MediaSessionService() {
 
         if (settings.getBoolean(KEY_RESUME_PLAYBACK, false)) {
             val player = mediaSession?.player
-            val queue  = JSONArray()
+            val queue = JSONArray()
             player?.let {
                 for (i in 0 until it.mediaItemCount) {
                     val item = it.getMediaItemAt(i)
                     queue.put(JSONObject().apply {
                         put("mediaId", item.mediaId)
-                        put("title",   item.mediaMetadata.title?.toString()  ?: "")
-                        put("artist",  item.mediaMetadata.artist?.toString() ?: "")
-                        put("uri",     item.localConfiguration?.uri?.toString() ?: item.mediaId)
-                        
+                        put("title", item.mediaMetadata.title?.toString() ?: "")
+                        put("artist", item.mediaMetadata.artist?.toString() ?: "")
+                        put("uri", item.localConfiguration?.uri?.toString() ?: item.mediaId)
+
                         val clip = item.clippingConfiguration
                         if (clip.startPositionMs > 0) {
                             put("start", clip.startPositionMs)
@@ -402,25 +404,25 @@ class PlaybackService : MediaSessionService() {
                     })
                 }
             }
-            settings.edit()
-                .putString("last_played_uri",    uri)
-                .putString("last_played_title",  title)
-                .putString("last_played_artist", artist)
-                .putInt(   "last_played_index",  player?.currentMediaItemIndex ?: 0)
-                .putString("last_played_queue",  queue.toString())
-                .apply()
+            settings.edit {
+                putString("last_played_uri", uri)
+                putString("last_played_title", title)
+                putString("last_played_artist", artist)
+                putInt("last_played_index", player?.currentMediaItemIndex ?: 0)
+                putString("last_played_queue", queue.toString())
+            }
         }
 
         if (settings.getBoolean(KEY_RECENT_FILES, true)) {
             try {
-                val arr  = JSONArray(settings.getString("recent_list", "[]"))
+                val arr = JSONArray(settings.getString("recent_list", "[]"))
                 val newArr = JSONArray()
                 newArr.put(JSONObject().apply { put("uri", uri); put("title", title); put("artist", artist) })
                 for (i in 0 until arr.length()) {
                     if (newArr.length() >= RECENT_LIST_MAX) break
                     if (arr.getJSONObject(i).getString("uri") != uri) newArr.put(arr.getJSONObject(i))
                 }
-                settings.edit().putString("recent_list", newArr.toString()).apply()
+                settings.edit { putString("recent_list", newArr.toString()) }
             } catch (e: Exception) { e.printStackTrace() }
         }
     }

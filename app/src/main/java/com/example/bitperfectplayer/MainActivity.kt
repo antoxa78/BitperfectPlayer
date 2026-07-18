@@ -14,6 +14,8 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -54,15 +56,15 @@ class MainActivity : BaseActivity() {
         // Write defaults on first run only
         val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
         if (!prefs.contains("screensaver_delay")) {
-            prefs.edit()
-                .putInt("screensaver_delay",   1)
-                .putBoolean("resume_playback", true)
-                .putBoolean("auto_scan",       true)
-                .putBoolean("network_buffer",  true)
-                .putBoolean("auto_reconnect",  true)
-                .putInt(KEY_WAVEFORM,          4)
-                .putInt(KEY_COLOR_SCHEME,      5)
-                .apply()
+            prefs.edit {
+                putInt("screensaver_delay", 1)
+                putBoolean("resume_playback", true)
+                putBoolean("auto_scan", true)
+                putBoolean("network_buffer", true)
+                putBoolean("auto_reconnect", true)
+                putInt(KEY_WAVEFORM, 4)
+                putInt(KEY_COLOR_SCHEME, 5)
+            }
         }
 
         checkPermissions()
@@ -420,9 +422,9 @@ class MainActivity : BaseActivity() {
             uriString.startsWith("content://") ||
             uriString.startsWith("http://")    ||
             uriString.startsWith("https://")   ||
-            uriString.startsWith("smb://")     -> Uri.parse(uriString)
+            uriString.startsWith("smb://") -> uriString.toUri()
             // Last-ditch attempt: partial SAF path
-            basePath == null && uriString.startsWith("primary%3A") -> Uri.parse(uriString)
+            basePath == null && uriString.startsWith("primary%3A") -> uriString.toUri()
             else -> null
         }
     } catch (e: Exception) { null }

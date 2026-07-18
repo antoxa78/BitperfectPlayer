@@ -1,5 +1,6 @@
 package com.example.bitperfectplayer
 
+import androidx.core.net.toUri
 import jcifs.CIFSContext
 import jcifs.config.PropertyConfiguration
 import jcifs.context.BaseContext
@@ -51,7 +52,7 @@ object SmbContext {
     fun getContextForUri(uri: String): CIFSContext {
         try {
             // Use android.net.Uri as it's more lenient with spaces and special chars than java.net.URI
-            val parsedUri = android.net.Uri.parse(uri)
+            val parsedUri = uri.toUri()
             val userInfo = parsedUri.userInfo
             if (userInfo != null && userInfo.contains(":")) {
                 val parts = userInfo.split(":", limit = 2)

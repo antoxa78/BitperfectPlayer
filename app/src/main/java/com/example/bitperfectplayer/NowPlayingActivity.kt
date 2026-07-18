@@ -29,6 +29,8 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
 import okhttp3.OkHttpClient
@@ -347,6 +349,7 @@ class NowPlayingActivity : BaseActivity() {
         }
     }
 
+    @OptIn(UnstableApi::class)
     override fun updateScreensaverText(textView: TextView) {
         val controller = mediaController ?: return
         val metadata   = controller.mediaMetadata
@@ -666,6 +669,7 @@ class NowPlayingActivity : BaseActivity() {
 
     // ── Format helpers ────────────────────────────────────────────────────────
 
+    @OptIn(UnstableApi::class)
     private fun formatInfoParts(f: Format): List<String> {
         val p = mutableListOf<String>()
         if (f.bitrate != Format.NO_VALUE && f.bitrate > 0) p.add("${f.bitrate / 1000} kbps")
@@ -674,6 +678,7 @@ class NowPlayingActivity : BaseActivity() {
         if (bd.isNotEmpty()) p.add(bd)
         return p
     }
+    @OptIn(UnstableApi::class)
     private fun buildFormatInfo(f: Format): String? = formatInfoParts(f).takeIf { it.isNotEmpty() }?.joinToString(" | ")
 
     // ── Playlist dialog ───────────────────────────────────────────────────────
@@ -717,7 +722,7 @@ class NowPlayingActivity : BaseActivity() {
                     .setTitle("All Files Access Required")
                     .setMessage("Please grant 'All Files Access' in system settings.")
                     .setPositiveButton("Settings") { _, _ ->
-                        try { startActivity(android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).also { it.data = Uri.parse("package:$packageName") }) }
+                        try { startActivity(android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).also { it.data = "package:$packageName".toUri() }) }
                         catch (e: Exception) { startActivity(android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
                     }
                     .setNegativeButton("Cancel", null).show()
@@ -867,7 +872,7 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun resolvePlaylistEntry(path: String, base: String?): Uri? {
         var r = path; if (base!=null && !path.contains("://") && !path.startsWith("/")) r = if (base.endsWith("/")) "$base$path" else "$base/$path"
-        return try { when { r.startsWith("/") -> Uri.fromFile(java.io.File(r)); r.startsWith("file://") -> Uri.fromFile(java.io.File(r.substring(7))); r.startsWith("content://")||r.startsWith("http://")||r.startsWith("https://")||r.startsWith("smb://") -> Uri.parse(r); else -> null } } catch (e: Exception) { null }
+        return try { when { r.startsWith("/") -> Uri.fromFile(java.io.File(r)); r.startsWith("file://") -> Uri.fromFile(java.io.File(r.substring(7))); r.startsWith("content://")||r.startsWith("http://")||r.startsWith("https://")||r.startsWith("smb://") -> r.toUri(); else -> null } } catch (e: Exception) { null }
     }
 
     private fun buildPlaylistItem(uri: Uri, title: String?): MediaItem {
