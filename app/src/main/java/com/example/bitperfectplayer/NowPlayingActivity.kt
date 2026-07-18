@@ -33,6 +33,7 @@ import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
+import jcifs.smb.SmbFile
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -50,6 +51,9 @@ class NowPlayingActivity : BaseActivity() {
         private const val PROGRESS_TICK_MS   = 1_000L
         private const val METADATA_DELAY_1   = 1_000L
         private const val METADATA_DELAY_2   = 3_000L
+
+        private val CLEANUP_REGEX = Regex("(?i)(\\s*\\(.*?remaster.*?\\)|\\s*\\[.*?explicit.*?\\]|\\s*\\(.*?live.*?\\)|\\s*\\(.*?feat.*?\\)|\\s*-\\s*single|\\s*-\\s*ep)")
+        private val FOLDER_ART_NAMES = arrayOf("folder.jpg", "cover.jpg", "album.jpg", "folder.png", "cover.png", "album.png", "front.jpg")
 
         val THEME_COLORS = intArrayOf(
             0xFF00E676.toInt(), 0xFF2979FF.toInt(), 0xFFFFC400.toInt(),
@@ -469,7 +473,7 @@ class NowPlayingActivity : BaseActivity() {
         textPlaylistPos.text = "${controller.currentMediaItemIndex + 1} / ${controller.mediaItemCount}"
 
         val uri = mediaItem?.mediaId ?: ""
-        loadAlbumArt(dispArtist, metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString(), dispTrack)
+        loadAlbumArt(uri, dispArtist, metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString(), dispTrack)
 
         btnPlayPause.setImageResource(if (controller.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
         updateShuffleRepeatUI()
@@ -505,11 +509,12 @@ class NowPlayingActivity : BaseActivity() {
      *
      * Priority:
      *  1. Embedded artwork in MediaMetadata.artworkData (ExoPlayer reads ID3/FLAC tags)
-     *  2. MusicBrainz release search → Cover Art Archive (redirects followed automatically)
-     *  3. iTunes Search API (free, no key)
-     *  4. Fallback: ic_audio icon tinted with theme color
+     *  2. Local folder artwork (folder.jpg, cover.jpg, etc.)
+     *  3. MusicBrainz release search → Cover Art Archive
+     *  4. iTunes Search API
+     *  5. Fallback: ic_audio icon tinted with theme color
      */
-    private fun loadAlbumArt(artist: String, album: String?, track: String) {
+    private fun loadAlbumArt(uri: String, artist: String, album: String?, track: String) {
         val artKey = "$artist|${album ?: track}"
         if (artKey == lastArtKey) return
         lastArtKey = artKey
@@ -538,8 +543,18 @@ class NowPlayingActivity : BaseActivity() {
         val capturedKey = artKey
 
         Thread {
-            val bitmap = fetchFromMusicBrainz(artist, album, track)
-                ?: fetchFromItunes(artist, album ?: track)
+            // 2 — Local folder artwork
+            var bitmap = fetchLocalFolderArt(uri)
+
+            if (bitmap == null) {
+                val sArtist = sanitizeForSearch(artist)
+                val sAlbum  = album?.let { sanitizeForSearch(it) }
+                val sTrack  = sanitizeForSearch(track)
+
+                // 3 & 4 — Online search with sanitized metadata
+                bitmap = fetchFromMusicBrainz(sArtist, sAlbum, sTrack)
+                    ?: fetchFromItunes(sArtist, sAlbum ?: sTrack)
+            }
 
             runOnUiThread {
                 if (capturedKey != lastArtKey) return@runOnUiThread   // track changed while fetching
@@ -554,6 +569,57 @@ class NowPlayingActivity : BaseActivity() {
                 }
             }
         }.start()
+    }
+
+    private fun sanitizeForSearch(text: String): String {
+        return text.replace(CLEANUP_REGEX, "").trim()
+    }
+
+    private fun fetchLocalFolderArt(uriString: String): Bitmap? {
+        try {
+            if (uriString.startsWith("smb://")) {
+                val smbFile = SmbFile(uriString, SmbContext.getContextForUri(uriString))
+                val parent = smbFile.parent ?: return null
+                for (name in FOLDER_ART_NAMES) {
+                    try {
+                        val artFile = SmbFile(parent + name, SmbContext.getContextForUri(uriString))
+                        if (artFile.exists()) {
+                            artFile.getInputStream().use { return BitmapFactory.decodeStream(it) }
+                        }
+                    } catch (_: Exception) {}
+                }
+            } else if (uriString.startsWith("file://") || uriString.startsWith("/")) {
+                val path = if (uriString.startsWith("file://")) uriString.substring(7) else uriString
+                val file = java.io.File(path)
+                val parent = file.parentFile ?: return null
+                for (name in FOLDER_ART_NAMES) {
+                    val artFile = java.io.File(parent, name)
+                    if (artFile.exists()) {
+                        return BitmapFactory.decodeFile(artFile.absolutePath)
+                    }
+                }
+            } else if (uriString.startsWith("content://")) {
+                val uri = uriString.toUri()
+                if (android.provider.DocumentsContract.isDocumentUri(this, uri)) {
+                    val docId = android.provider.DocumentsContract.getDocumentId(uri)
+                    if (docId.contains("/")) {
+                        val parentId = docId.substringBeforeLast("/")
+                        val authority = uri.authority ?: return null
+                        val treeId = if (docId.contains(":")) docId.substringBefore(":") else ""
+                        for (name in FOLDER_ART_NAMES) {
+                            try {
+                                val childId = if (parentId.endsWith("/")) "$parentId$name" else "$parentId/$name"
+                                val childUri = android.provider.DocumentsContract.buildDocumentUri(authority, childId)
+                                contentResolver.openInputStream(childUri)?.use { return BitmapFactory.decodeStream(it) }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.d("AlbumArt", "Local folder art failed: ${e.message}")
+        }
+        return null
     }
 
     /**
