@@ -952,7 +952,19 @@ class NowPlayingActivity : BaseActivity() {
     private fun buildMediaItem(f: java.io.File, uri: Uri): MediaItem {
         val lo = f.name.lowercase()
         val mime = mimeTypeFor(lo)
-        return MediaItem.Builder().setMediaId(uri.toString()).setUri(uri).setMimeType(mime).setMediaMetadata(MediaMetadata.Builder().setTitle(f.name.substringBeforeLast(".")).build()).build()
+        val meta = MetadataUtils.getMetadata(this, uri)
+        return MediaItem.Builder()
+            .setMediaId(uri.toString())
+            .setUri(uri)
+            .setMimeType(mime)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(meta.title ?: f.name.substringBeforeLast("."))
+                    .setArtist(meta.artist ?: "")
+                    .setAlbumTitle(meta.album ?: "")
+                    .build()
+            )
+            .build()
     }
 
     private fun mimeTypeFor(uriString: String): String? {

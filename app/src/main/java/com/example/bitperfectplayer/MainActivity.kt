@@ -212,13 +212,16 @@ class MainActivity : BaseActivity() {
             contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         } catch (_: Exception) {}
 
+        val meta = MetadataUtils.getMetadata(this, uri)
         return MediaItem.Builder()
             .setMediaId(uri.toString())
             .setUri(uri)
             .setMimeType(mimeTypeFor(uri.toString()))
             .setMediaMetadata(
                 MediaMetadata.Builder()
-                    .setTitle(uri.lastPathSegment ?: "Unknown")
+                    .setTitle(meta.title ?: uri.lastPathSegment ?: "Unknown")
+                    .setArtist(meta.artist ?: "")
+                    .setAlbumTitle(meta.album ?: "")
                     .build()
             )
             .build()

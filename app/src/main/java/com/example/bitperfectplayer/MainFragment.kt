@@ -1038,7 +1038,8 @@ class MainFragment : BrowseSupportFragment() {
                     } catch (e: Exception) {
                         // Fallback if buildChildDocumentsUriUsingTree fails (might not be a tree URI)
                         if (isPlayable(displayName)) {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     }
                 } else if (isPlayable(displayName)) {
@@ -1049,7 +1050,8 @@ class MainFragment : BrowseSupportFragment() {
                         if (parsed.isNotEmpty()) {
                             itemsToAdd.addAll(parsed)
                         } else {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     } else if (lower.endsWith(".cue")) {
                         val basePath = uri.toString().substringBeforeLast("%2F")
@@ -1057,7 +1059,8 @@ class MainFragment : BrowseSupportFragment() {
                         if (parsed.isNotEmpty()) {
                             itemsToAdd.addAll(parsed)
                         } else {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     } else if (lower.endsWith(".pls")) {
                         val basePath = uri.toString().substringBeforeLast("%2F")
@@ -1065,10 +1068,12 @@ class MainFragment : BrowseSupportFragment() {
                         if (parsed.isNotEmpty()) {
                             itemsToAdd.addAll(parsed)
                         } else {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     } else {
-                        itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                        val meta = MetadataUtils.getMetadata(context, uri)
+                        itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                     }
                 }
             }
@@ -1086,14 +1091,16 @@ class MainFragment : BrowseSupportFragment() {
                 if (parsed.isNotEmpty()) {
                     itemsToAdd.addAll(parsed)
                 } else {
-                    itemsToAdd.add(createMediaItem(name, "", rootUri.toString()))
+                    val meta = MetadataUtils.getMetadata(context, rootUri)
+                    itemsToAdd.add(createMediaItem(meta.title ?: name, meta.artist ?: "", rootUri.toString()))
                 }
             } else if (lowerName.endsWith(".cue")) {
                 val parsed = mainActivity.parseCue(rootUri)
                 if (parsed.isNotEmpty()) {
                     itemsToAdd.addAll(parsed)
                 } else {
-                    itemsToAdd.add(createMediaItem(name, "", rootUri.toString()))
+                    val meta = MetadataUtils.getMetadata(context, rootUri)
+                    itemsToAdd.add(createMediaItem(meta.title ?: name, meta.artist ?: "", rootUri.toString()))
                 }
             } else if (lowerName.endsWith(".pls")) {
                 val basePath = rootUri.toString().substringBeforeLast("%2F")
@@ -1622,11 +1629,15 @@ class MainFragment : BrowseSupportFragment() {
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
-                                    itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                                    val uri = Uri.fromFile(file)
+                                    val meta = MetadataUtils.getMetadata(context, uri)
+                                    itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                                 }
                             }
                         } catch (e: Exception) {
-                            itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                            val uri = Uri.fromFile(file)
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                         }
                     } else if (lower.endsWith(".cue")) {
                         try {
@@ -1635,11 +1646,15 @@ class MainFragment : BrowseSupportFragment() {
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
-                                    itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                                    val uri = Uri.fromFile(file)
+                                    val meta = MetadataUtils.getMetadata(context, uri)
+                                    itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                                 }
                             }
                         } catch (e: Exception) {
-                            itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                            val uri = Uri.fromFile(file)
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                         }
                     } else if (lower.endsWith(".pls")) {
                         try {
@@ -1648,15 +1663,20 @@ class MainFragment : BrowseSupportFragment() {
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
-                                    itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                                    val uri = Uri.fromFile(file)
+                                    val meta = MetadataUtils.getMetadata(context, uri)
+                                    itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                                 }
                             }
                         } catch (e: Exception) {
-                            itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                            val uri = Uri.fromFile(file)
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                         }
                     } else {
-                        val uri = Uri.fromFile(file).toString()
-                        itemsToAdd.add(createMediaItem(file.name, "Local Storage", uri))
+                        val uri = Uri.fromFile(file)
+                        val meta = MetadataUtils.getMetadata(context, uri)
+                        itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                     }
                 }
             }
