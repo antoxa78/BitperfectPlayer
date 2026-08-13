@@ -106,7 +106,7 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
             id.startsWith("action:Player Color Scheme") -> R.drawable.ic_palette
             id.startsWith("action:Waveform Type")     -> R.drawable.anim_playing
             id.startsWith("smb://")                   -> R.drawable.ic_network_music
-            lower.endsWith(".m3u") || lower.endsWith(".m3u8") || lower.endsWith(".pls") -> {
+            lower.endsWith(".m3u") || lower.endsWith(".m3u8") || lower.endsWith(".pls") || lower.endsWith(".cue") -> {
                 if (id.startsWith("content://")) R.drawable.ic_playlist_local else R.drawable.ic_playlist
             }
             mediaItem.mediaMetadata.artist?.contains("Playlist") == true -> {

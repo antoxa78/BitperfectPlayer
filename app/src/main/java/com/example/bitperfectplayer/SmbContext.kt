@@ -1,5 +1,6 @@
 package com.example.bitperfectplayer
 
+import androidx.core.net.toUri
 import jcifs.CIFSContext
 import jcifs.config.PropertyConfiguration
 import jcifs.context.BaseContext
@@ -50,7 +51,8 @@ object SmbContext {
      */
     fun getContextForUri(uri: String): CIFSContext {
         try {
-            val parsedUri = java.net.URI(uri)
+            // Use android.net.Uri as it's more lenient with spaces and special chars than java.net.URI
+            val parsedUri = uri.toUri()
             val userInfo = parsedUri.userInfo
             if (userInfo != null && userInfo.contains(":")) {
                 val parts = userInfo.split(":", limit = 2)
@@ -67,12 +69,12 @@ object SmbContext {
     private fun buildContext(): CIFSContext {
         val props = Properties().apply {
             // Protocol version range — let the server negotiate
-            setProperty("jcifs.smb.client.minVersion", "SMB202")
+            setProperty("jcifs.smb.client.minVersion", "SMB1")
             setProperty("jcifs.smb.client.maxVersion", "SMB311")
 
             // Authentication
             setProperty("jcifs.smb.client.enableSMB2", "true")
-            setProperty("jcifs.smb.client.dfs.disabled", "false")
+            setProperty("jcifs.smb.client.dfs.disabled", "true") // Disable DFS to avoid "Access is denied" on many simple shares
 
             // Timeouts (ms)
             setProperty("jcifs.smb.client.connTimeout", "15000")
@@ -86,8 +88,12 @@ object SmbContext {
             // Authentication settings for modern servers
             setProperty("jcifs.smb.client.useRawNTLM", "true")
             setProperty("jcifs.smb.lmCompatibility", "3") // Force NTLMv2
-            setProperty("jcifs.smb.client.enableSMB2", "true")
             setProperty("jcifs.smb.client.useExtendedSecurity", "true")
+
+            // Critical for listing shares on many modern servers/NAS
+            setProperty("jcifs.smb.client.ipcSigningEnforced", "false")
+            setProperty("jcifs.smb.client.signingEnforced", "false")
+            setProperty("jcifs.smb.client.signingPreferred", "false")
 
             // Buffer sizes for streaming audio
             setProperty("jcifs.smb.client.rcv_buf_size", "131072")

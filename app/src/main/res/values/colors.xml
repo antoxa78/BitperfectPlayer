@@ -12,6 +12,7 @@
     <!-- Background shades -->
     <color name="bg_dark">#FF121212</color>
     <color name="bg_pure_black">#FF000000</color>
+    <color name="ic_launcher_background_alien">#FF0D0D15</color>
 
     <!-- Text -->
     <color name="text_primary">#FFFFFFFF</color>
