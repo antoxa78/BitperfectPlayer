@@ -86,6 +86,8 @@
         android:textColor="@color/text_primary"
         android:textSize="12sp"
         android:gravity="center"
+        android:maxLines="1"
+        android:ellipsize="end"
         android:fontFamily="monospace" />
 
     <com.example.bitperfectplayer.AnimatedWaveformView

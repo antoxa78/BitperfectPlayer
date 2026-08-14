@@ -66,6 +66,11 @@ class MainActivity : BaseActivity() {
                 putInt(KEY_COLOR_SCHEME, 5)
             }
         }
+        // Initialize newly added settings independently so upgrades do not silently
+        // disable features when older preferences already contain screensaver_delay.
+        if (!prefs.contains("resume_playback")) {
+            prefs.edit { putBoolean("resume_playback", true) }
+        }
 
         checkPermissions()
 
@@ -117,9 +122,30 @@ class MainActivity : BaseActivity() {
             return
         }
         val metadata = controller.mediaMetadata
-        val title  = metadata.title?.toString() ?: "Bitperfect Player"
+        var title  = metadata.title?.toString() ?: "Bitperfect Player"
         val artist = metadata.artist?.toString() ?: ""
         val album = metadata.albumTitle?.toString() ?: ""
+
+        // ICY streams: prefer the in-band StreamTitle captured by the service.
+        val mediaId  = controller.currentMediaItem?.mediaId ?: ""
+        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
+        val icy      = PlaybackService.icyInfo
+        if (isStream) {
+            val icyForItem = icy?.takeIf { it.mediaId == mediaId }
+            val station = metadata.station?.toString()?.takeIf { it.isNotBlank() }
+                ?: icyForItem?.station
+            if (icyForItem != null && !icyForItem.title.isNullOrBlank()) {
+                title = icyForItem.title
+            } else if (!station.isNullOrBlank()) {
+                title = station
+            } else {
+                // No usable metadata: prettify the URL-derived static title.
+                val last = mediaId.toUri().lastPathSegment
+                if (last != null && title == last) title = last.substringBeforeLast(".")
+                else if (title.isBlank()) title = last?.substringBeforeLast(".")?.takeIf { it.isNotBlank() }
+                    ?: mediaId.toUri().host?.removePrefix("www.") ?: title
+            }
+        }
 
         val sb = SpannableStringBuilder()
         sb.append("Now Playing:\n\n")

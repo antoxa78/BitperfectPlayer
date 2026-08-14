@@ -69,6 +69,7 @@ class NowPlayingActivity : BaseActivity() {
 
     // Album art: track last fetched key to avoid redundant network requests
     private var lastArtKey: String = ""
+    private var lastIcyInfo: IcyStreamInfo? = null
     private val artHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -362,12 +363,36 @@ class NowPlayingActivity : BaseActivity() {
         var artist = metadata.artist?.toString() ?: itemMeta?.artist?.toString() ?: metadata.albumArtist?.toString() ?: ""
         var album = metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString() ?: ""
 
+        // ICY streams: prefer the in-band StreamTitle captured by the service.
+        val mediaId  = controller.currentMediaItem?.mediaId ?: ""
+        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
+        val icy      = PlaybackService.icyInfo
+        val station  = metadata.station?.toString()?.takeIf { it.isNotBlank() }
+            ?: itemMeta?.station?.toString()?.takeIf { it.isNotBlank() }
+            ?: icy?.takeIf { it.mediaId == mediaId }?.station
+        val genre    = metadata.genre?.toString()?.takeIf { it.isNotBlank() }
+            ?: icy?.takeIf { it.mediaId == mediaId }?.genre?.takeIf { it.isNotBlank() }
+        if (isStream && icy != null && icy.mediaId == mediaId) {
+            if (!icy.title.isNullOrBlank()) title = icy.title
+            else if (!station.isNullOrBlank()) {
+                title = station
+                if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true))
+                    artist = genre ?: streamHost(mediaId) ?: ""
+                album = icy.description ?: album
+            } else {
+                title = streamTitleFallback(mediaId, title) ?: title
+            }
+        } else if (isStream) {
+            if (!station.isNullOrBlank()) title = station
+            else title = streamTitleFallback(mediaId, title) ?: title
+        }
+
         val delims = arrayOf(" - ", " – ", " — ", " : ", " | ")
         if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true)) {
             for (d in delims) { if (title.contains(d)) { val p = title.split(d, limit=2); artist = p[0].trim(); title = p[1].trim(); break } }
         }
-        val station = metadata.station?.toString() ?: itemMeta?.station?.toString()
-        if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true)) artist = station ?: ""
+        if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true))
+            artist = station ?: streamHost(mediaId) ?: ""
 
         val sb = SpannableStringBuilder()
         sb.append("Now Playing:\n\n")
@@ -439,12 +464,30 @@ class NowPlayingActivity : BaseActivity() {
         val displayTitle = metadata.displayTitle?.toString() ?: itemMeta?.displayTitle?.toString()
         val artist       = metadata.artist?.toString()       ?: itemMeta?.artist?.toString()
         val albumArtist  = metadata.albumArtist?.toString()  ?: itemMeta?.albumArtist?.toString()
-        val station      = metadata.station?.toString()      ?: itemMeta?.station?.toString()
         val subtitle     = metadata.subtitle?.toString()     ?: itemMeta?.subtitle?.toString()
         val description  = metadata.description?.toString()  ?: itemMeta?.description?.toString()
 
+        // ICY streams: the item's static title takes precedence over the in-band
+        // StreamTitle in Player.mediaMetadata, so prefer the service-captured info.
+        val mediaId  = mediaItem?.mediaId ?: ""
+        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
+        val icy      = PlaybackService.icyInfo
+        val icyForItem = icy?.takeIf { it.mediaId == mediaId }
+        val icyTrack   = icyForItem?.title?.takeIf { it.isNotBlank() }
+        val icyDesc    = icyForItem?.description
+        val station    = metadata.station?.toString()?.takeIf { it.isNotBlank() }
+                         ?: itemMeta?.station?.toString()?.takeIf { it.isNotBlank() }
+                         ?: icyForItem?.station
+        val genre      = metadata.genre?.toString()?.takeIf { it.isNotBlank() }
+                         ?: icyForItem?.genre?.takeIf { it.isNotBlank() }
+
         var dispArtist = artist ?: albumArtist ?: ""
-        var dispTrack  = title  ?: displayTitle ?: "Unknown Title"
+        var dispTrack  = when {
+            icyTrack != null -> icyTrack
+            isStream && !station.isNullOrBlank() -> station
+            isStream -> streamTitleFallback(mediaId, title ?: displayTitle) ?: displayTitle ?: "Unknown Title"
+            else -> title ?: displayTitle ?: "Unknown Title"
+        }
         if (dispArtist.isEmpty() || dispArtist.equals("Unknown Artist", ignoreCase = true)) {
             dispArtist = when {
                 !subtitle.isNullOrBlank()    && subtitle    != dispTrack -> subtitle
@@ -456,7 +499,13 @@ class NowPlayingActivity : BaseActivity() {
         var split = false
         for (d in delims) { if (dispTrack.contains(d)) { val p = dispTrack.split(d, limit=2); dispArtist = p[0].trim(); dispTrack = p[1].trim(); split = true; break } }
         if (!split && dispArtist.contains(" - ")) { val p = dispArtist.split(" - ", limit=2); dispArtist = p[0].trim(); dispTrack = p[1].trim() }
-        if (dispArtist.isEmpty() || dispArtist.equals("Unknown Artist", ignoreCase = true)) dispArtist = station ?: displayTitle ?: "Unknown Artist"
+        if (dispArtist.isEmpty() || dispArtist.equals("Unknown Artist", ignoreCase = true)) {
+            dispArtist = when {
+                isStream && icyTrack != null -> station ?: streamHost(mediaId) ?: displayTitle ?: "Unknown Artist"
+                isStream -> genre ?: icyDesc ?: streamHost(mediaId) ?: displayTitle ?: "Unknown Artist"
+                else -> station ?: displayTitle ?: "Unknown Artist"
+            }
+        }
         if (dispArtist == dispTrack && !station.isNullOrBlank()) dispArtist = station
 
         textTitle.text  = dispTrack
@@ -464,11 +513,14 @@ class NowPlayingActivity : BaseActivity() {
 
         val finalAlbum = when {
             !station.isNullOrBlank()      && station      != dispTrack && station      != dispArtist -> station
+            !icyDesc.isNullOrBlank()      && icyDesc      != dispTrack && icyDesc      != dispArtist -> icyDesc
             !displayTitle.isNullOrBlank() && displayTitle != dispTrack && displayTitle != dispArtist -> displayTitle
             else -> metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString()
         }
+        // INVISIBLE (not GONE) so the album row keeps its space — the seek bar and
+        // controls below must not shift when stream metadata adds/removes the album.
         if (!finalAlbum.isNullOrEmpty()) { textAlbum.text = finalAlbum; textAlbum.visibility = android.view.View.VISIBLE }
-        else textAlbum.visibility = android.view.View.GONE
+        else textAlbum.visibility = android.view.View.INVISIBLE
 
         textPlaylistPos.text = "${controller.currentMediaItemIndex + 1} / ${controller.mediaItemCount}"
 
@@ -488,7 +540,8 @@ class NowPlayingActivity : BaseActivity() {
         }
         val infoList = mutableListOf<String>()
         val icyName = station ?: albumArtist
-        if (!icyName.isNullOrBlank() && icyName != artist && icyName != dispArtist) infoList.add(icyName)
+        if (!icyName.isNullOrBlank() && icyName != artist && icyName != dispArtist && icyName != dispTrack) infoList.add(icyName)
+        if (!genre.isNullOrBlank() && genre != icyName && genre != dispArtist && genre != dispTrack) infoList.add(genre)
         format?.let { infoList.addAll(formatInfoParts(it)) }
 
         if (infoList.isNotEmpty()) { textBitrate.text = infoList.joinToString(" | "); textBitrate.setTextColor(Color.WHITE) }
@@ -726,6 +779,12 @@ class NowPlayingActivity : BaseActivity() {
                 if (dur > 0 && dur != Long.MAX_VALUE && dur != C.TIME_UNSET) {
                     seekBar.max = dur.toInt(); seekBar.progress = pos.toInt(); textTotalTime.text = formatTime(dur)
                 } else { seekBar.max = 100; seekBar.progress = 0; textTotalTime.text = "∞" }
+
+                // ICY stream titles change without firing onMediaMetadataChanged (the
+                // item's static title masks them), so poll the service-captured title.
+                val icy = PlaybackService.icyInfo
+                if (icy != lastIcyInfo) { lastIcyInfo = icy; updateUI(); refreshScreensaver() }
+
                 handler.postDelayed(this, PROGRESS_TICK_MS)
             }
         })
@@ -734,6 +793,28 @@ class NowPlayingActivity : BaseActivity() {
     private fun formatTime(ms: Long): String { val s = ms / 1000; return "%d:%02d".format(s / 60, s % 60) }
 
     // ── Format helpers ────────────────────────────────────────────────────────
+
+    /** Host of a stream URL (without www.), or null for non-stream media. */
+    private fun streamHost(mediaId: String): String? {
+        if (!mediaId.startsWith("http://") && !mediaId.startsWith("https://")) return null
+        return mediaId.toUri().host?.removePrefix("www.")?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Display title for a stream that broadcasts no usable metadata.
+     * Prettifies a static title that is just the URL's file name (drops the
+     * extension), otherwise derives a name from the URL path or host.
+     */
+    private fun streamTitleFallback(mediaId: String, staticTitle: String?): String? {
+        if (!mediaId.startsWith("http://") && !mediaId.startsWith("https://")) return null
+        val last = mediaId.toUri().lastPathSegment
+        if (!staticTitle.isNullOrBlank()) {
+            return if (last != null && staticTitle == last) last.substringBeforeLast(".") else staticTitle
+        }
+        val name = last?.substringBeforeLast(".")
+        if (!name.isNullOrBlank()) return name
+        return mediaId.toUri().host?.removePrefix("www.")
+    }
 
     @OptIn(UnstableApi::class)
     private fun formatInfoParts(f: Format): List<String> {

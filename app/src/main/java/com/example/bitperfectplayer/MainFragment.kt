@@ -457,9 +457,21 @@ class MainFragment : BrowseSupportFragment() {
         val controller = activity?.getController()
         
         val currentItem = controller?.currentMediaItem
-        val title = currentItem?.mediaMetadata?.title?.toString() ?: "Nothing Playing"
+        var title = currentItem?.mediaMetadata?.title?.toString() ?: "Nothing Playing"
         val subtitle = currentItem?.mediaMetadata?.artist?.toString() ?: ""
         val isPlaying = controller?.isPlaying == true
+
+        // ICY streams: prefer the in-band StreamTitle captured by the service.
+        val mediaId  = currentItem?.mediaId ?: ""
+        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
+        val icy      = PlaybackService.icyInfo
+        if (isStream) {
+            val icyForItem = icy?.takeIf { it.mediaId == mediaId }
+            val station = controller?.mediaMetadata?.station?.toString()?.takeIf { it.isNotBlank() }
+                ?: icyForItem?.station
+            if (icyForItem != null && !icyForItem.title.isNullOrBlank()) title = icyForItem.title
+            else if (!station.isNullOrBlank()) title = station
+        }
 
         val nowPlayingId = if (isPlaying) "action:NOW_PLAYING:$title" else "action:NOW_PAUSED:$title"
         controlsAdapter.add(
@@ -1847,7 +1859,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isResumeEnabled() = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        .getBoolean(KEY_RESUME, false)
+        .getBoolean(KEY_RESUME, true)
 
     private fun isRecentEnabled() = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         .getBoolean(KEY_RECENT, true)
@@ -2344,11 +2356,15 @@ class MainFragment : BrowseSupportFragment() {
             }
             
             if (items.isEmpty()) return
+            val safeIndex = index.coerceIn(0, items.lastIndex)
             
             val activity = activity as? MainActivity
             activity?.getController()?.let { controller ->
-                controller.setMediaItems(items, index, pos)
+                controller.setMediaItems(items, safeIndex, pos)
                 controller.prepare()
+                // Set this explicitly because restoring a playlist does not always
+                // inherit the service's previous playWhenReady state.
+                controller.playWhenReady = true
                 controller.play()
                 
                 val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)

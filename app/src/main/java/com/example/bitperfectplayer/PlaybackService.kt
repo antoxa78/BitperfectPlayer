@@ -12,8 +12,10 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Metadata
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.AudioProcessorChain
 import androidx.media3.common.util.UnstableApi
@@ -29,12 +31,24 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.metadata.icy.IcyInfo
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+
+/** Live ICY info for the stream currently being played, if any. */
+data class IcyStreamInfo(
+    val mediaId: String,
+    val title: String?,
+    val station: String?,
+    val genre: String?,
+    val description: String?,
+    val url: String?
+)
 
 @OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
@@ -90,6 +104,16 @@ class PlaybackService : MediaSessionService() {
         /** Live reference to the running service — used by UI for resetAudioSink(). */
         @Volatile var instance: PlaybackService? = null
             private set
+
+        /**
+         * Latest ICY metadata from the stream currently being played.
+         *
+         * Media3 gives MediaItem metadata precedence over in-band ICY metadata, so
+         * Player.mediaMetadata.title never reflects the stream's StreamTitle once a
+         * static title is set on the item. The UI reads this field instead.
+         */
+        @Volatile var icyInfo: IcyStreamInfo? = null
+            private set
     }
 
     // ── USB DAC monitoring ────────────────────────────────────────────────────
@@ -126,6 +150,11 @@ class PlaybackService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var bitPerfectManager: BitPerfectManager
+
+    /** mediaId of the currently playing item — written on the main thread only. */
+    @Volatile private var activeMediaId: String? = null
+    private val icyInfoLock = Any()
 
     // ── Position saver ────────────────────────────────────────────────────────
 
@@ -236,16 +265,39 @@ class PlaybackService : MediaSessionService() {
     private lateinit var httpFactory: OkHttpDataSource.Factory
 
     private fun buildPlayer(): ExoPlayer {
+        val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        val offloadProvider = BitPerfectOffloadProvider(am)
+        val selectedAudioDevice = AtomicReference<android.media.AudioDeviceInfo?>(null)
+
         val renderersFactory = object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
                 context: Context,
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean
-            ): AudioSink = DefaultAudioSink.Builder(context)
+            ): AudioSink {
+                val sink = DefaultAudioSink.Builder(context)
                 .setEnableAudioTrackPlaybackParams(false)
                 .setEnableFloatOutput(true)
                 .setAudioProcessorChain(BitPerfectAudioProcessorChain)
+                .setAudioOffloadSupportProvider(offloadProvider)
+                .setAudioTrackProvider(object : DefaultAudioSink.AudioTrackProvider {
+                    override fun getAudioTrack(
+                        audioTrackConfig: AudioSink.AudioTrackConfig,
+                        audioAttributes: AudioAttributes,
+                        audioSessionId: Int
+                    ): android.media.AudioTrack {
+                        bitPerfectManager.updateAudioTrack(
+                            audioTrackConfig,
+                            selectedAudioDevice.get()
+                        )
+                        return DefaultAudioSink.AudioTrackProvider.DEFAULT.getAudioTrack(
+                            audioTrackConfig, audioAttributes, audioSessionId
+                        )
+                    }
+                })
                 .build()
+                return BitPerfectAudioSink(sink, bitPerfectManager, selectedAudioDevice)
+            }
         }
 
         val extractorsFactory = androidx.media3.extractor.DefaultExtractorsFactory()
@@ -259,9 +311,15 @@ class PlaybackService : MediaSessionService() {
             .setDataSourceFactory(dataSourceFactory)
 
         val settings = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+            .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+            .build()
+
         val builder = ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
-            .setAudioAttributes(AudioAttributes.DEFAULT, true)
+            .setAudioAttributes(audioAttributes, true)
+            .experimentalSetDynamicSchedulingEnabled(true)
 
         if (settings.getBoolean(KEY_NETWORK_BUFFER, true)) {
             builder.setLoadControl(
@@ -273,7 +331,19 @@ class PlaybackService : MediaSessionService() {
             )
         }
 
-        return builder.build().also { it.addListener(playerListener) }
+        val player = builder.build()
+        player.trackSelectionParameters = player.trackSelectionParameters
+            .buildUpon()
+            .setAudioOffloadPreferences(
+                TrackSelectionParameters.AudioOffloadPreferences.Builder()
+                    // Offload routes audio through the DSP and bypasses the bit-perfect
+                    // mixer, so it must stay disabled for bit-perfect playback.
+                    .setAudioOffloadMode(TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED)
+                    .build()
+            )
+            .build()
+
+        return player.also { it.addListener(playerListener) }
     }
 
     // ── Player listener ───────────────────────────────────────────────────────
@@ -283,6 +353,9 @@ class PlaybackService : MediaSessionService() {
 
         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
             Log.e(TAG, "Player error: ${error.errorCodeName} — ${error.message}", error)
+            // The current AudioTrack is no longer usable. Do not leave its preferred
+            // mixer attributes active while reconnecting or moving to another item.
+            bitPerfectManager.clear()
             val player = mediaSession?.player ?: return
             val autoReconnect = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
                 .getBoolean(KEY_AUTO_RECONNECT, true)
@@ -302,7 +375,24 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-            retryCount = 0; saveLastPlayed(mediaItem)
+            retryCount = 0
+            saveLastPlayed(mediaItem)
+            resetIcyInfo(mediaItem?.mediaId)
+            if (mediaItem == null) bitPerfectManager.clear()
+        }
+
+        override fun onMetadata(metadata: Metadata) {
+            val mediaId = mediaSession?.player?.currentMediaItem?.mediaId ?: return
+            for (i in 0 until metadata.length()) {
+                val entry = metadata.get(i)
+                val title = (if (entry is IcyInfo) entry.title else null)?.trim()
+                if (!title.isNullOrBlank()) {
+                    try {
+                        mergeIcyInfo(mediaId, title = title)
+                        Log.d(TAG, "ICY title: $title")
+                    } catch (e: Exception) { Log.e(TAG, "ICY title merge failed", e) }
+                }
+            }
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -315,6 +405,12 @@ class PlaybackService : MediaSessionService() {
             if (playbackState == Player.STATE_READY) retryCount = 0
             if (playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING)
                 saveCurrentPosition()
+
+            if (playbackState == Player.STATE_IDLE || playbackState == Player.STATE_ENDED) {
+                // Stop/end releases the active audio pipeline. Keep the preference scoped
+                // to an active track rather than leaving it set for the service lifetime.
+                bitPerfectManager.clear()
+            }
 
             // Bit-perfect design note: a buffer underrun surfaces here as a plain
             // stall (STATE_BUFFERING → playback pauses) rather than a speed-up
@@ -341,6 +437,7 @@ class PlaybackService : MediaSessionService() {
                 )
             }
         }
+
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -348,6 +445,7 @@ class PlaybackService : MediaSessionService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        bitPerfectManager = BitPerfectManager(this)
 
         httpFactory = OkHttpDataSource.Factory(
             OkHttpClient.Builder()
@@ -372,11 +470,20 @@ class PlaybackService : MediaSessionService() {
         mainHandler.postDelayed({ checkAndResetUsbAudio("startup") }, USB_SETTLE_MS)
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
+        // Only this app and trusted system/media controllers may control playback.
+        return if (controllerInfo.packageName == packageName || controllerInfo.isTrusted) {
+            mediaSession
+        } else {
+            null
+        }
+    }
 
     override fun onDestroy() {
         instance = null
         saveCurrentPosition()
+        bitPerfectManager.clear()
+        resetIcyInfo(null)
         mainHandler.removeCallbacksAndMessages(null)
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
         mediaSession?.run { player.release(); release() }
@@ -388,7 +495,9 @@ class PlaybackService : MediaSessionService() {
     private fun saveLastPlayed(mediaItem: MediaItem?) {
         val uri = mediaItem?.mediaId ?: return
         if (uri.startsWith("action:")) return
-        val title  = mediaItem.mediaMetadata.title?.toString()  ?: "Unknown"
+        val icy = icyInfo
+        val title  = if (icy != null && icy.mediaId == uri && !icy.title.isNullOrBlank()) icy.title
+                     else mediaItem.mediaMetadata.title?.toString() ?: "Unknown"
         val artist = mediaItem.mediaMetadata.artist?.toString() ?: ""
         val settings = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
 
@@ -399,9 +508,14 @@ class PlaybackService : MediaSessionService() {
                 for (i in 0 until it.mediaItemCount) {
                     val item = it.getMediaItemAt(i)
                     queue.put(JSONObject().apply {
+                        val localConfig = item.localConfiguration
+                        val clipping = item.clippingConfiguration
                         put("mediaId", item.mediaId)
+                        put("uri", localConfig?.uri?.toString() ?: item.mediaId)
                         put("title",   item.mediaMetadata.title?.toString()  ?: "")
                         put("artist",  item.mediaMetadata.artist?.toString() ?: "")
+                        put("start", clipping.startPositionMs)
+                        put("end", clipping.endPositionMs)
                     })
                 }
             }
@@ -428,19 +542,83 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /** Merges a piece of ICY info into the current holder (if it belongs to the active item). */
+    private fun mergeIcyInfo(
+        mediaId: String,
+        title: String? = null,
+        station: String? = null,
+        genre: String? = null,
+        description: String? = null,
+        url: String? = null
+    ) {
+        synchronized(icyInfoLock) {
+            // A loader can finish after the player has moved to another item. Do not allow
+            // that late response to repopulate metadata for the old stream.
+            if (activeMediaId != mediaId) return
+
+            val cur = icyInfo
+            val merged = if (cur != null && cur.mediaId == mediaId) {
+                IcyStreamInfo(
+                    mediaId,
+                    title ?: cur.title,
+                    station ?: cur.station,
+                    genre ?: cur.genre,
+                    description ?: cur.description,
+                    url ?: cur.url
+                )
+            } else {
+                IcyStreamInfo(mediaId, title, station, genre, description, url)
+            }
+            if (merged != cur) icyInfo = merged
+        }
+    }
+
+    private fun resetIcyInfo(mediaId: String?) {
+        synchronized(icyInfoLock) {
+            activeMediaId = mediaId
+            icyInfo = null
+        }
+    }
+
     // ── Inner data source ─────────────────────────────────────────────────────
 
     @UnstableApi
-    private class AppDataSource(context: Context, httpFactory: HttpDataSource.Factory) : DataSource {
+    private inner class AppDataSource(context: Context, httpFactory: HttpDataSource.Factory) : DataSource {
         private val defaultSrc = DefaultDataSource.Factory(context, httpFactory).createDataSource()
         private val smbSrc     = SmbDataSource()
         private var active: DataSource? = null
+        private var lastUri: String? = null
 
         override fun addTransferListener(l: TransferListener) { defaultSrc.addTransferListener(l); smbSrc.addTransferListener(l) }
-        override fun open(dataSpec: DataSpec): Long { active = if (dataSpec.uri.scheme == "smb") smbSrc else defaultSrc; return active!!.open(dataSpec) }
+        override fun open(dataSpec: DataSpec): Long {
+            val scheme = dataSpec.uri.scheme
+            lastUri = if (scheme == "http" || scheme == "https") dataSpec.uri.toString() else null
+            active = if (scheme == "smb") smbSrc else defaultSrc
+            return active!!.open(dataSpec)
+        }
         override fun read(b: ByteArray, o: Int, l: Int): Int = active?.read(b, o, l) ?: -1
         override fun getUri(): Uri? = active?.uri
-        override fun getResponseHeaders(): Map<String, List<String>> = active?.responseHeaders ?: emptyMap()
+        override fun getResponseHeaders(): Map<String, List<String>> {
+            val headers = active?.responseHeaders ?: emptyMap()
+            val uri = lastUri ?: return headers
+            if (headers.isEmpty()) return headers
+
+            // Called on the loading thread: must never throw or touch the player.
+            try {
+                fun header(name: String): String? =
+                    headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }
+                        ?.value?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }
+
+                mergeIcyInfo(
+                    uri,
+                    station     = header("icy-name"),
+                    genre       = header("icy-genre"),
+                    description = header("icy-description"),
+                    url         = header("icy-url")
+                )
+            } catch (e: Exception) { Log.e(TAG, "ICY header capture failed", e) }
+            return headers
+        }
         override fun close() { active?.close(); active = null }
     }
 }
