@@ -41,6 +41,12 @@ class MainFragment : BrowseSupportFragment() {
     private var hasAttemptedResume = false
     private var lastSelectedRowId = -1L
     private var lastSelectedColumn = 0
+    // Stored so it can be removed from the controller in onDestroyView (BUG-1).
+    private var playerListener: androidx.media3.common.Player.Listener? = null
+    // Incremented each time updatePlaylistRow() runs so background scan threads
+    // can detect that a newer scan has superseded them and discard their results,
+    // preventing stale items from leaking into a freshly-cleared adapter (BUG-3).
+    @Volatile private var playlistScanGeneration = 0
     private lateinit var settingsAdapter: ArrayObjectAdapter
     // Index of the "USB DAC" card inside settingsAdapter — must match the add() order below
     private val SETTINGS_USB_DAC_INDEX = 7
@@ -63,6 +69,17 @@ class MainFragment : BrowseSupportFragment() {
         super.onCreate(savedInstanceState)
         // jcifs-ng 2.x is configured via SmbContext (PropertyConfiguration + BaseContext).
         // System.setProperty() has no effect in jcifs-ng and has been removed.
+    }
+
+    override fun onDestroyView() {
+        // Remove the player listener to prevent callbacks firing on a detached
+        // fragment (which would crash via requireContext()) and to avoid leaking
+        // this fragment instance through the controller reference (BUG-1).
+        playerListener?.let { l ->
+            (activity as? MainActivity)?.getController()?.removeListener(l)
+        }
+        playerListener = null
+        super.onDestroyView()
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
@@ -486,8 +503,13 @@ class MainFragment : BrowseSupportFragment() {
                 .build()
         )
 
-        // Add Resume Last Played if enabled and not currently playing anything else
-        if (isResumeEnabled() && (controller == null || controller.mediaItemCount == 0)) {
+        // Add Resume Last Played if enabled and nothing is actively playing.
+        // Show the card both when the queue is empty (fresh session / service killed)
+        // and when items exist but are not playing (paused or playlist ended).
+        val resumeVisible = isResumeEnabled() && (controller == null ||
+                controller.mediaItemCount == 0 ||
+                (!controller.isPlaying && controller.playbackState != androidx.media3.common.Player.STATE_BUFFERING))
+        if (resumeVisible) {
             val settings = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             val lastUri = settings.getString("last_played_uri", null)
             if (lastUri != null) {
@@ -500,9 +522,12 @@ class MainFragment : BrowseSupportFragment() {
     private fun updatePlaylistRow() {
         if (!::playlistAdapter.isInitialized) return
         playlistAdapter.clear()
-        
+        // Bump the generation so any in-flight background threads from a previous
+        // call see the change and drop their results (BUG-3).
+        val myGeneration = ++playlistScanGeneration
+
         val context = context ?: return
-        
+
         // Scan Local Folders for Playlists
         val settings = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val foldersJson = settings.getString(KEY_MUSIC_FOLDERS, "[]")
@@ -512,24 +537,27 @@ class MainFragment : BrowseSupportFragment() {
                 val obj = jsonArray.getJSONObject(i)
                 val uriStr = obj.getString("uri")
                 if (uriStr.startsWith("content://")) {
-                    findPlaylistsLocal(uriStr)
+                    findPlaylistsLocal(uriStr, myGeneration)
                 } else if (uriStr.startsWith("file://")) {
                     val path = uriStr.toUri().path
-                    if (path != null) findPlaylistsFile(path)
+                    if (path != null) findPlaylistsFile(path, myGeneration)
                 }
             }
         } catch (e: Exception) {}
     }
 
-    private fun findPlaylistsFile(path: String) {
+    private fun findPlaylistsFile(path: String, generation: Int) {
         Thread {
             try {
                 val root = java.io.File(path)
                 fun scanRecursive(file: java.io.File) {
+                    if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     if (file.isDirectory) {
                         file.listFiles()?.forEach { scanRecursive(it) }
                     } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue")) {
                         activity?.runOnUiThread {
+                            if (playlistScanGeneration != generation) return@runOnUiThread
+                            if (!isAdded) return@runOnUiThread
                             playlistAdapter.add(createMediaItem(file.name, "Local Playlist", Uri.fromFile(file).toString()))
                         }
                     }
@@ -541,12 +569,13 @@ class MainFragment : BrowseSupportFragment() {
         }.start()
     }
 
-    private fun findPlaylistsLocal(uriString: String) {
+    private fun findPlaylistsLocal(uriString: String, generation: Int) {
         val context = context ?: return
         val rootUri = uriString.toUri()
         Thread {
             try {
                 fun scanRecursive(uri: Uri) {
+                    if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
                     val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
                     val docId = try { android.provider.DocumentsContract.getDocumentId(uri) } catch (e: Exception) { treeId }
@@ -570,6 +599,8 @@ class MainFragment : BrowseSupportFragment() {
                                 scanRecursive(childUri)
                             } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls") || name.lowercase().endsWith(".cue")) {
                                 activity?.runOnUiThread {
+                                    if (playlistScanGeneration != generation) return@runOnUiThread
+                                    if (!isAdded) return@runOnUiThread
                                     playlistAdapter.add(createMediaItem(name, "Local Playlist", childUri.toString()))
                                 }
                             }
@@ -583,10 +614,11 @@ class MainFragment : BrowseSupportFragment() {
         }.start()
     }
 
-    private fun findPlaylistsSmb(uri: String) {
+    private fun findPlaylistsSmb(uri: String, generation: Int) {
         Thread {
             try {
                 fun scanRecursive(smbUri: String) {
+                    if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     val dir = SmbFile(smbUri, SmbContext.getContextForUri(smbUri))
                     val files = try { dir.listFiles() } catch (e: Exception) { null } ?: emptyArray()
                     for (f in files) {
@@ -596,6 +628,8 @@ class MainFragment : BrowseSupportFragment() {
                             val name = f.name
                             val path = f.path
                             activity?.runOnUiThread {
+                                if (playlistScanGeneration != generation) return@runOnUiThread
+                                if (!isAdded) return@runOnUiThread
                                 playlistAdapter.add(createMediaItem(name, "SMB Playlist", path))
                             }
                         }
@@ -614,19 +648,36 @@ class MainFragment : BrowseSupportFragment() {
             override fun run() {
                 val controller = activity?.getController()
                 if (controller != null) {
-                    controller.addListener(object : androidx.media3.common.Player.Listener {
+                    // Store the listener so it can be removed in onDestroyView (BUG-1).
+                    val listener = object : androidx.media3.common.Player.Listener {
                         override fun onEvents(player: androidx.media3.common.Player, events: androidx.media3.common.Player.Events) {
                             updateControlsRow()
                             updatePlaylistRow()
                         }
-                    })
+                    }
+                    playerListener = listener
+                    controller.addListener(listener)
                     updateControlsRow()
                     updatePlaylistRow()
 
-                    // Auto-resume if enabled and nothing is playing
-                    if (isResumeEnabled() && controller.mediaItemCount == 0 && !hasAttemptedResume) {
+                    // Auto-resume if enabled and playback is not already active.
+                    // Two cases:
+                    //  1. No items in queue (service was killed / fresh session) → full
+                    //     restore from persisted prefs.
+                    //  2. Items exist but player is paused in STATE_READY (service
+                    //     survived a HOME press) → just resume in-place.
+                    if (isResumeEnabled() && !hasAttemptedResume) {
                         hasAttemptedResume = true
-                        resumeLastPlayed()
+                        when {
+                            controller.mediaItemCount == 0 -> {
+                                resumeLastPlayed()
+                            }
+                            !controller.isPlaying &&
+                            controller.playbackState == androidx.media3.common.Player.STATE_READY -> {
+                                controller.play()
+                                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+                            }
+                        }
                     }
                 } else {
                     view?.postDelayed(this, 500)
@@ -1141,6 +1192,7 @@ class MainFragment : BrowseSupportFragment() {
                         controller.setMediaItems(sortedItems)
                         controller.prepare()
                         controller.play()
+                        if (!isAdded) return@runOnUiThread   // BUG-2: guard against detached fragment
                         val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                         startActivity(intent)
                     } else {
@@ -1266,6 +1318,7 @@ class MainFragment : BrowseSupportFragment() {
                                 controller.setMediaItems(sortedItems)
                                 controller.prepare()
                                 controller.play()
+                                if (!isAdded) return@runOnUiThread   // BUG-2
                                 val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                                 startActivity(intent)
                             } else {
@@ -1708,6 +1761,7 @@ class MainFragment : BrowseSupportFragment() {
                         controller.setMediaItems(sortedItems)
                         controller.prepare()
                         controller.play()
+                        if (!isAdded) return@runOnUiThread   // BUG-2
                         val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                         startActivity(intent)
                     } else {
@@ -1981,7 +2035,9 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun toggleResumePlayback() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val current = prefs.getBoolean(KEY_RESUME, false)
+        // Use the same default (true) as isResumeEnabled() so a missing pref is
+        // treated consistently rather than toggling in the wrong direction (BUG-5).
+        val current = prefs.getBoolean(KEY_RESUME, true)
         prefs.edit { putBoolean(KEY_RESUME, !current) }
         refreshWithCurrentFocus()
     }
@@ -2583,6 +2639,10 @@ class MainFragment : BrowseSupportFragment() {
                     .setTitle("Exit")
                     .setMessage("Are you sure you want to exit?")
                     .setPositiveButton("Yes") { _, _ ->
+                        // Ask the service to save its state synchronously before we
+                        // kill the process, so the last playback position is not lost
+                        // (BUG-6: System.exit(0) previously raced with apply()).
+                        PlaybackService.instance?.saveCurrentPositionSync()
                         activity?.stopService(android.content.Intent(requireContext(), PlaybackService::class.java))
                         activity?.finishAffinity()
                         System.exit(0)

@@ -67,6 +67,9 @@ class NowPlayingActivity : BaseActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var animatedWaveform: AnimatedWaveformView
 
+    // Stored so the listener can be removed in onDestroy (BUG-11).
+    private var playerListener: Player.Listener? = null
+
     // Album art: track last fetched key to avoid redundant network requests
     private var lastArtKey: String = ""
     private var lastIcyInfo: IcyStreamInfo? = null
@@ -120,6 +123,11 @@ class NowPlayingActivity : BaseActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        // Remove the player listener before releasing the controller so it cannot
+        // fire on a released MediaController (BUG-11, BUG-12).
+        playerListener?.let { mediaController?.removeListener(it) }
+        playerListener = null
+        mediaController = null
         controllerFuture?.let { MediaController.releaseFuture(it) }
         super.onDestroy()
     }
@@ -165,10 +173,10 @@ class NowPlayingActivity : BaseActivity() {
     private fun setupSeekBar() {
         seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    textCurrentTime.text = formatTime(progress.toLong())
-                    if (!isSeekBarTracking) mediaController?.seekTo(progress.toLong())
-                }
+                // Only update the time label here. Seeking is done exclusively in
+                // onStopTrackingTouch to avoid a double-seek on D-pad input, where
+                // onProgressChanged fires before onStartTrackingTouch (BUG-13).
+                if (fromUser) textCurrentTime.text = formatTime(progress.toLong())
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {
                 isSeekBarTracking = true; handler.removeCallbacksAndMessages(null)
@@ -299,7 +307,8 @@ class NowPlayingActivity : BaseActivity() {
         animatedWaveform.setColor(getThemeColor())
         updateControlButtonsTint()
 
-        controller.addListener(object : Player.Listener {
+        // Store the listener so it can be removed in onDestroy (BUG-11).
+        val listener = object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int)         { updateUI(); refreshScreensaver() }
             override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata)              { updateUI(); refreshScreensaver() }
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks)            { updateUI(); refreshScreensaver() }
@@ -324,7 +333,9 @@ class NowPlayingActivity : BaseActivity() {
                 textBitrate.text = "Error: ${error.errorCodeName}"
                 Toast.makeText(this@NowPlayingActivity, "Playback error: ${error.message}", Toast.LENGTH_SHORT).show()
             }
-        })
+        }
+        playerListener = listener
+        controller.addListener(listener)
 
         updateUI()
         startProgressUpdate()
@@ -439,9 +450,12 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun updateControlButtonsTint() {
         val tc = getThemeColor()
+        // Default (rest) state uses the full theme colour; pressed/focused states
+        // get a darkened semi-transparent variant. The previous code had
+        // Color.TRANSPARENT as the rest state, making buttons invisible (BUG-14).
         val tl = android.content.res.ColorStateList(
             arrayOf(intArrayOf(android.R.attr.state_pressed), intArrayOf(android.R.attr.state_focused), intArrayOf()),
-            intArrayOf((tc and 0x00FFFFFF) or 0x66000000, (tc and 0x00FFFFFF) or 0x44000000, Color.TRANSPARENT)
+            intArrayOf((tc and 0x00FFFFFF) or 0x66000000, (tc and 0x00FFFFFF) or 0x44000000, tc)
         )
         listOf(R.id.btn_shuffle, R.id.btn_prev, R.id.btn_play_pause, R.id.btn_next,
                R.id.btn_repeat, R.id.btn_playlist, R.id.btn_dac_reset)
@@ -742,8 +756,12 @@ class NowPlayingActivity : BaseActivity() {
             .header("User-Agent", "BitperfectPlayer/2.3 (https://github.com/antoxa78/BitperfectPlayer)")
             .header("Accept", accept)
             .build()
-        val resp = artHttpClient.newCall(req).execute()
-        return if (resp.isSuccessful) resp.body?.string() else null
+        // Use resp.use{} so the ResponseBody is always closed, including on
+        // non-2xx responses where body?.string() would otherwise leave the
+        // connection open and exhaust the OkHttp pool (BUG-9).
+        return artHttpClient.newCall(req).execute().use { resp ->
+            if (resp.isSuccessful) resp.body?.string() else null
+        }
     }
 
     /** GET request returning response body as ByteArray, or null on non-2xx. */
@@ -751,8 +769,9 @@ class NowPlayingActivity : BaseActivity() {
         val req = Request.Builder().url(url)
             .header("User-Agent", "BitperfectPlayer/2.3 (https://github.com/antoxa78/BitperfectPlayer)")
             .build()
-        val resp = artHttpClient.newCall(req).execute()
-        return if (resp.isSuccessful) resp.body?.bytes() else null
+        return artHttpClient.newCall(req).execute().use { resp ->
+            if (resp.isSuccessful) resp.body?.bytes() else null
+        }
     }
 
     /** Escapes Lucene special characters for MusicBrainz query strings. */
@@ -771,6 +790,9 @@ class NowPlayingActivity : BaseActivity() {
     // ── Progress bar ──────────────────────────────────────────────────────────
 
     private fun startProgressUpdate() {
+        // Cancel any existing loop before starting a new one so there is never
+        // more than one concurrent progress-update Runnable (BUG-10).
+        handler.removeCallbacksAndMessages(null)
         handler.post(object : Runnable {
             override fun run() {
                 val c = mediaController ?: return

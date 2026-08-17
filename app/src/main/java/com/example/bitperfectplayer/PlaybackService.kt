@@ -118,18 +118,22 @@ class PlaybackService : MediaSessionService() {
 
     // ── USB DAC monitoring ────────────────────────────────────────────────────
 
+    // Runnable field so USB-settle delayed calls can be cancelled before re-posting,
+    // preventing pileup on rapid hotplug events (BUG-18).
+    private val usbSettleRunnable = Runnable { checkAndResetUsbAudio("USB attach") }
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     Log.i(TAG, "USB device attached — will check for DAC in ${USB_SETTLE_MS}ms")
-                    mainHandler.postDelayed(
-                        { checkAndResetUsbAudio("USB attach") },
-                        USB_SETTLE_MS
-                    )
+                    // Cancel any previous pending settle check before re-posting (BUG-18).
+                    mainHandler.removeCallbacks(usbSettleRunnable)
+                    mainHandler.postDelayed(usbSettleRunnable, USB_SETTLE_MS)
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     Log.i(TAG, "USB device detached")
+                    mainHandler.removeCallbacks(usbSettleRunnable)
                 }
             }
         }
@@ -174,14 +178,35 @@ class PlaybackService : MediaSessionService() {
     }
 
     /**
+     * Saves the current playback position synchronously using commit() instead
+     * of apply(). Called from the UI before System.exit(0) so the position is
+     * guaranteed to be on disk before the process is killed (BUG-6).
+     */
+    fun saveCurrentPositionSync() {
+        mediaSession?.player?.let { p ->
+            if (p.playbackState != Player.STATE_IDLE)
+                getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+                    .edit().putLong("last_played_pos", p.currentPosition).commit()
+        }
+    }
+
+    /**
      * Tears down ExoPlayer's AudioTrack (closing the HAL session) and
      * immediately rebuilds it, forcing Android to re-negotiate bit-perfect
      * output parameters with the DAC.
      *
      * Current queue, position, and play-state are fully restored.
      */
+    // Runnable field for the sink-restore step so rapid resetAudioSink() calls
+    // cancel the previous pending restore before scheduling a new one (BUG-17).
+    private var sinkRestoreRunnable: Runnable? = null
+
     fun resetAudioSink() {
         val player = mediaSession?.player as? ExoPlayer ?: return
+
+        // Cancel any in-flight restore from a previous call before we stop the
+        // player again, so the restore does not run against a stale item list.
+        sinkRestoreRunnable?.let { mainHandler.removeCallbacks(it) }
 
         val wasPlaying = player.isPlaying
         val index      = player.currentMediaItemIndex
@@ -194,15 +219,18 @@ class PlaybackService : MediaSessionService() {
         player.pause()
         player.stop()
 
-        mainHandler.postDelayed({
-            val p = mediaSession?.player as? ExoPlayer ?: return@postDelayed
+        val restoreRunnable = Runnable {
+            sinkRestoreRunnable = null
+            val p = mediaSession?.player as? ExoPlayer ?: return@Runnable
             if (items.isNotEmpty()) {
                 p.setMediaItems(items, index, position)
                 p.prepare()
                 if (wasPlaying) p.play()
             }
             Log.i(TAG, "Audio sink reset complete")
-        }, USB_RESET_GAP_MS)
+        }
+        sinkRestoreRunnable = restoreRunnable
+        mainHandler.postDelayed(restoreRunnable, USB_RESET_GAP_MS)
     }
 
     // ── Bit-perfect audio processor chain ─────────────────────────────────────
