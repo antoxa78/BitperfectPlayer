@@ -111,6 +111,9 @@ class MainFragment : BrowseSupportFragment() {
                             .setTitle("Exit")
                             .setMessage("Are you sure you want to exit?")
                             .setPositiveButton("Yes") { _, _ ->
+                                // Persist the position synchronously before the
+                                // process dies, same as the menu Exit action.
+                                PlaybackService.instance?.saveCurrentPositionSync()
                                 activity?.stopService(
                                     android.content.Intent(requireContext(), PlaybackService::class.java)
                                 )
@@ -647,7 +650,7 @@ class MainFragment : BrowseSupportFragment() {
         val checkController = object : Runnable {
             override fun run() {
                 val controller = activity?.getController()
-                if (controller != null) {
+                if (controller != null && controller.isConnected) {
                     // Store the listener so it can be removed in onDestroyView (BUG-1).
                     val listener = object : androidx.media3.common.Player.Listener {
                         override fun onEvents(player: androidx.media3.common.Player, events: androidx.media3.common.Player.Events) {
@@ -667,13 +670,28 @@ class MainFragment : BrowseSupportFragment() {
                     //  2. Items exist but player is paused in STATE_READY (service
                     //     survived a HOME press) → just resume in-place.
                     if (isResumeEnabled() && !hasAttemptedResume) {
-                        hasAttemptedResume = true
                         when {
                             controller.mediaItemCount == 0 -> {
+                                hasAttemptedResume = true
                                 resumeLastPlayed()
                             }
+                            // Items already queued but not playing — resume in
+                            // place. STATE_BUFFERING is included so a stream that
+                            // is re-buffering after the app relaunches still gets
+                            // resumed instead of being left dead in the queue.
+                            controller.playbackState == androidx.media3.common.Player.STATE_IDLE -> {
+                                // Items queued but the player is idle (e.g. the
+                                // radio station errored and the service's
+                                // reconnect attempts ended there). Give it a
+                                // fresh prepare+play instead of leaving it dead.
+                                hasAttemptedResume = true
+                                controller.prepare()
+                                controller.play()
+                                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+                            }
                             !controller.isPlaying &&
-                            controller.playbackState == androidx.media3.common.Player.STATE_READY -> {
+                            controller.playbackState != androidx.media3.common.Player.STATE_ENDED -> {
+                                hasAttemptedResume = true
                                 controller.play()
                                 startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
                             }
@@ -2413,10 +2431,17 @@ class MainFragment : BrowseSupportFragment() {
             
             if (items.isEmpty()) return
             val safeIndex = index.coerceIn(0, items.lastIndex)
-            
+
+            // Live radio streams never have a meaningful position: a stale
+            // (unbounded, hours-long) persisted position would make ExoPlayer
+            // seek past the stream end and instantly end playback instead of
+            // resuming the station (BUG-19). Streams always restart at 0.
+            val streamItem = items[safeIndex].mediaId
+            val restorePos = if (streamItem.startsWith("http://") || streamItem.startsWith("https://")) 0L else pos
+
             val activity = activity as? MainActivity
             activity?.getController()?.let { controller ->
-                controller.setMediaItems(items, safeIndex, pos)
+                controller.setMediaItems(items, safeIndex, restorePos)
                 controller.prepare()
                 // Set this explicitly because restoring a playlist does not always
                 // inherit the service's previous playWhenReady state.

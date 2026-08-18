@@ -1,6 +1,19 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
+
+// Read signing credentials from local.properties (which is gitignored).
+val localProperties = Properties().apply {
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { load(it) }
+    }
+}
+
+fun prop(name: String): String? = localProperties.getProperty(name)
+    ?: providers.gradleProperty(name).orNull
 
 android {
     namespace = "com.example.bitperfectplayer"
@@ -14,8 +27,8 @@ android {
         applicationId = "com.github.antoxa78.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 35
-        versionName = "2.7.0"
+        versionCode = 36
+        versionName = "2.7.1"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -25,11 +38,23 @@ android {
         buildConfig = true
     }
 
+    signingConfigs {
+        if (prop("RELEASE_STORE_FILE") != null) {
+            create("release") {
+                storeFile = file(prop("RELEASE_STORE_FILE")!!)
+                storePassword = prop("RELEASE_STORE_PASSWORD")!!
+                keyAlias = prop("RELEASE_KEY_ALIAS")!!
+                keyPassword = prop("RELEASE_KEY_PASSWORD")!!
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

@@ -24,7 +24,6 @@ import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
-import com.google.common.util.concurrent.MoreExecutors
 import java.io.BufferedReader
 import java.io.InputStreamReader
 
@@ -51,9 +50,9 @@ class MainActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
-        // Write defaults on first run only
+        // Write defaults before the UI is created so the fragment reads the
+        // correct initial values (e.g., resume_playback defaults to true).
         val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
         if (!prefs.contains("screensaver_delay")) {
             prefs.edit {
@@ -71,6 +70,8 @@ class MainActivity : BaseActivity() {
         if (!prefs.contains("resume_playback")) {
             prefs.edit { putBoolean("resume_playback", true) }
         }
+
+        setContentView(R.layout.activity_main)
 
         checkPermissions()
 
@@ -92,7 +93,7 @@ class MainActivity : BaseActivity() {
             } catch (e: Exception) {
                 e.printStackTrace()
             }
-        }, MoreExecutors.directExecutor())
+        }, ContextCompat.getMainExecutor(this))
     }
 
     override fun onDestroy() {

@@ -11,6 +11,7 @@ import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Metadata
 import androidx.media3.common.PlaybackParameters
@@ -169,11 +170,38 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /**
+     * Playback position worth persisting, in ms.
+     *
+     * Returns 0 for live streams (duration == TIME_UNSET) because their
+     * currentPosition grows unboundedly and is meaningless for a restart —
+     * restoring it makes ExoPlayer seek past the stream end on seekable
+     * radio streams (e.g. MP3 with a Xing/VBR header), which instantly ends
+     * playback instead of resuming the station (BUG-19). Also returns 0 for
+     * finished items (pos == duration, e.g. playlist ended) since resuming
+     * at that position would instantly end playback again.
+     */
+    private fun safePositionToSave(p: Player): Long {
+        val pos = p.currentPosition
+        val dur = p.duration
+        return if (dur == C.TIME_UNSET || pos >= dur) 0L else pos
+    }
+
     private fun saveCurrentPosition() {
         mediaSession?.player?.let { p ->
-            if (p.playbackState != Player.STATE_IDLE)
+            if (p.playbackState != Player.STATE_IDLE) {
+                // Index and position must be written atomically in one edit:
+                // saveLastPlayed() (on track transition) and this timer save
+                // independently, and pairing a stale position from the previous
+                // track with the new track's index would make resume seek past
+                // the end and skip/stop instead of resuming.
+                val safePos = safePositionToSave(p)
                 getSharedPreferences(PREFS_APP, MODE_PRIVATE)
-                    .edit().putLong("last_played_pos", p.currentPosition).apply()
+                    .edit()
+                    .putLong("last_played_pos", safePos)
+                    .putInt("last_played_index", p.currentMediaItemIndex)
+                    .apply()
+            }
         }
     }
 
@@ -184,9 +212,14 @@ class PlaybackService : MediaSessionService() {
      */
     fun saveCurrentPositionSync() {
         mediaSession?.player?.let { p ->
-            if (p.playbackState != Player.STATE_IDLE)
+            if (p.playbackState != Player.STATE_IDLE) {
+                val safePos = safePositionToSave(p)
                 getSharedPreferences(PREFS_APP, MODE_PRIVATE)
-                    .edit().putLong("last_played_pos", p.currentPosition).commit()
+                    .edit()
+                    .putLong("last_played_pos", safePos)
+                    .putInt("last_played_index", p.currentMediaItemIndex)
+                    .commit()
+            }
         }
     }
 
@@ -208,12 +241,20 @@ class PlaybackService : MediaSessionService() {
         // player again, so the restore does not run against a stale item list.
         sinkRestoreRunnable?.let { mainHandler.removeCallbacks(it) }
 
-        val wasPlaying = player.isPlaying
+        // Capture the user's play INTENT, not isPlaying. A stream that is still
+        // buffering reports isPlaying == false (it is only true in STATE_READY),
+        // so restoring it without play() would leave it paused forever. This is
+        // exactly what broke resume of radio stations on restart: the startup
+        // DAC reset fired 1.5s after the service started while the auto-resumed
+        // station was still buffering (BUG-20).
+        val playWhenReady = player.playWhenReady
         val index      = player.currentMediaItemIndex
-        val position   = player.currentPosition
+        // Live streams (duration == TIME_UNSET) report an unbounded position;
+        // restoring it would seek past the end of a seekable station (BUG-19).
+        val position   = if (player.duration == C.TIME_UNSET) 0L else player.currentPosition
         val items      = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) }
 
-        Log.i(TAG, "Resetting audio sink [playing=$wasPlaying idx=$index pos=$position]")
+        Log.i(TAG, "Resetting audio sink [playing=${player.isPlaying} playWhenReady=$playWhenReady idx=$index pos=$position]")
 
         // Pause + stop releases the AudioTrack → HAL session is closed
         player.pause()
@@ -222,10 +263,13 @@ class PlaybackService : MediaSessionService() {
         val restoreRunnable = Runnable {
             sinkRestoreRunnable = null
             val p = mediaSession?.player as? ExoPlayer ?: return@Runnable
+            // Restore the play intent even when there is nothing queued yet, so
+            // a later setMediaItems() call does not inherit the pause() state.
+            p.playWhenReady = playWhenReady
             if (items.isNotEmpty()) {
                 p.setMediaItems(items, index, position)
                 p.prepare()
-                if (wasPlaying) p.play()
+                if (playWhenReady) p.play()
             }
             Log.i(TAG, "Audio sink reset complete")
         }
@@ -552,6 +596,7 @@ class PlaybackService : MediaSessionService() {
                 .putString("last_played_title",  title)
                 .putString("last_played_artist", artist)
                 .putInt(   "last_played_index",  player?.currentMediaItemIndex ?: 0)
+                .putLong(  "last_played_pos",    player?.let { safePositionToSave(it) } ?: 0L)
                 .putString("last_played_queue",  queue.toString())
                 .apply()
         }

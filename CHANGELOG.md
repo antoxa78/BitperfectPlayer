@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.7.1 - 2026-08-18
+
+### Fixed
+
+- **Resume playback for radio stations:** Live streams (duration unknown) previously persisted an unbounded playback position. Restoring it made ExoPlayer seek past the stream end on seekable radio streams (e.g. MP3 with Xing/VBR headers), instantly ending playback instead of resuming the last station. Live streams now always save/restore position 0, including the Exit path and USB DAC sink resets.
+- **Auto-resume after a radio error:** If a station errored and the reconnect loop left the player idle with items queued, relaunching the app no longer leaves it dead — it gets a fresh prepare+play.
+- **Radio stations not resuming with a USB DAC:** The 1.5s startup DAC reset raced with auto-resume. A stream still buffering reported `isPlaying == false`, so the reset's restore step never called `play()` and the station stayed paused forever. The sink reset now captures and restores `playWhenReady` (play intent) instead of `isPlaying`.
+
 ## 2.7.0 - 2026-08-17
 
 ### Fixed
