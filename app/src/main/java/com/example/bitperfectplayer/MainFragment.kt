@@ -114,11 +114,22 @@ class MainFragment : BrowseSupportFragment() {
                                 // Persist the position synchronously before the
                                 // process dies, same as the menu Exit action.
                                 PlaybackService.instance?.saveCurrentPositionSync()
-                                activity?.stopService(
-                                    android.content.Intent(requireContext(), PlaybackService::class.java)
-                                )
-                                activity?.finishAffinity()
-                                System.exit(0)
+                                val prefsX = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                                val keepLan = prefsX.getBoolean("mpd_enabled", true) &&
+                                    prefsX.getBoolean("mpd_autostart", false)
+                                if (keepLan) {
+                                    // Stop playback but leave PlaybackService (and its
+                                    // MPD server) running in the foreground so MALP
+                                    // keeps working.
+                                    PlaybackService.instance?.stopPlaybackKeepLanControl()
+                                    activity?.finishAffinity()
+                                } else {
+                                    activity?.stopService(
+                                        android.content.Intent(requireContext(), PlaybackService::class.java)
+                                    )
+                                    activity?.finishAffinity()
+                                    System.exit(0)
+                                }
                             }
                             .setNegativeButton("No", null)
                             .show()
@@ -262,6 +273,7 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("Waveform Type", "Current: ${getWaveformTypeName()}"))
         settingsAdapter.add(createActionItem("Player Color Scheme", "Current: ${getColorSchemeName()}"))
         settingsAdapter.add(createActionItem("USB DAC", getUsbDacStatus()))
+        settingsAdapter.add(createActionItem("LAN Player Control", getLanControlSubtitle()))
         settingsAdapter.add(createActionItem("About", "Version and build info"))
         val settingsHeader = HeaderItem(4, "Settings")
         rowsAdapter.add(ListRow(settingsHeader, settingsAdapter))
@@ -1919,6 +1931,363 @@ class MainFragment : BrowseSupportFragment() {
             .show()
     }
 
+    // ── LAN Player Control ──────────────────────────────────────────────
+    private fun isMpdEnabled(): Boolean =
+        requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean("mpd_enabled", true)
+
+    private fun getMpdPort(): Int =
+        requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getInt("mpd_port", 6600)
+
+    private fun getLanControlSubtitle(): String {
+        val enabled = try { isMpdEnabled() } catch (_: Exception) { true }
+        val port = try { getMpdPort() } catch (_: Exception) { 6600 }
+        val running = PlaybackService.instance?.isMpdRunning() == true
+        val clients = PlaybackService.instance?.getClientCount() ?: 0
+        val pwdSet = try {
+            requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                .getString("mpd_password", "")?.isNotBlank() == true
+        } catch (_: Exception) { false }
+        val lock = if (pwdSet) " 🔒" else ""
+        return when {
+            !enabled -> "Disabled"
+            running -> "Enabled :$port$lock — ${getLocalIp()}:$port" + if (clients > 0) " ($clients)" else ""
+            else -> "Enabled :$port$lock — starting…"
+        }
+    }
+
+    private fun getLocalIp(): String {
+        return try {
+            val ifaces = java.net.NetworkInterface.getNetworkInterfaces()
+            var fallback: String? = null
+            while (ifaces.hasMoreElements()) {
+                val ni = ifaces.nextElement()
+                if (!ni.isUp || ni.isLoopback) continue
+                val addrs = ni.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (addr.isLoopbackAddress) continue
+                    val host = addr.hostAddress ?: continue
+                    if (host.contains(":")) continue // skip IPv6
+                    if (host.startsWith("192.168.") || host.startsWith("10.") || host.startsWith("172.")) return host
+                    if (fallback == null) fallback = host
+                }
+            }
+            fallback ?: "—"
+        } catch (_: Exception) { "—" }
+    }
+
+    private fun updateLanControlCard() {
+        if (!::settingsAdapter.isInitialized) return
+        // LAN index is 8 when inserted after USB DAC (7)
+        val lanIndex = 8
+        if (lanIndex < settingsAdapter.size()) {
+            settingsAdapter.replace(lanIndex, createActionItem("LAN Player Control", getLanControlSubtitle()))
+        }
+    }
+
+    private fun showLanControlDialog() {
+        val context = requireContext()
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        var enabled = prefs.getBoolean("mpd_enabled", true)
+        val port = prefs.getInt("mpd_port", 6600)
+        var currentPassword = prefs.getString("mpd_password", "") ?: ""
+        val ip = getLocalIp()
+        val running = PlaybackService.instance?.isMpdRunning() == true
+
+        val dialogView = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 16)
+        }
+
+        fun buildInfoText(pwd: String, isEnabled: Boolean, curPort: Int = port): String = buildString {
+            val clients = PlaybackService.instance?.getClientCount() ?: 0
+            val runText = if (!isEnabled) "Disabled" else if (running) "Running ($clients client${if (clients != 1) "s" else ""})" else "Starting…"
+            append("MPD server for MALP / YMuse / any MPD client\n\n")
+            append("Status: $runText\n")
+            append("Address: $ip:$curPort\n")
+            if (pwd.isNotBlank()) append("Password: set (🔒)\n") else append("Password: none\n")
+        }
+
+        val infoView = android.widget.TextView(context).apply {
+            text = buildInfoText(currentPassword, enabled)
+            textSize = 13f
+            setLineSpacing(4f, 1f)
+        }
+        dialogView.addView(infoView)
+
+        val switchRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 16, 0, 16)
+        }
+        val switchLabel = android.widget.TextView(context).apply {
+            text = "Enable LAN control"
+            textSize = 15f
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val enableSwitch = android.widget.Switch(context).apply {
+            isChecked = enabled
+            isFocusable = true
+        }
+        switchRow.addView(switchLabel)
+        switchRow.addView(enableSwitch)
+        dialogView.addView(switchRow)
+
+        // Password row
+        val pwdRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(0, 8, 0, 8)
+        }
+        val pwdLabel = android.widget.TextView(context).apply {
+            text = "Password (leave empty for none):"
+            textSize = 13f
+            setPadding(0, 0, 0, 8)
+        }
+        val pwdInput = android.widget.EditText(context).apply {
+            setText(currentPassword)
+            hint = "e.g. 1234"
+            // Plain text inputType so show/hide toggle is reliable on TV.
+            // NOTE: isSingleLine must come BEFORE transformationMethod — setSingleLine()
+            // internally applies SingleLineTransformationMethod (plain text) and would
+            // otherwise wipe the password masking on every dialog open.
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isSingleLine = true
+            transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+            setPadding(16, 12, 16, 12)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF2A2A2A.toInt())
+                cornerRadius = 8f
+                setStroke(1, 0xFF555555.toInt())
+            }
+            setTextColor(0xFFFFFFFF.toInt())
+            setHintTextColor(0xFF888888.toInt())
+        }
+        val showPwdRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 8, 0, 0)
+            isFocusable = false
+            descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
+        }
+        val showPwdLabel = android.widget.TextView(context).apply {
+            text = "Show password"
+            textSize = 13f
+            setTextColor(0xFFCCCCCC.toInt())
+            isFocusable = false
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val showPwdCheck = android.widget.Switch(context).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isChecked = false
+        }
+        showPwdRow.addView(showPwdLabel)
+        showPwdRow.addView(showPwdCheck)
+        pwdRow.addView(pwdLabel)
+        pwdRow.addView(pwdInput)
+        pwdRow.addView(showPwdRow)
+        dialogView.addView(pwdRow)
+
+        // Port row
+        val portRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 8, 0, 8)
+        }
+        val portLabel = android.widget.TextView(context).apply {
+            text = "Port:"
+            textSize = 13f
+            setPadding(0, 0, 16, 0)
+        }
+        val portInput = android.widget.EditText(context).apply {
+            setText(port.toString())
+            hint = "6600"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isSingleLine = true
+            setPadding(16, 10, 16, 10)
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF2A2A2A.toInt())
+                cornerRadius = 8f
+                setStroke(1, 0xFF555555.toInt())
+            }
+            setTextColor(0xFFFFFFFF.toInt())
+            setHintTextColor(0xFF888888.toInt())
+        }
+        portRow.addView(portLabel)
+        portRow.addView(portInput)
+        dialogView.addView(portRow)
+
+        // Autostart row
+        var autostartEnabled = prefs.getBoolean("mpd_autostart", false)
+        val autostartRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 12, 0, 4)
+        }
+        val autostartLabel = android.widget.TextView(context).apply {
+            text = "Autostart on boot"
+            textSize = 13f
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val autostartSwitch = android.widget.Switch(context).apply {
+            isChecked = autostartEnabled
+            isFocusable = true
+            isFocusableInTouchMode = true
+        }
+        autostartRow.addView(autostartLabel)
+        autostartRow.addView(autostartSwitch)
+        dialogView.addView(autostartRow)
+
+        // Ensure focus navigation works on TV (D-pad)
+        pwdInput.isFocusable = true
+        pwdInput.isFocusableInTouchMode = true
+        portInput.isFocusable = true
+        portInput.isFocusableInTouchMode = true
+        // Make container not steal focus
+        dialogView.isFocusable = false
+        dialogView.descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
+        // Fix focus order: pwd -> showPwd -> port -> autostart
+        pwdInput.nextFocusDownId = showPwdCheck.id
+        showPwdCheck.nextFocusDownId = portInput.id
+        portInput.nextFocusDownId = autostartSwitch.id
+        // Assign IDs if needed for focus chain
+        if (pwdInput.id == android.view.View.NO_ID) pwdInput.id = android.view.View.generateViewId()
+        if (showPwdCheck.id == android.view.View.NO_ID) showPwdCheck.id = android.view.View.generateViewId()
+        if (portInput.id == android.view.View.NO_ID) portInput.id = android.view.View.generateViewId()
+        if (autostartSwitch.id == android.view.View.NO_ID) autostartSwitch.id = android.view.View.generateViewId()
+        // Re-apply after IDs generated
+        pwdInput.nextFocusDownId = showPwdCheck.id
+        showPwdCheck.nextFocusDownId = portInput.id
+        portInput.nextFocusDownId = autostartSwitch.id
+
+        val dialog = AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("LAN Player Control")
+            .setIcon(R.drawable.ic_network)
+            .setView(dialogView)
+            .setPositiveButton("OK", null)
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Restart server", null)
+            .create()
+
+        dialog.setOnShowListener {
+            // Show keyboard when password field gains focus (TV + phone)
+            dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+            // Defensive: ensure masking state matches the switch on every (re)open
+            pwdInput.transformationMethod = if (showPwdCheck.isChecked) null
+                else android.text.method.PasswordTransformationMethod.getInstance()
+            pwdInput.requestFocus()
+            try {
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                imm.showSoftInput(pwdInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            } catch (_: Exception) {}
+            pwdInput.setOnClickListener {
+                try {
+                    val imm2 = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                    imm2.showSoftInput(pwdInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                } catch (_: Exception) {}
+            }
+            pwdInput.setOnFocusChangeListener { v, hasFocus ->
+                if (hasFocus) {
+                    try {
+                        val imm3 = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                        imm3.showSoftInput(v, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                    } catch (_: Exception) {}
+                }
+            }
+
+            val okBtn = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            val restartBtn = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+
+            fun refreshInfo() {
+                val curPort = portInput.text.toString().toIntOrNull() ?: port
+                infoView.text = buildInfoText(pwdInput.text.toString(), enabled, curPort)
+            }
+
+            enableSwitch.setOnCheckedChangeListener { _, checked ->
+                enabled = checked
+                refreshInfo()
+            }
+            autostartSwitch.setOnCheckedChangeListener { _, checked ->
+                autostartEnabled = checked
+            }
+            showPwdCheck.setOnCheckedChangeListener { _, checked ->
+                val selStart = pwdInput.selectionStart
+                val selEnd = pwdInput.selectionEnd
+                // Only toggle transformation — keep inputType as password to avoid keyboard reset on TV
+                pwdInput.transformationMethod = if (checked) null else android.text.method.PasswordTransformationMethod.getInstance()
+                // Keep cursor and ensure password stays hidden/shown
+                pwdInput.setSelection(selStart.coerceAtLeast(0), selEnd.coerceAtLeast(0))
+            }
+            pwdInput.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) { refreshInfo() }
+            })
+            portInput.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) { refreshInfo() }
+            })
+
+            okBtn.setOnClickListener {
+                val newPwd = pwdInput.text.toString().trim()
+                val newPort = portInput.text.toString().toIntOrNull()
+                if (newPort == null || newPort !in 1024..65535) {
+                    Toast.makeText(context, "Port must be 1024-65535", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                val oldEnabled = prefs.getBoolean("mpd_enabled", true)
+                val oldPwd = prefs.getString("mpd_password", "") ?: ""
+                val oldPort = prefs.getInt("mpd_port", 6600)
+                val oldAutostart = prefs.getBoolean("mpd_autostart", false)
+                val changed = oldEnabled != enabled || oldPwd != newPwd || oldPort != newPort || oldAutostart != autostartEnabled
+                prefs.edit {
+                    putBoolean("mpd_enabled", enabled)
+                    putString("mpd_password", newPwd)
+                    putInt("mpd_port", newPort)
+                    putBoolean("mpd_autostart", autostartEnabled)
+                }
+                if (changed) {
+                    PlaybackService.instance?.updateMpdServer()
+                    val msg = when {
+                        !enabled -> "MPD disabled"
+                        newPwd.isNotBlank() -> "MPD :$newPort 🔒"
+                        else -> "MPD :$newPort"
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                }
+                updateLanControlCard()
+                dialog.dismiss()
+            }
+            restartBtn.setOnClickListener {
+                val newPwd = pwdInput.text.toString().trim()
+                val newPort = portInput.text.toString().toIntOrNull() ?: port
+                if (newPort !in 1024..65535) {
+                    Toast.makeText(context, "Port must be 1024-65535", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                prefs.edit {
+                    putBoolean("mpd_enabled", true)
+                    putString("mpd_password", newPwd)
+                    putInt("mpd_port", newPort)
+                    putBoolean("mpd_autostart", autostartEnabled)
+                }
+                PlaybackService.instance?.updateMpdServer()
+                Toast.makeText(context, "Restarting MPD :$newPort …", Toast.LENGTH_SHORT).show()
+                updateLanControlCard()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
     private fun getScreensaverLabel(): String {
         val mins = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             .getInt(KEY_SCREENSAVER, 0)
@@ -2656,6 +3025,9 @@ class MainFragment : BrowseSupportFragment() {
             actionId == "action:USB DAC" -> {
                 showUsbDacDialog()
             }
+            actionId == "action:LAN Player Control" -> {
+                showLanControlDialog()
+            }
             actionId == "action:About" -> {
                 showAboutDialog()
             }
@@ -2668,9 +3040,19 @@ class MainFragment : BrowseSupportFragment() {
                         // kill the process, so the last playback position is not lost
                         // (BUG-6: System.exit(0) previously raced with apply()).
                         PlaybackService.instance?.saveCurrentPositionSync()
-                        activity?.stopService(android.content.Intent(requireContext(), PlaybackService::class.java))
-                        activity?.finishAffinity()
-                        System.exit(0)
+                        val prefsX = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                        val keepLan = prefsX.getBoolean("mpd_enabled", true) &&
+                            prefsX.getBoolean("mpd_autostart", false)
+                        if (keepLan) {
+                            // Stop playback but leave PlaybackService (and its MPD
+                            // server) running in the foreground so MALP keeps working.
+                            PlaybackService.instance?.stopPlaybackKeepLanControl()
+                            activity?.finishAffinity()
+                        } else {
+                            activity?.stopService(android.content.Intent(requireContext(), PlaybackService::class.java))
+                            activity?.finishAffinity()
+                            System.exit(0)
+                        }
                     }
                     .setNegativeButton("No", null)
                     .show()

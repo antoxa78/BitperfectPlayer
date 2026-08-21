@@ -1,15 +1,20 @@
 package com.example.bitperfectplayer
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbManager
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.core.app.NotificationCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -79,6 +84,11 @@ class PlaybackService : MediaSessionService() {
 
         private const val USB_SETTLE_MS        = 1_500L
         private const val USB_RESET_GAP_MS     = 400L
+
+        private const val LAN_FG_NOTIF_ID      = 1002
+        private const val MEDIA3_NOTIF_ID      = 1001 // Media3 DefaultMediaNotificationProvider default id
+        private const val CHANNEL_LAN_CONTROL  = "lan_control"
+        private const val LAN_FG_WATCHDOG_MS   = 60_000L
 
         private const val TAG_BITPERFECT       = "BitPerfectAudio"
 
@@ -156,6 +166,77 @@ class PlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var bitPerfectManager: BitPerfectManager
+    private var mpdServer: MpdServer? = null
+
+    // ── LAN keep-foreground ───────────────────────────────────────────────────
+    // Android TV aggressively kills idle "started" services once the app UI is
+    // closed, which takes the MPD server down with it. While LAN control is
+    // enabled and Media3 is not showing its own media notification, hold the
+    // service in the foreground state with a minimal silent notification.
+
+    private var lanFgOwned = false
+    private val lanFgWatchdog = object : Runnable {
+        override fun run() {
+            updateLanForeground()
+            mainHandler.postDelayed(this, LAN_FG_WATCHDOG_MS)
+        }
+    }
+
+    private fun updateLanForeground() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { updateLanForeground() }
+            return
+        }
+        val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+        val mpdEnabled = prefs.getBoolean("mpd_enabled", true)
+        val player = mediaSession?.player
+        val media3OwnsFg = player != null && player.playWhenReady &&
+            (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_BUFFERING)
+
+        if (lanFgOwned) {
+            if (media3OwnsFg) {
+                // Media3 took over the foreground state — hand over silently.
+                lanFgOwned = false
+            } else if (!mpdEnabled) {
+                try { stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+                lanFgOwned = false
+                Log.i(TAG, "LAN keep-foreground released")
+            }
+        }
+        if (!mpdEnabled || media3OwnsFg || lanFgOwned) return
+
+        try {
+            val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            if (mgr.getNotificationChannel(CHANNEL_LAN_CONTROL) == null) {
+                mgr.createNotificationChannel(
+                    NotificationChannel(CHANNEL_LAN_CONTROL, "LAN control",
+                        NotificationManager.IMPORTANCE_MIN)
+                )
+            }
+            // While paused, Media3 keeps its (non-foreground) media notification
+            // with id 1001; remove it so we don't end up with two notifications
+            // alongside our LAN keep-foreground one.
+            try { mgr.cancel(MEDIA3_NOTIF_ID) } catch (_: Exception) {}
+            val port = prefs.getInt("mpd_port", 6600).coerceIn(1024, 65535)
+            val n = NotificationCompat.Builder(this, CHANNEL_LAN_CONTROL)
+                .setSmallIcon(R.drawable.ic_network)
+                .setContentTitle("LAN control active")
+                .setContentText("MPD :$port — control from phone app")
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .build()
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(LAN_FG_NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            } else {
+                startForeground(LAN_FG_NOTIF_ID, n)
+            }
+            lanFgOwned = true
+            Log.i(TAG, "LAN keep-foreground started")
+        } catch (e: Exception) {
+            Log.w(TAG, "LAN keep-foreground failed: ${e.message}")
+        }
+    }
 
     /** mediaId of the currently playing item — written on the main thread only. */
     @Volatile private var activeMediaId: String? = null
@@ -423,6 +504,12 @@ class PlaybackService : MediaSessionService() {
     private val playerListener = object : Player.Listener {
         private var retryCount = 0
 
+        override fun onEvents(player: Player, events: Player.Events) {
+            // Media3 promotes/demotes its own media notification as playback
+            // starts/stops — keep our LAN keep-foreground in sync.
+            updateLanForeground()
+        }
+
         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
             Log.e(TAG, "Player error: ${error.errorCodeName} — ${error.message}", error)
             // The current AudioTrack is no longer usable. Do not leave its preferred
@@ -540,6 +627,72 @@ class PlaybackService : MediaSessionService() {
         // On startup: if a USB DAC is already connected, reset the sink so
         // Android HAL negotiates bit-perfect output from the very first track.
         mainHandler.postDelayed({ checkAndResetUsbAudio("startup") }, USB_SETTLE_MS)
+
+        // Embedded MPD server for MALP / any MPD client (port 6600).
+        // Runs on its own threads and drives playback only via MediaController
+        // — never touches the bit-perfect audio chain.
+        updateMpdServer()
+
+        // Keep-alive watchdog: re-assert foreground state if the system drops it.
+        mainHandler.post(lanFgWatchdog)
+    }
+
+    fun isMpdRunning(): Boolean = mpdServer != null
+    fun getClientCount(): Int = mpdServer?.getClientCount() ?: 0
+
+    /** Stops playback but keeps the service (and MPD server) alive for LAN control. */
+    fun stopPlaybackKeepLanControl() {
+        mainHandler.post {
+            try {
+                mediaSession?.player?.let { p ->
+                    p.playWhenReady = false
+                    p.stop()
+                }
+            } catch (_: Exception) {}
+            updateLanForeground()
+        }
+    }
+
+    fun updateMpdServer() {
+        val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+        val enabled = prefs.getBoolean("mpd_enabled", true)
+        val port = prefs.getInt("mpd_port", 6600).coerceIn(1024, 65535)
+        try {
+            if (enabled) {
+                // Ensure the service is in the started state so it survives
+                // activity unbind / task removal while LAN control is enabled.
+                try { startService(Intent(this, PlaybackService::class.java)) } catch (_: Exception) {}
+                val curPort = mpdServer?.getPort()
+                if (mpdServer == null) {
+                    mpdServer = MpdServer(this).also { it.start() }
+                    Log.i(TAG, "MPD server started on $port (LAN control enabled)")
+                } else if (curPort != null && curPort != port) {
+                    mpdServer?.stop()
+                    mpdServer = MpdServer(this).also { it.start() }
+                    Log.i(TAG, "MPD server restarted on $port (port changed)")
+                }
+            } else {
+                mpdServer?.stop()
+                mpdServer = null
+                Log.i(TAG, "MPD server stopped (LAN control disabled)")
+            }
+            updateLanForeground()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update MPD server", e)
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Media3's default stops the service when playback is idle, which kills
+        // the MPD server and breaks LAN control after the app UI is closed.
+        val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+        val keepAlive = prefs.getBoolean("mpd_enabled", true) &&
+            prefs.getBoolean("mpd_autostart", false)
+        if (keepAlive) {
+            Log.i(TAG, "Task removed — keeping service alive for LAN control")
+            return
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
@@ -556,6 +709,8 @@ class PlaybackService : MediaSessionService() {
         saveCurrentPosition()
         bitPerfectManager.clear()
         resetIcyInfo(null)
+        try { mpdServer?.stop() } catch (_: Exception) {}
+        mpdServer = null
         mainHandler.removeCallbacksAndMessages(null)
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
         mediaSession?.run { player.release(); release() }
