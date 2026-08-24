@@ -489,20 +489,15 @@ class MainFragment : BrowseSupportFragment() {
         val controller = activity?.getController()
         
         val currentItem = controller?.currentMediaItem
-        var title = currentItem?.mediaMetadata?.title?.toString() ?: "Nothing Playing"
-        val subtitle = currentItem?.mediaMetadata?.artist?.toString() ?: ""
         val isPlaying = controller?.isPlaying == true
 
-        // ICY streams: prefer the in-band StreamTitle captured by the service.
-        val mediaId  = currentItem?.mediaId ?: ""
-        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
-        val icy      = PlaybackService.icyInfo
-        if (isStream) {
-            val icyForItem = icy?.takeIf { it.mediaId == mediaId }
-            val station = controller?.mediaMetadata?.station?.toString()?.takeIf { it.isNotBlank() }
-                ?: icyForItem?.station
-            if (icyForItem != null && !icyForItem.title.isNullOrBlank()) title = icyForItem.title
-            else if (!station.isNullOrBlank()) title = station
+        var title = "Nothing Playing"
+        var subtitle = ""
+        if (currentItem != null) {
+            // Same track/artist resolution as the full-screen Now Playing activity.
+            val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+            title = info.track
+            subtitle = info.artist
         }
 
         val nowPlayingId = if (isPlaying) "action:NOW_PLAYING:$title" else "action:NOW_PAUSED:$title"

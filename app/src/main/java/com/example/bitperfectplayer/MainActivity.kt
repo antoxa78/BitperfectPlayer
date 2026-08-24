@@ -118,33 +118,22 @@ class MainActivity : BaseActivity() {
 
     override fun updateScreensaverText(textView: TextView) {
         val controller = mediaController
-        if (controller == null || controller.mediaMetadata.title == null) {
+        if (controller == null || controller.currentMediaItem == null) {
             textView.text = "Bitperfect Player"
             return
         }
-        val metadata = controller.mediaMetadata
-        var title  = metadata.title?.toString() ?: "Bitperfect Player"
-        val artist = metadata.artist?.toString() ?: ""
-        val album = metadata.albumTitle?.toString() ?: ""
+        // Same track/artist/album resolution as the Now Playing screen and card.
+        val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+        var title = info.track
+        val artist = info.artist
+        val album = info.album
 
-        // ICY streams: prefer the in-band StreamTitle captured by the service.
-        val mediaId  = controller.currentMediaItem?.mediaId ?: ""
-        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
-        val icy      = PlaybackService.icyInfo
-        if (isStream) {
-            val icyForItem = icy?.takeIf { it.mediaId == mediaId }
-            val station = metadata.station?.toString()?.takeIf { it.isNotBlank() }
-                ?: icyForItem?.station
-            if (icyForItem != null && !icyForItem.title.isNullOrBlank()) {
-                title = icyForItem.title
-            } else if (!station.isNullOrBlank()) {
-                title = station
-            } else {
-                // No usable metadata: prettify the URL-derived static title.
-                val last = mediaId.toUri().lastPathSegment
-                if (last != null && title == last) title = last.substringBeforeLast(".")
-                else if (title.isBlank()) title = last?.substringBeforeLast(".")?.takeIf { it.isNotBlank() }
-                    ?: mediaId.toUri().host?.removePrefix("www.") ?: title
+        // When the title embeds the artist ("Artist - Track") alongside a separate
+        // artist row, strip the prefix so the value is not shown twice (BUG).
+        if (artist.isNotBlank()) {
+            for (d in arrayOf(" - ", " – ", " — ", " : ", " | ")) {
+                val prefix = artist + d
+                if (title.startsWith(prefix)) { title = title.substring(prefix.length).trim(); break }
             }
         }
 
@@ -169,8 +158,10 @@ class MainActivity : BaseActivity() {
         }
 
         appendRow(title, R.drawable.ic_audio)
-        appendRow(artist, R.drawable.ic_artist)
-        appendRow(album, R.drawable.ic_album_art)
+        // Skip the artist row when the artist is already part of the title
+        // (e.g. station "Solar Radio High" in title "Solar Radio High [256kbps]")
+        if (artist.isNotBlank() && artist != title && !title.startsWith(artist)) appendRow(artist, R.drawable.ic_artist)
+        if (album.isNotBlank() && album != title && album != artist) appendRow(album, R.drawable.ic_album_art)
 
         textView.text = sb
         textView.textAlignment = android.view.View.TEXT_ALIGNMENT_CENTER
@@ -281,8 +272,11 @@ class MainActivity : BaseActivity() {
                 if (trimmed.isEmpty()) continue
 
                 if (trimmed.startsWith("#EXTINF:")) {
-                    val comma = trimmed.indexOf(',')
-                    if (comma != -1) currentTitle = trimmed.substring(comma + 1)
+                    // Attributes (tvg-id=..., tvg-logo=..., group-title=...) sit between
+                    // the duration and the actual title, so the title starts after the
+                    // LAST comma — indexOf(',') would pollute it with the attributes.
+                    val comma = trimmed.lastIndexOf(',')
+                    if (comma != -1) currentTitle = trimmed.substring(comma + 1).trim()
                 } else if (!trimmed.startsWith("#")) {
                     // Normalise Windows path separators
                     val normalizedPath = trimmed.replace("\\", "/")

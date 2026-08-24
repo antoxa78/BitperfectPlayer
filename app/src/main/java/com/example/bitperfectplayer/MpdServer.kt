@@ -36,6 +36,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
 
 /**
  * Embedded MPD-protocol server. Drives playback **only** through a
@@ -53,6 +56,8 @@ class MpdServer(private val context: Context) {
         private const val REPORTED_VERSION = "0.24.0"
         private const val HOP_TIMEOUT_MS = 3000L
         private const val IDLE_MAX_MS = 60_000L
+        /** Settling window that coalesces burst queue edits into one version change. */
+        private const val VERSION_SETTLE_MS = 3000L
 
         // ACK codes
         const val ACK_NOT_LIST = 1
@@ -110,6 +115,21 @@ class MpdServer(private val context: Context) {
     private var nextSongId = 1
     private var queueVersion = 1
     private var lastFingerprint = ""
+    private var firstSyncDone = false
+    private var pendingBumpToken = 0
+    private var settledFingerprint: String? = null
+
+    init {
+        // Persist the queue version + fingerprint across app restarts so a
+        // restart with the same restored queue keeps the same version — clients
+        // like MALP don't clear/refetch their playlist view (BUG).
+        try {
+            val p = appContext.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
+            queueVersion = p.getInt("mpd_queue_version", 1)
+            lastFingerprint = p.getString("mpd_queue_fingerprint", "") ?: ""
+            settledFingerprint = lastFingerprint
+        } catch (_: Exception) {}
+    }
 
     // Idle
     private inner class IdleWaiter(val wanted: Set<String>) {
@@ -215,7 +235,8 @@ class MpdServer(private val context: Context) {
 
     private data class Snapshot(
         val state: Int, val playing: Boolean, val index: Int, val count: Int,
-        val mediaId: String?, val repeat: Int, val random: Boolean, val queueFp: String
+        val mediaId: String?, val repeat: Int, val random: Boolean, val queueFp: String,
+        val icyFp: String
     )
 
     private fun pollChanges(): Set<String>? {
@@ -227,6 +248,9 @@ class MpdServer(private val context: Context) {
         if (snap.state != prev.state || snap.playing != prev.playing || snap.index != prev.index || snap.mediaId != prev.mediaId) out.add("player")
         if (snap.count != prev.count || snap.queueFp != prev.queueFp) out.add("playlist")
         if (snap.repeat != prev.repeat || snap.random != prev.random) out.add("options")
+        // A radio stream's song title (ICY) changes without any player event —
+        // notify idle clients so MALP re-queries and shows it promptly (BUG).
+        if (snap.icyFp != prev.icyFp) out.add("player")
         return out
     }
 
@@ -239,6 +263,9 @@ class MpdServer(private val context: Context) {
     }
 
     // ── Main-thread hop ─────────────────────────────────────────────────────
+    // MediaController in this Media3 version must be used from the thread it
+    // was created on (the app main thread), so every command routes through
+    // mainHandler. The 3s timeout guards against a stalled main thread.
 
     private fun <T> hop(block: (MediaController) -> T): T {
         val c = controller ?: throw MpdAck(ACK_SYSTEM, "player not connected")
@@ -260,8 +287,10 @@ class MpdServer(private val context: Context) {
     private fun lightSnapshot(): Snapshot? = try {
         hop { c ->
             val fp = buildFingerprint(c)
+            val icy = PlaybackService.icyInfo
+            val icyFp = if (icy != null) "${icy.mediaId}|${icy.title ?: ""}|${icy.station ?: ""}" else ""
             Snapshot(c.playbackState, c.isPlaying, c.currentMediaItemIndex, c.mediaItemCount,
-                c.currentMediaItem?.mediaId, c.repeatMode, c.shuffleModeEnabled, fp)
+                c.currentMediaItem?.mediaId, c.repeatMode, c.shuffleModeEnabled, fp, icyFp)
         }
     } catch (_: Exception) { null }
 
@@ -285,17 +314,61 @@ class MpdServer(private val context: Context) {
                     val reused = if (i < songIds.size && oldMid == mid) songIds[i] else 0
                     newIds[i] = if (reused != 0) reused else nextSongId++
                 }
-                if (newIds != songIds) { songIds = newIds; queueVersion++ }
-                lastFingerprint = buildFingerprint(c)
+                val fp = buildFingerprint(c)
+                if (firstSyncDone) {
+                    if (newIds != songIds) {
+                        songIds = newIds
+                        scheduleVersionBump(fp)
+                    }
+                } else {
+                    // Fresh server after an app restart: keep the persisted version
+                    // when the queue is unchanged (restored), so clients don't see a
+                    // version change and don't clear/refetch their playlist view.
+                    firstSyncDone = true
+                    songIds = newIds
+                    if (fp != lastFingerprint) scheduleVersionBump(fp)
+                }
+                lastFingerprint = fp
                 return
             }
             val fp = buildFingerprint(c)
             if (fp != lastFingerprint) {
                 // order changed — assign fresh ids for moved entries is OK; bump version
-                queueVersion++
                 lastFingerprint = fp
+                scheduleVersionBump(fp)
             }
         }
+    }
+
+    /**
+     * Coalesces rapid queue edits into a single version change: the version bumps
+     * once, ~3s after the queue settles, instead of once per edit. Clients like
+     * MALP clear + refetch their playlist view on every version change, so bursts
+     * of adds/moves/deletes used to flash the playlist empty repeatedly (BUG).
+     */
+    private fun scheduleVersionBump(fp: String) {
+        val token = ++pendingBumpToken
+        mainHandler.postDelayed({
+            synchronized(qLock) {
+                if (token != pendingBumpToken) return@synchronized
+                pendingBumpToken = 0
+                if (lastFingerprint != fp) return@synchronized
+                if (settledFingerprint == fp) return@synchronized
+                settledFingerprint = fp
+                queueVersion++
+                persistQueueVersion(fp)
+                Log.w(TAG, "SYNC settle-bump v=$queueVersion fp=${fp.take(40)}")
+            }
+        }, VERSION_SETTLE_MS)
+    }
+
+    private fun persistQueueVersion(fp: String) {
+        try {
+            appContext.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
+                .edit().putInt("mpd_queue_version", queueVersion)
+                .putString("mpd_queue_fingerprint", fp)
+                .apply()
+        } catch (_: Exception) {}
     }
 
     private fun posOfId(id: Int): Int = synchronized(qLock) { songIds.indexOf(id) }
@@ -308,9 +381,14 @@ class MpdServer(private val context: Context) {
         override fun run() {
             // Reset per-connection auth (pooled threads reuse ThreadLocal)
             clientAuth.set(getPassword().isEmpty())
+            clientSocket.set(sock)
             clientCount.incrementAndGet()
             try {
                 sock.tcpNoDelay = true
+                // Keep the connection alive through brief network hiccups (the
+                // Shield's Wi-Fi is prone to drops) — helps prevent client-side
+                // "Connection reset" + playlist refetch cycles.
+                try { sock.setKeepAlive(true) } catch (_: Exception) {}
                 val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
                 val writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8))
                 send(writer, "OK MPD $REPORTED_VERSION")
@@ -325,19 +403,24 @@ class MpdServer(private val context: Context) {
                         var hadError = false
                         for ((idx, line) in lines.withIndex()) {
                             if (hadError) break
-                            try { execLine(line, writer, reader); if (okEach) send(writer, "OK") }
+                            binaryResponseSent.set(false)
+                            try { execLine(line, writer, reader); if (okEach && !binaryResponseSent.get()) send(writer, "OK") }
                             catch (e: MpdAck) { sendAck(writer, idx, lineToken(line), e); hadError = true }
                             catch (_: CloseSignal) { sock.close(); return }
                         }
-                        if (!hadError && !okEach) send(writer, "OK")
+                        if (!hadError && !okEach && !binaryResponseSent.get()) send(writer, "OK")
                         continue
                     }
-                    try { execLine(raw, writer, reader); send(writer, "OK") }
+                    binaryResponseSent.set(false)
+                    try { execLine(raw, writer, reader); if (!binaryResponseSent.get()) send(writer, "OK") }
                     catch (e: MpdAck) { sendAck(writer, 0, lineToken(raw), e) }
                     catch (_: CloseSignal) { break }
                 }
             } catch (e: Exception) { if (running) Log.d(TAG, "client: ${e.message}") }
-            finally { clientCount.decrementAndGet(); try { sock.close() } catch (_: Exception) {} }
+            finally {
+                clientSocket.remove()
+                clientCount.decrementAndGet(); try { sock.close() } catch (_: Exception) {}
+            }
         }
         private fun lineToken(line: String): String = try { tokenize(line).firstOrNull() ?: "" } catch (_: Exception) { "" }
     }
@@ -382,6 +465,8 @@ class MpdServer(private val context: Context) {
     // Per-connection auth flag is stored in Client; execLine checks it via helper below.
     // We pass authenticated state via ThreadLocal for simplicity (each Client thread has its own).
     private val clientAuth = ThreadLocal.withInitial { false }
+    private val clientSocket = ThreadLocal<Socket>()
+    private val binaryResponseSent = ThreadLocal.withInitial { false }
 
     @Throws(MpdAck::class, CloseSignal::class)
     private fun execLine(line: String, writer: BufferedWriter, reader: BufferedReader? = null) {
@@ -398,6 +483,10 @@ class MpdServer(private val context: Context) {
         }
         // idle needs special handling — it blocks; pass reader so noidle can interrupt
         if (cmd == "idle") { handleIdle(args, writer, reader); return }
+        if (cmd == "albumart" || cmd == "readpicture") {
+            handleAlbumArt(args, writer)
+            return
+        }
         if (cmd == "noidle") {
             // If we are inside idle, this will be consumed by handleIdle's reader poll; otherwise just ack
             return
@@ -428,6 +517,7 @@ class MpdServer(private val context: Context) {
         // Wait up to IDLE_MAX_MS but wake early if client sends noidle
         var remaining = IDLE_MAX_MS
         val step = 100L
+        var consumedCommand = false
         while (remaining > 0) {
             if (waiter.latch.await(step, TimeUnit.MILLISECONDS)) break
             // Check if client sent noidle
@@ -445,16 +535,22 @@ class MpdServer(private val context: Context) {
                                 idleWaiters.remove(waiter)
                                 break
                             } else if (peek != null) {
-                                // Unexpected line during idle — treat as noidle wake and push back not possible
-                                // Just break and let outer loop handle it on next iteration (re-inject via flag)
-                                // We consumed it, so we need to handle it as next command — store for outer loop
-                                // For now just break idle and the consumed line is lost — so we handle it by dispatching it here
-                                // Dispatch the consumed non-noidle line as next command
+                                // Unexpected line during idle — a command arrived while
+                                // idling (clients like MALP do this). Dispatch it here;
+                                // the idle events must NOT be written afterwards or the
+                                // client sees "changed:" on top of the command's own
+                                // response and aborts the connection (BUG: "Connection
+                                // reset" in MALP → playlist cleared).
+                                consumedCommand = true
                                 try {
                                     execLine(peek, writer, reader)
                                     // Send OK for that command if needed is handled inside execLine's caller — we need to send OK here
                                     // execLine for non-idle doesn't send OK itself; caller sends OK. So we mimic:
                                     writer.write("OK\n"); writer.flush()
+                                } catch (e: MpdAck) {
+                                    // Surface the error to the client instead of swallowing it (BUG: silent "nothing happens")
+                                    val cmdTok = try { tokenize(peek).firstOrNull() ?: "" } catch (_: Exception) { "" }
+                                    sendAck(writer, 0, cmdTok, e)
                                 } catch (_: Exception) {}
                                 idleWaiters.remove(waiter)
                                 break
@@ -466,6 +562,7 @@ class MpdServer(private val context: Context) {
             remaining -= step
         }
         if (idleWaiters.contains(waiter)) idleWaiters.remove(waiter)
+        if (consumedCommand) return
         val fired = waiter.fired
         for (sub in fired) { writer.write("changed: $sub\n") }
         writer.flush()
@@ -632,7 +729,8 @@ class MpdServer(private val context: Context) {
                 if (args.isEmpty()) throw MpdAck(ACK_ARG, "need playlist name")
                 val items = loadStoredPlaylist(args[0])
                 if (items.isEmpty()) throw MpdAck(ACK_NO_EXIST, "No such playlist")
-                hop { it.addMediaItems(items) }
+                // Loading a stored playlist replaces the current queue (MALP expects this)
+                hop { it.setMediaItems(items) }
             }
             "save" -> {
                 if (args.isEmpty()) throw MpdAck(ACK_ARG, "need name")
@@ -643,16 +741,222 @@ class MpdServer(private val context: Context) {
                 val f = playlistFile(args[0]); if (!f.exists() || !f.delete()) throw MpdAck(ACK_NO_EXIST, "No such playlist")
                 invalidatePlaylistCache()
             }
-            "rename" -> {
-                if (args.size < 2) throw MpdAck(ACK_ARG, "need old and new")
-                val a = playlistFile(args[0]); val b = playlistFile(args[1])
-                if (!a.exists()) throw MpdAck(ACK_NO_EXIST, "No such playlist")
-                if (b.exists()) throw MpdAck(ACK_SYSTEM, "playlist already exists")
-                if (!a.renameTo(b)) throw MpdAck(ACK_SYSTEM, "rename failed")
-                invalidatePlaylistCache()
+             "rename" -> {
+                 if (args.size < 2) throw MpdAck(ACK_ARG, "need old and new")
+                 val a = playlistFile(args[0]); val b = playlistFile(args[1])
+                 if (!a.exists()) throw MpdAck(ACK_NO_EXIST, "No such playlist")
+                 if (b.exists()) throw MpdAck(ACK_SYSTEM, "playlist already exists")
+                 if (!a.renameTo(b)) throw MpdAck(ACK_SYSTEM, "rename failed")
+                 invalidatePlaylistCache()
+             }
+             else -> throw MpdAck(ACK_UNKNOWN, "unknown command \"$cmd\"")
+         }
+     }
+
+    private fun handleAlbumArt(args: List<String>, writer: BufferedWriter) {
+        if (args.isEmpty()) throw MpdAck(ACK_ARG, "need uri")
+        val uri = args[0]
+        val artBytes = getArtworkBytes(uri) ?: throw MpdAck(ACK_NO_EXIST, "no album art")
+
+        writer.flush()
+        val sock = clientSocket.get() ?: throw MpdAck(ACK_SYSTEM, "not connected")
+        val os = sock.getOutputStream()
+        os.write("size: ${artBytes.size}\nbinary: ${artBytes.size}\n".toByteArray(Charsets.UTF_8))
+        os.write(artBytes)
+        os.write("\nOK\n".toByteArray(Charsets.UTF_8))
+        os.flush()
+        // Mark that this command already emitted its own OK so Client doesn't append another.
+        binaryResponseSent.set(true)
+    }
+
+    private fun getArtworkBytes(uri: String): ByteArray? {
+        // 1. For the currently playing track, use ExoPlayer's already-parsed embedded
+        //    artworkData (same source the player's own Now Playing screen uses). This is
+        //    the most reliable path and matches exactly what the on-device UI shows.
+        try {
+            val current = hop { c ->
+                val idx = c.currentMediaItemIndex
+                if (idx < 0 || idx >= c.mediaItemCount) null
+                else {
+                    val item = c.getMediaItemAt(idx)
+                    val path = mpdPath(item.mediaId)
+                    // Use the player's merged metadata (same source as the Now Playing
+                    // UI) — ExoPlayer populates it with embedded artwork during playback,
+                    // while the static media item's artworkData is usually empty.
+                    val art = c.mediaMetadata?.artworkData ?: item.mediaMetadata?.artworkData
+                    if (path == uri && art != null && art.isNotEmpty()) art else null
+                }
             }
-                        "albumart", "readpicture" -> throw MpdAck(ACK_NO_EXIST, "no album art")
-            else -> throw MpdAck(ACK_UNKNOWN, "unknown command \"$cmd\"")
+            if (current != null && current.isNotEmpty()) return current
+        } catch (_: Exception) {}
+
+        var artist: String? = null
+        var album: String? = null
+        var title: String? = null
+
+        try {
+            val file = resolveLocalPath(uri)
+            if (file.exists() && file.isFile) {
+                // 2. Local folder artwork — the player's own UI goes straight from
+                //    embedded artworkData to folder art, so match it exactly (no
+                //    separate MediaMetadataRetriever pass, which could surface an
+                //    embedded image the player's UI doesn't show).
+                val parent = file.parentFile
+                if (parent != null && parent.exists()) {
+                    val artNames = arrayOf("cover.jpg", "folder.jpg", "cover.png", "folder.png", "album.jpg", "artwork.jpg")
+                    for (name in artNames) {
+                        val artFile = java.io.File(parent, name)
+                        if (artFile.exists()) {
+                            val bytes = artFile.readBytes()
+                            if (bytes.isNotEmpty()) return bytes
+                        }
+                    }
+                }
+
+                // Remember metadata for online fallback (local files)
+                library.lookup(file.absolutePath)?.let {
+                    artist = it.artist.ifBlank { null }
+                    album = it.album.ifBlank { null }
+                    title = it.title.ifBlank { null }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting artwork for $uri", e)
+        }
+
+        // 4. Online fallback (mirrors the player's own UI) — for files/streams
+        //    that have no local artwork. Uses the current track's metadata when
+        //    the library has no entry (e.g. internet radio streams).
+        if (artist.isNullOrBlank()) {
+            try {
+                hop { c ->
+                    val idx = c.currentMediaItemIndex
+                    if (idx >= 0 && idx < c.mediaItemCount) {
+                        val item = c.getMediaItemAt(idx)
+                        val isStream = item.mediaId.startsWith("http://") || item.mediaId.startsWith("https://")
+                        if (isStream) {
+                            // Streams: use the live track info (icyInfo) so the search
+                            // finds the actual song's artwork, not the stream's own name.
+                            val info = TrackInfoResolver.resolve(c, PlaybackService.icyInfo)
+                            val station = PlaybackService.icyInfo?.station?.takeIf { it.isNotBlank() }
+                            // If the only "artist" is the station name, drop it so the
+                            // search keys off the actual track title instead of a generic
+                            // station name (which rarely matches any album).
+                            artist = info.artist.takeIf { it.isNotBlank() && it != "Unknown Artist" && it != station }
+                            title = info.track.takeIf { it.isNotBlank() && it != "Unknown Title" }
+                            album = info.album.takeIf { it.isNotBlank() }
+                        } else {
+                            val mm = item.mediaMetadata
+                            artist = mm?.artist?.toString()?.takeIf { it.isNotBlank() }
+                            album = mm?.albumTitle?.toString()?.takeIf { it.isNotBlank() }
+                            title = mm?.title?.toString()?.takeIf { it.isNotBlank() }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        if (!artist.isNullOrBlank() || !title.isNullOrBlank()) {
+            return fetchOnlineArt(artist, album, title)
+        }
+        return null
+    }
+
+    private fun fetchOnlineArt(artist: String?, album: String?, title: String?): ByteArray? {
+        return try {
+            val parts = listOfNotNull(
+                artist?.takeIf { it.isNotBlank() },
+                album?.takeIf { it.isNotBlank() },
+                title?.takeIf { it.isNotBlank() }
+            )
+            if (parts.isEmpty()) return null
+            val term = Uri.encode(parts.joinToString(" "))
+
+            // MusicBrainz release search -> Cover Art Archive. Tried FIRST to match
+            // the player's own Now Playing UI, so both surfaces show the same art.
+            val query = if (!album.isNullOrBlank() && !artist.isNullOrBlank())
+                "release:\"${mbEscape(album)}\" AND artist:\"${mbEscape(artist)}\""
+            else if (!artist.isNullOrBlank())
+                "recording:\"${mbEscape(title ?: "")}\" AND artist:\"${mbEscape(artist)}\""
+            else
+                "recording:\"${mbEscape(title ?: "")}\""
+            val mbUrl = "https://musicbrainz.org/ws/2/release/?query=${Uri.encode(query)}&limit=5&fmt=json"
+            val mbJson = httpGetString(mbUrl)
+            if (mbJson != null) {
+                val releases = JSONObject(mbJson).optJSONArray("releases")
+                if (releases != null && releases.length() > 0) {
+                    var bestMbid: String? = null
+                    var bestScore = -1
+                    for (i in 0 until releases.length()) {
+                        val rel = releases.getJSONObject(i)
+                        val score = rel.optInt("score", 0)
+                        if (score > bestScore) { bestScore = score; bestMbid = rel.optString("id").takeIf { it.isNotBlank() } }
+                    }
+                    if (!bestMbid.isNullOrBlank()) {
+                        val b = httpGetBytes("https://coverartarchive.org/release/$bestMbid/front-250")
+                        if (b != null && b.isNotEmpty()) return b
+                    }
+                }
+            }
+
+            // Fallback: iTunes Search API (mirrors the player's own fallback order).
+            val itunes = httpGetString("https://itunes.apple.com/search?term=$term&media=music&entity=song&limit=5")
+            if (itunes != null) {
+                val results = JSONObject(itunes).optJSONArray("results")
+                if (results != null && results.length() > 0) {
+                    val artUrl = results.getJSONObject(0)
+                        .optString("artworkUrl100").takeIf { it.isNotBlank() }
+                        ?.replace("100x100bb", "600x600bb")
+                    if (artUrl != null) {
+                        val b = httpGetBytes(artUrl)
+                        if (b != null && b.isNotEmpty()) return b
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.d(TAG, "Online artwork lookup failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun mbEscape(s: String): String = s.replace("\"", "\\\"").take(100)
+
+    private val artHttpClient: OkHttpClient by lazy {
+        // Tight timeouts: the full online lookup (up to 3 requests) must complete
+        // within the remote client's ~10s socket read timeout, or the artwork
+        // request is aborted and no art is shown.
+        OkHttpClient.Builder()
+            .connectTimeout(2, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private fun httpGetString(url: String): String? {
+        return try {
+            val req = Request.Builder().url(url)
+                .header("User-Agent", "BitperfectPlayer/2.3 (https://github.com/antoxa78/BitperfectPlayer)")
+                .header("Accept", "application/json")
+                .build()
+            artHttpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) resp.body?.string() else null
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "HTTP GET failed: $url ${e.message}")
+            null
+        }
+    }
+
+    private fun httpGetBytes(url: String): ByteArray? {
+        return try {
+            val req = Request.Builder().url(url)
+                .header("User-Agent", "BitperfectPlayer/2.3 (https://github.com/antoxa78/BitperfectPlayer)")
+                .build()
+            artHttpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) resp.body?.bytes() else null
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "HTTP GET bytes failed: $url ${e.message}")
+            null
         }
     }
 
@@ -747,7 +1051,7 @@ class MpdServer(private val context: Context) {
             syncIdsIfNeeded(c)
             val idx = c.currentMediaItemIndex
             if (idx < 0 || idx >= c.mediaItemCount) return@hop
-            appendSong(c, idx, out)
+            appendSong(c, idx, out, useLiveCurrent = true)
         }
     }
 
@@ -792,7 +1096,7 @@ class MpdServer(private val context: Context) {
         }
     }
 
-    private fun appendSong(c: MediaController, pos: Int, out: StringBuilder) {
+    private fun appendSong(c: MediaController, pos: Int, out: StringBuilder, useLiveCurrent: Boolean = false) {
         val item = c.getMediaItemAt(pos)
         val uri = item.mediaId
         val filePath = mpdPath(uri)
@@ -812,15 +1116,55 @@ class MpdServer(private val context: Context) {
             else -> -1
         }
         if (secs >= 0) { out.append("Time: ").append(secs).append('\n'); out.append("duration: ").append(String.format(Locale.US, "%.3f", secs.toDouble())).append('\n') }
-        val title = item.mediaMetadata.title?.toString() ?: lib?.title ?: File(filePath).nameWithoutExtension
-        val artist = item.mediaMetadata.artist?.toString()?.takeIf { it.isNotBlank() } ?: lib?.artist ?: ""
-        val album = item.mediaMetadata.albumTitle?.toString() ?: lib?.album ?: ""
-        val genre = lib?.genre ?: ""
-        val trackNo = lib?.trackNo ?: 0
-        if (artist.isNotBlank()) out.append("Artist: ").append(artist).append('\n')
+        // The current song reports the same resolved track/artist as the app's own
+        // UI (live tags for local files, ICY StreamTitle for radio streams), so
+        // MALP shows the same info as the Now Playing screen.
+        var title: String? = null
+        var artist = ""
+        var album = ""
+        var albumArtist = ""
+        var genre = ""
+        var trackNo = 0
+        var discNo = 0
+        val isStream = uri.startsWith("http://") || uri.startsWith("https://")
+        // Use live tags for the current song only when showing it as "now playing"
+        // (currentsong). In the playlist listing, keep the stream's stored name so
+        // the live ICY track title doesn't overwrite the stream's own tag.
+        if (pos == c.currentMediaItemIndex && (useLiveCurrent || !isStream)) {
+            val info = TrackInfoResolver.resolve(c, PlaybackService.icyInfo)
+            if (info.track != "Unknown Title") title = info.track
+            if (info.artist != "Unknown Artist") artist = info.artist
+            album = info.album
+            // Live tags (extracted from the file during playback) are richer than
+            // the static item metadata — e.g. external-drive files carry album,
+            // track and disc tags that the MPD library never scanned.
+            val live = if (isStream) null else c.mediaMetadata
+            albumArtist = live?.albumArtist?.toString()?.takeIf { it.isNotBlank() }
+                ?: item.mediaMetadata.albumArtist?.toString()?.takeIf { it.isNotBlank() } ?: ""
+            genre = live?.genre?.toString()?.takeIf { it.isNotBlank() } ?: ""
+            trackNo = live?.trackNumber ?: 0
+            discNo = live?.discNumber ?: 0
+        } else {
+            // In the playlist listing the queue item's title is the original stream
+            // name (it is never overwritten with the live track), so use it directly.
+            title = item.mediaMetadata.title?.toString()
+            artist = item.mediaMetadata.artist?.toString()?.takeIf { it.isNotBlank() }
+                ?: item.mediaMetadata.albumArtist?.toString()?.takeIf { it.isNotBlank() } ?: ""
+            album = item.mediaMetadata.albumTitle?.toString() ?: ""
+            albumArtist = item.mediaMetadata.albumArtist?.toString()?.takeIf { it.isNotBlank() } ?: ""
+        }
+        val finalTitle = title?.takeIf { it.isNotBlank() } ?: lib?.title ?: File(filePath).nameWithoutExtension
+        val finalArtist = artist.takeIf { it.isNotBlank() } ?: lib?.artist ?: ""
+        album = album.takeIf { it.isNotBlank() } ?: lib?.album ?: ""
+        albumArtist = albumArtist.takeIf { it.isNotBlank() } ?: lib?.albumArtist ?: ""
+        genre = genre.takeIf { it.isNotBlank() } ?: lib?.genre ?: ""
+        trackNo = trackNo.takeIf { it > 0 } ?: lib?.trackNo ?: 0
+        if (finalArtist.isNotBlank()) out.append("Artist: ").append(finalArtist).append('\n')
+        if (albumArtist.isNotBlank() && albumArtist != finalArtist) out.append("AlbumArtist: ").append(albumArtist).append('\n')
         if (album.isNotBlank()) out.append("Album: ").append(album).append('\n')
-        out.append("Title: ").append(title).append('\n')
+        out.append("Title: ").append(finalTitle).append('\n')
         if (trackNo > 0) out.append("Track: ").append(trackNo).append('\n')
+        if (discNo > 0) out.append("Disc: ").append(discNo).append('\n')
         if (genre.isNotBlank()) out.append("Genre: ").append(genre).append('\n')
         // Format line per song (optional)
         val fmt = findAudioFormat(c).takeIf { pos == c.currentMediaItemIndex }
@@ -838,17 +1182,53 @@ class MpdServer(private val context: Context) {
 
     private fun storageRoots(): List<Pair<File, String>> {
         val out = ArrayList<Pair<File, String>>()
+        val seen = HashSet<String>()
+
+        fun tryAdd(f: File, label: String) {
+            val p = f.absolutePath.trimEnd('/')
+            if (p.isEmpty() || !f.exists() || !f.isDirectory || seen.contains(p)) return
+            // canRead() is unreliable on Android TV / Shield mounts; listing is the real test.
+            val readable = try { f.list() != null } catch (e: Exception) { false }
+            if (!readable) return
+            seen.add(p)
+            out.add(f to label)
+        }
+
         val primary = Environment.getExternalStorageDirectory()
-        if (primary != null && primary.isDirectory) out.add(primary to "Internal Storage")
+        if (primary != null && primary.isDirectory) tryAdd(primary, "Internal Storage")
         try {
             File("/storage").listFiles()?.forEach { f ->
                 val n = f.name
                 if (n == "emulated" || n == "self" || n.startsWith("private") || n.startsWith("enc_")) return@forEach
-                if (f.isDirectory && f.canRead() && out.none { it.first.absolutePath == f.absolutePath }) {
-                    out.add(f to f.name)
+                tryAdd(f, n)
+            }
+        } catch (_: Exception) {}
+
+        // Some Android TV builds expose removable volumes (USB SSD / flash) only via
+        // /mnt/media_rw or lack a readable /storage/<vol> FUSE view. Sweep /proc/mounts
+        // as a fallback, mirroring MainFragment.detectExternalDrives().
+        try {
+            val removableFs = setOf("vfat", "exfat", "ntfs", "ntfs3", "ext4", "ext3", "ext2", "f2fs", "sdfat", "fuse", "fuseblk")
+            val skipPrefixes = listOf("/mnt/runtime", "/mnt/installer", "/mnt/androidwritable", "/mnt/user",
+                "/mnt/pass_through", "/mnt/appfuse", "/mnt/asec", "/mnt/obb", "/mnt/expand", "/mnt/secure")
+            java.io.BufferedReader(java.io.FileReader("/proc/mounts")).use { reader ->
+                reader.lineSequence().forEach { line ->
+                    val parts = line.split(" ")
+                    if (parts.size < 3) return@forEach
+                    val mount = parts[1]
+                    val fsType = parts[2]
+                    if (fsType !in removableFs) return@forEach
+                    if (!mount.startsWith("/storage/") && !mount.startsWith("/mnt/media_rw/")) return@forEach
+                    if (skipPrefixes.any { mount.startsWith(it) }) return@forEach
+                    val name = mount.substringAfterLast('/')
+                    // Skip if a /storage view of the same volume exists — it was already
+                    // handled (or is gated the same way by the FUSE daemon).
+                    if (mount.startsWith("/mnt/media_rw/") && File("/storage/$name").isDirectory) return@forEach
+                    tryAdd(File(mount), name)
                 }
             }
         } catch (_: Exception) {}
+
         return out
     }
 
@@ -1054,20 +1434,58 @@ class MpdServer(private val context: Context) {
 
     private fun findPlaylist(name: String): File? {
         if (name.isBlank()) return null
-        File(name).takeIf { it.exists() }?.let { return it }
+        // Only treat real playlist files as playlists — matching by exists()/isFile
+        // alone would hijack "add <dir>" or "add <song.mp3>" into an empty playlist
+        // parse (BUG).
+        File(name).takeIf { it.isFile && isPlaylistFile(it.name) }?.let { return it }
         cachedPlaylists()[name]?.let { return it }
         return cachedPlaylists().entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+    }
+
+    private fun isPlaylistFile(name: String): Boolean {
+        val l = name.lowercase()
+        return l.endsWith(".m3u") || l.endsWith(".m3u8") || l.endsWith(".pls") || l.endsWith(".cue")
     }
 
     private fun writeListPlaylist(args: List<String>, out: StringBuilder, withInfo: Boolean) {
         if (args.isEmpty()) throw MpdAck(ACK_ARG, "need playlist name")
         val f = findPlaylist(args[0]) ?: throw MpdAck(ACK_NO_EXIST, "No such playlist")
-        val lines = f.readLines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
-        for (line in lines) {
-            out.append("file: ").append(line).append('\n')
+        for (entry in parseM3uEntries(f)) {
+            out.append("file: ").append(entry.raw).append('\n')
             if (withInfo) {
-                val lib = library.lookup(line)
-                if (lib != null) { out.append("Title: ").append(lib.title).append('\n'); if (lib.artist.isNotBlank()) out.append("Artist: ").append(lib.artist).append('\n') }
+                var title: String? = null
+                var artist = ""
+                if (entry.path.startsWith("http://") || entry.path.startsWith("https://")) {
+                    // Radio station: show the playlist's station name instead of the raw URL.
+                    val rawTitle = entry.title ?: ""
+                    if (rawTitle.isNotBlank()) {
+                        var splitArtist = ""
+                        var splitTrack: String = rawTitle
+                        for (d in arrayOf(" - ", " – ", " — ", " : ", " | ")) {
+                            val idx = splitTrack.indexOf(d)
+                            if (idx >= 0) {
+                                splitArtist = splitTrack.substring(0, idx).trim()
+                                splitTrack = splitTrack.substring(idx + d.length).trim()
+                                break
+                            }
+                        }
+                        if (splitTrack.isNotBlank()) title = splitTrack
+                        if (splitArtist.isNotBlank()) artist = splitArtist
+                    } else {
+                        title = entry.path.substringAfterLast('/').takeIf { it.isNotBlank() }
+                    }
+                } else {
+                    val lib = try { library.lookup(entry.path) } catch (_: Exception) { null }
+                    if (lib != null) {
+                        title = lib.title
+                        if (lib.artist.isNotBlank()) artist = lib.artist
+                    } else {
+                        title = entry.title?.takeIf { it.isNotBlank() }
+                            ?: entry.path.substringAfterLast('/').substringBeforeLast('.')
+                    }
+                }
+                if (!title.isNullOrBlank()) out.append("Title: ").append(title).append('\n')
+                if (artist.isNotBlank()) out.append("Artist: ").append(artist).append('\n')
             }
         }
     }
@@ -1139,9 +1557,9 @@ class MpdServer(private val context: Context) {
             .setMediaMetadata(MediaMetadata.Builder().setTitle(title).apply { if (artist.isNotBlank()) setArtist(artist); if (!lib?.album.isNullOrBlank()) setAlbumTitle(lib.album) }.build()).build()
     }
 
-    private fun streamItem(url: String): MediaItem =
+    private fun streamItem(url: String, title: String? = null): MediaItem =
         MediaItem.Builder().setMediaId(url).setUri(url).setMimeType(MimeTypes.AUDIO_MPEG)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(url.substringAfterLast('/')).build()).build()
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(title?.takeIf { it.isNotBlank() } ?: url.substringAfterLast('/')).build()).build()
 
     private fun genericItem(uri: String): MediaItem =
         MediaItem.Builder().setMediaId(uri).setUri(uri).setMimeType(mimeFor(uri))
@@ -1305,28 +1723,44 @@ class MpdServer(private val context: Context) {
 
     // ── Playlist file parsers ─────────────────────────────────────────────
 
-    private fun parseM3uFile(f: File): List<MediaItem> {
-        val out = mutableListOf<MediaItem>()
+    private data class PlaylistEntry(val raw: String, val path: String, val title: String?)
+
+    /** Parses an .m3u/.m3u8 file into entries with their EXTINF titles resolved. */
+    private fun parseM3uEntries(f: File): List<PlaylistEntry> {
+        val out = mutableListOf<PlaylistEntry>()
         try {
             FileInputStream(f).bufferedReader().use { br ->
                 var title: String? = null
                 for (raw in br.lineSequence()) {
-                    var line = raw.trim().removePrefix("\uFEFF")
+                    val line = raw.trim().removePrefix("\uFEFF")
                     if (line.isEmpty()) continue
-                    if (line.startsWith("#EXTINF:")) { val c = line.indexOf(','); if (c >= 0) title = line.substring(c + 1).trim() }
-                    else if (!line.startsWith("#")) {
+                    if (line.startsWith("#EXTINF:")) {
+                        // Attributes (tvg-id=..., tvg-logo=..., group-title=...) sit between
+                        // the duration and the actual title, so the title starts after the
+                        // LAST comma — indexOf(',') would pollute it with the attributes.
+                        val c = line.lastIndexOf(',')
+                        if (c >= 0) title = line.substring(c + 1).trim()
+                    } else if (!line.startsWith("#")) {
                         val norm = line.replace('\\', '/')
                         val resolved = if (norm.startsWith("/") || norm.contains("://")) norm else File(f.parentFile, norm).absolutePath
-                        val file = File(resolved)
-                        if (file.exists() && MpdLibrary.isAudioFile(file.name)) {
-                            val lib = library.lookup(file.absolutePath)
-                            out.add(fileToMediaItem(file, lib))
-                        } else if (resolved.startsWith("http")) out.add(streamItem(resolved))
+                        out.add(PlaylistEntry(line, resolved, title))
                         title = null
                     }
                 }
             }
         } catch (_: Exception) {}
+        return out
+    }
+
+    private fun parseM3uFile(f: File): List<MediaItem> {
+        val out = mutableListOf<MediaItem>()
+        for (entry in parseM3uEntries(f)) {
+            val file = File(entry.path)
+            if (file.isFile && MpdLibrary.isAudioFile(file.name)) {
+                val lib = library.lookup(file.absolutePath)
+                out.add(fileToMediaItem(file, lib))
+            } else if (entry.path.startsWith("http")) out.add(streamItem(entry.path, entry.title))
+        }
         return out
     }
 
@@ -1345,11 +1779,12 @@ class MpdServer(private val context: Context) {
             val n = props["numberofentries"]?.toIntOrNull() ?: 0
             for (i in 1..n) {
                 val file = props["file$i"] ?: continue
+                val stationTitle = props["title$i"]
                 val norm = file.replace('\\', '/')
                 val resolved = if (norm.startsWith("/") || norm.contains("://")) norm else File(f.parentFile, norm).absolutePath
                 val fileObj = File(resolved)
                 if (fileObj.exists() && MpdLibrary.isAudioFile(fileObj.name)) out.add(fileToMediaItem(fileObj, library.lookup(fileObj.absolutePath)))
-                else if (resolved.startsWith("http")) out.add(streamItem(resolved))
+                else if (resolved.startsWith("http")) out.add(streamItem(resolved, stationTitle))
             }
         } catch (_: Exception) {}
         return out

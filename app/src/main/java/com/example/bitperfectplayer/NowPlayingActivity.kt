@@ -370,40 +370,23 @@ class NowPlayingActivity : BaseActivity() {
         val controller = mediaController ?: return
         val metadata   = controller.mediaMetadata
         val itemMeta   = controller.currentMediaItem?.mediaMetadata
-        var title  = metadata.title?.toString() ?: itemMeta?.title?.toString() ?: metadata.displayTitle?.toString() ?: "Bitperfect Player"
-        var artist = metadata.artist?.toString() ?: itemMeta?.artist?.toString() ?: metadata.albumArtist?.toString() ?: ""
-        var album = metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString() ?: ""
 
-        // ICY streams: prefer the in-band StreamTitle captured by the service.
+        // Same track/artist/album resolution as the full screen and the card.
+        val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+        val title  = info.track
+        var artist = info.artist
+        val album  = info.album
+
         val mediaId  = controller.currentMediaItem?.mediaId ?: ""
-        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
         val icy      = PlaybackService.icyInfo
         val station  = metadata.station?.toString()?.takeIf { it.isNotBlank() }
             ?: itemMeta?.station?.toString()?.takeIf { it.isNotBlank() }
             ?: icy?.takeIf { it.mediaId == mediaId }?.station
-        val genre    = metadata.genre?.toString()?.takeIf { it.isNotBlank() }
-            ?: icy?.takeIf { it.mediaId == mediaId }?.genre?.takeIf { it.isNotBlank() }
-        if (isStream && icy != null && icy.mediaId == mediaId) {
-            if (!icy.title.isNullOrBlank()) title = icy.title
-            else if (!station.isNullOrBlank()) {
-                title = station
-                if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true))
-                    artist = genre ?: streamHost(mediaId) ?: ""
-                album = icy.description ?: album
-            } else {
-                title = streamTitleFallback(mediaId, title) ?: title
-            }
-        } else if (isStream) {
-            if (!station.isNullOrBlank()) title = station
-            else title = streamTitleFallback(mediaId, title) ?: title
-        }
-
-        val delims = arrayOf(" - ", " – ", " — ", " : ", " | ")
-        if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true)) {
-            for (d in delims) { if (title.contains(d)) { val p = title.split(d, limit=2); artist = p[0].trim(); title = p[1].trim(); break } }
-        }
-        if (artist.isEmpty() || artist.equals("Unknown Artist", ignoreCase = true))
-            artist = station ?: streamHost(mediaId) ?: ""
+        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
+        // Streams: never use the live extractor tags (the stream's own junk);
+        // the station name or host is the artist until the ICY song title arrives.
+        if (isStream && (artist.isBlank() || artist == "Unknown Artist"))
+            artist = station ?: TrackInfoResolver.streamHost(mediaId) ?: ""
 
         val sb = SpannableStringBuilder()
         sb.append("Now Playing:\n\n")
@@ -426,10 +409,14 @@ class NowPlayingActivity : BaseActivity() {
         }
 
         appendRow(title, R.drawable.ic_audio)
-        appendRow(artist, R.drawable.ic_artist)
-        appendRow(album, R.drawable.ic_album_art)
+        // Skip the artist row when the artist is already part of the title
+        // (e.g. station "Solar Radio High" in title "Solar Radio High [256kbps]")
+        if (artist.isNotBlank() && artist != title && !title.startsWith(artist)) appendRow(artist, R.drawable.ic_artist)
+        if (album.isNotBlank() && album != title && album != artist) appendRow(album, R.drawable.ic_album_art)
 
-        if (!station.isNullOrBlank() && station != artist && station != title) {
+        // The station name is already shown as the album row for streams — don't
+        // repeat it in the parentheses (BUG: duplicate items in the screensaver).
+        if (!station.isNullOrBlank() && station != artist && station != title && station != album) {
             sb.append("(").append(station).append(")\n")
         }
 
@@ -474,20 +461,19 @@ class NowPlayingActivity : BaseActivity() {
         val metadata  = controller.mediaMetadata
         val mediaItem = controller.currentMediaItem
         val itemMeta  = mediaItem?.mediaMetadata
-        val title        = metadata.title?.toString()        ?: itemMeta?.title?.toString()
-        val displayTitle = metadata.displayTitle?.toString() ?: itemMeta?.displayTitle?.toString()
         val artist       = metadata.artist?.toString()       ?: itemMeta?.artist?.toString()
         val albumArtist  = metadata.albumArtist?.toString()  ?: itemMeta?.albumArtist?.toString()
-        val subtitle     = metadata.subtitle?.toString()     ?: itemMeta?.subtitle?.toString()
-        val description  = metadata.description?.toString()  ?: itemMeta?.description?.toString()
+
+        // Shared with the main-screen Now Playing card so both always agree.
+        val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+        var dispArtist = info.artist
+        var dispTrack  = info.track
 
         // ICY streams: the item's static title takes precedence over the in-band
         // StreamTitle in Player.mediaMetadata, so prefer the service-captured info.
         val mediaId  = mediaItem?.mediaId ?: ""
-        val isStream = mediaId.startsWith("http://") || mediaId.startsWith("https://")
         val icy      = PlaybackService.icyInfo
         val icyForItem = icy?.takeIf { it.mediaId == mediaId }
-        val icyTrack   = icyForItem?.title?.takeIf { it.isNotBlank() }
         val icyDesc    = icyForItem?.description
         val station    = metadata.station?.toString()?.takeIf { it.isNotBlank() }
                          ?: itemMeta?.station?.toString()?.takeIf { it.isNotBlank() }
@@ -495,42 +481,10 @@ class NowPlayingActivity : BaseActivity() {
         val genre      = metadata.genre?.toString()?.takeIf { it.isNotBlank() }
                          ?: icyForItem?.genre?.takeIf { it.isNotBlank() }
 
-        var dispArtist = artist ?: albumArtist ?: ""
-        var dispTrack  = when {
-            icyTrack != null -> icyTrack
-            isStream && !station.isNullOrBlank() -> station
-            isStream -> streamTitleFallback(mediaId, title ?: displayTitle) ?: displayTitle ?: "Unknown Title"
-            else -> title ?: displayTitle ?: "Unknown Title"
-        }
-        if (dispArtist.isEmpty() || dispArtist.equals("Unknown Artist", ignoreCase = true)) {
-            dispArtist = when {
-                !subtitle.isNullOrBlank()    && subtitle    != dispTrack -> subtitle
-                !description.isNullOrBlank() && description != dispTrack -> description
-                else -> dispArtist
-            }
-        }
-        val delims = arrayOf(" - ", " – ", " — ", " : ", " | ")
-        var split = false
-        for (d in delims) { if (dispTrack.contains(d)) { val p = dispTrack.split(d, limit=2); dispArtist = p[0].trim(); dispTrack = p[1].trim(); split = true; break } }
-        if (!split && dispArtist.contains(" - ")) { val p = dispArtist.split(" - ", limit=2); dispArtist = p[0].trim(); dispTrack = p[1].trim() }
-        if (dispArtist.isEmpty() || dispArtist.equals("Unknown Artist", ignoreCase = true)) {
-            dispArtist = when {
-                isStream && icyTrack != null -> station ?: streamHost(mediaId) ?: displayTitle ?: "Unknown Artist"
-                isStream -> genre ?: icyDesc ?: streamHost(mediaId) ?: displayTitle ?: "Unknown Artist"
-                else -> station ?: displayTitle ?: "Unknown Artist"
-            }
-        }
-        if (dispArtist == dispTrack && !station.isNullOrBlank()) dispArtist = station
-
         textTitle.text  = dispTrack
         textArtist.text = dispArtist
 
-        val finalAlbum = when {
-            !station.isNullOrBlank()      && station      != dispTrack && station      != dispArtist -> station
-            !icyDesc.isNullOrBlank()      && icyDesc      != dispTrack && icyDesc      != dispArtist -> icyDesc
-            !displayTitle.isNullOrBlank() && displayTitle != dispTrack && displayTitle != dispArtist -> displayTitle
-            else -> metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString()
-        }
+        val finalAlbum = info.album
         // INVISIBLE (not GONE) so the album row keeps its space — the seek bar and
         // controls below must not shift when stream metadata adds/removes the album.
         if (!finalAlbum.isNullOrEmpty()) { textAlbum.text = finalAlbum; textAlbum.visibility = android.view.View.VISIBLE }
@@ -815,28 +769,6 @@ class NowPlayingActivity : BaseActivity() {
     private fun formatTime(ms: Long): String { val s = ms / 1000; return "%d:%02d".format(s / 60, s % 60) }
 
     // ── Format helpers ────────────────────────────────────────────────────────
-
-    /** Host of a stream URL (without www.), or null for non-stream media. */
-    private fun streamHost(mediaId: String): String? {
-        if (!mediaId.startsWith("http://") && !mediaId.startsWith("https://")) return null
-        return mediaId.toUri().host?.removePrefix("www.")?.takeIf { it.isNotBlank() }
-    }
-
-    /**
-     * Display title for a stream that broadcasts no usable metadata.
-     * Prettifies a static title that is just the URL's file name (drops the
-     * extension), otherwise derives a name from the URL path or host.
-     */
-    private fun streamTitleFallback(mediaId: String, staticTitle: String?): String? {
-        if (!mediaId.startsWith("http://") && !mediaId.startsWith("https://")) return null
-        val last = mediaId.toUri().lastPathSegment
-        if (!staticTitle.isNullOrBlank()) {
-            return if (last != null && staticTitle == last) last.substringBeforeLast(".") else staticTitle
-        }
-        val name = last?.substringBeforeLast(".")
-        if (!name.isNullOrBlank()) return name
-        return mediaId.toUri().host?.removePrefix("www.")
-    }
 
     @OptIn(UnstableApi::class)
     private fun formatInfoParts(f: Format): List<String> {

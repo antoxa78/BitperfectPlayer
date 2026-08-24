@@ -15,9 +15,11 @@ import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
+import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Metadata
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -552,6 +554,10 @@ class PlaybackService : MediaSessionService() {
                     } catch (e: Exception) { Log.e(TAG, "ICY title merge failed", e) }
                 }
             }
+            // Push the captured stream info to the MediaSession so system surfaces
+            // (Shield home Now Playing bar, other controllers) show the real
+            // track/artist instead of "Bitperfect Player - Unknown".
+            publishIcyMetadataToSession()
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -617,6 +623,12 @@ class PlaybackService : MediaSessionService() {
 
         mediaSession = MediaSession.Builder(this, buildPlayer()).build()
         mainHandler.post(savePositionRunnable)
+
+        // Restore the saved queue right away (before the MPD server is reachable)
+        // so LAN clients never see a briefly-empty playlist after a process
+        // restart — previously only MainFragment restored it, seconds later
+        // (BUG: playlist items disappear in MALP for a few seconds).
+        restoreSavedQueue()
 
         // Listen for USB plug/unplug events
         registerReceiver(usbReceiver, IntentFilter().apply {
@@ -770,6 +782,57 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /**
+     * Restores the saved queue/index/position into the player if its queue is
+     * empty. Mirrors MainFragment.resumeLastPlayed() but runs at service start,
+     * so the MPD server never exposes an empty playlist after a restart.
+     */
+    private fun restoreSavedQueue() {
+        try {
+            val settings = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+            if (!settings.getBoolean(KEY_RESUME_PLAYBACK, false)) return
+            val player = mediaSession?.player ?: return
+            if (player.mediaItemCount > 0) return
+            val queueJson = settings.getString("last_played_queue", null) ?: return
+            val queueArray = JSONArray(queueJson)
+            val items = mutableListOf<MediaItem>()
+            for (i in 0 until queueArray.length()) {
+                val entry = queueArray.optJSONObject(i)
+                if (entry == null) continue
+                val mId = entry.optString("mediaId", "")
+                val uri = entry.optString("uri", mId)
+                val title = entry.optString("title", "")
+                val artist = entry.optString("artist", "")
+                val start = entry.optLong("start", 0)
+                val end = entry.optLong("end", C.TIME_UNSET)
+                if (uri.isEmpty()) continue
+                val fallbackTitle = uri.substringAfterLast('/').substringBeforeLast('.').ifBlank { mId }
+                val meta = MediaMetadata.Builder().setTitle(title.ifBlank { fallbackTitle })
+                if (artist.isNotBlank()) meta.setArtist(artist)
+                val b = MediaItem.Builder()
+                    .setMediaId(mId)
+                    .setUri(uri.toUri())
+                    .setMediaMetadata(meta.build())
+                if (start > 0 || end != C.TIME_UNSET) {
+                    val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(start)
+                    if (end != C.TIME_UNSET) clip.setEndPositionMs(end)
+                    b.setClippingConfiguration(clip.build())
+                }
+                items.add(b.build())
+            }
+            if (items.isEmpty()) return
+            val index = settings.getInt("last_played_index", 0).coerceIn(0, items.lastIndex)
+            val pos = settings.getLong("last_played_pos", 0)
+            // Radio streams never have a meaningful position (BUG-19): restart at 0.
+            val restorePos = if (items[index].mediaId.startsWith("http://") || items[index].mediaId.startsWith("https://")) 0L else pos
+            player.setMediaItems(items, index, restorePos)
+            player.prepare()
+            Log.i(TAG, "Restored ${items.size} queued items (index $index)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Queue restore failed: ${e.message}")
+        }
+    }
+
     /** Merges a piece of ICY info into the current holder (if it belongs to the active item). */
     private fun mergeIcyInfo(
         mediaId: String,
@@ -808,6 +871,52 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /**
+     * Publishes the captured stream info (ICY song title / artist / station name)
+     * as the current item's metadata so system surfaces — the Shield home screen's
+     * Now Playing bar, other media controllers — show the real track and artist
+     * instead of the app name + "Unknown".
+     */
+    private fun publishIcyMetadataToSession() {
+        try {
+            val player = mediaSession?.player ?: return
+            val item = player.currentMediaItem ?: return
+            val icy = icyInfo ?: return
+            if (icy.mediaId != item.mediaId) return
+
+            val icyTitle = icy.title?.takeIf { it.isNotBlank() }
+            var track = icyTitle
+            var artist = ""
+            val rawTrack = track
+            if (rawTrack != null) {
+                val delims = arrayOf(" - ", " – ", " — ", " : ", " | ")
+                for (d in delims) {
+                    if (rawTrack.contains(d)) { val p = rawTrack.split(d, limit = 2); artist = p[0].trim(); track = p[1].trim(); break }
+                }
+            }
+            val station = icy.station?.takeIf { it.isNotBlank() }
+            val base = item.mediaMetadata
+            val builder = base.buildUpon()
+            var changed = false
+            // IMPORTANT: never overwrite the queue item's title with the live track —
+            // the playlist/queue (and MPD) must keep the stream's own name. The live
+            // track is stored in subtitle instead; the Now Playing display already
+            // shows the live title via icyInfo / TrackInfoResolver.
+            if (!track.isNullOrBlank() && track != base.subtitle) { builder.setSubtitle(track); changed = true }
+            if (artist.isBlank() && station != null && station != track) artist = station
+            if (artist.isNotBlank() && artist != base.artist) { builder.setArtist(artist); changed = true }
+            // Stations repeat the same ICY title on every metadata frame — don't
+            // replace the queue item unless something actually changed.
+            if (!changed) return
+            player.replaceMediaItem(
+                player.currentMediaItemIndex,
+                item.buildUpon().setMediaMetadata(builder.build()).build()
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "publishIcyMetadata failed: ${e.message}")
+        }
+    }
+
     // ── Inner data source ─────────────────────────────────────────────────────
 
     @UnstableApi
@@ -832,6 +941,11 @@ class PlaybackService : MediaSessionService() {
             if (headers.isEmpty()) return headers
 
             // Called on the loading thread: must never throw or touch the player.
+            // lastUri is the ORIGINAL item URL (dataSpec.uri from open()), which
+            // matches the player item's mediaId even when the stream redirects —
+            // merging under it keeps the ICY info matched to the item without
+            // touching the player off the main thread (BUG: station name never
+            // captured, "Player is accessed on the wrong thread").
             try {
                 fun header(name: String): String? =
                     headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }
@@ -844,6 +958,8 @@ class PlaybackService : MediaSessionService() {
                     description = header("icy-description"),
                     url         = header("icy-url")
                 )
+                // Headers arrive on the loading thread; push to the session on main.
+                mainHandler.post { publishIcyMetadataToSession() }
             } catch (e: Exception) { Log.e(TAG, "ICY header capture failed", e) }
             return headers
         }

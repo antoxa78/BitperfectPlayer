@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.8.2 - 2026-08-24
+
+### Fixed
+
+- **MPD playlist flashing empty in MALP:** Bursts of queue edits triggered one `changed` event each, so MALP cleared and refetched the playlist repeatedly. Version changes are now settled/coalesced into a single bump, and the queue version survives restarts so clients don't refetch an unchanged playlist.
+- **MPD command during idle racing the event write:** A command arriving while `idle` was pending could emit `changed:` on top of the command's own response, causing "connection reset" + playlist refetch cycles in MALP. The pending idle event is now consumed and dispatched instead.
+- **MPD empty playlist right after a process restart:** The saved queue is now restored at service start, so LAN clients never see a briefly-empty playlist.
+- **M3U titles polluted with `tvg-*` attributes:** Title extraction now uses the last comma (attributes sit between the duration and the title).
+- **Stored-playlist rename command:** Fixed a stray whitespace that produced `unknown command` for `rename`.
+
+### Added
+
+- **Album art over MPD:** `albumart` command, with online cover lookup for live streams in search results.
+- **Live track metadata on system surfaces:** ICY stream info is now pushed to the MediaSession, so the Shield home Now Playing bar and other controllers show the real track/artist instead of "Bitperfect Player - Unknown".
+
+### Improved
+
+- **Shared track info resolution:** Extracted into `TrackInfoResolver` so the Now Playing screen and the main-screen card always show identical title/artist/album (including ICY streams, fallbacks, and "Artist - Title" splitting), with duplicate artist/album rows removed.
+
 ## 2.7.1 - 2026-08-18
 
 ### Fixed
