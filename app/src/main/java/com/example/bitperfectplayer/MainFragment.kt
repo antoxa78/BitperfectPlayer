@@ -587,7 +587,8 @@ class MainFragment : BrowseSupportFragment() {
                 fun scanRecursive(uri: Uri) {
                     if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
-                    val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
+                    val authority = uri.authority ?: return
+                    val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, treeId)
                     val docId = try { android.provider.DocumentsContract.getDocumentId(uri) } catch (e: Exception) { treeId }
                     val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
                     val projection = arrayOf(
@@ -918,7 +919,8 @@ class MainFragment : BrowseSupportFragment() {
         Thread {
             try {
                 val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
-                val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
+                val authority = uri.authority ?: return@Thread
+                val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, treeId)
                 val docId = try {
                     android.provider.DocumentsContract.getDocumentId(uri)
                 } catch (e: Exception) {
@@ -1099,7 +1101,8 @@ class MainFragment : BrowseSupportFragment() {
                 if (isDir) {
                     try {
                         val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
-                        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
+                        val authority = uri.authority ?: return
+                        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, treeId)
                         val docId = try {
                             android.provider.DocumentsContract.getDocumentId(uri)
                         } catch (e: Exception) {
@@ -2437,7 +2440,7 @@ class MainFragment : BrowseSupportFragment() {
         android.widget.ArrayAdapter<BrowseItem>(context, R.layout.list_item_browse, items) {
         override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.list_item_browse, parent, false)
-            val item = getItem(position)!!
+            val item = getItem(position) ?: return view
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.name
             val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
             icon.setImageResource(item.icon)
@@ -2452,7 +2455,7 @@ class MainFragment : BrowseSupportFragment() {
         android.widget.ArrayAdapter<DialogOptionItem>(context, R.layout.list_item_browse, items) {
         override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.list_item_browse, parent, false)
-            val item = getItem(position)!!
+            val item = getItem(position) ?: return view
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.label
             val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
             icon.setImageResource(item.iconRes)

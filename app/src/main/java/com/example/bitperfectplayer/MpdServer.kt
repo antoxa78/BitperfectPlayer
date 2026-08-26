@@ -347,7 +347,7 @@ class MpdServer(private val context: Context) {
      * of adds/moves/deletes used to flash the playlist empty repeatedly (BUG).
      */
     private fun scheduleVersionBump(fp: String) {
-        val token = ++pendingBumpToken
+        val token = synchronized(qLock) { ++pendingBumpToken }
         mainHandler.postDelayed({
             synchronized(qLock) {
                 if (token != pendingBumpToken) return@synchronized
@@ -404,15 +404,15 @@ class MpdServer(private val context: Context) {
                         for ((idx, line) in lines.withIndex()) {
                             if (hadError) break
                             binaryResponseSent.set(false)
-                            try { execLine(line, writer, reader); if (okEach && !binaryResponseSent.get()) send(writer, "OK") }
+                            try { execLine(line, writer, reader); if (okEach && binaryResponseSent.get() != true) send(writer, "OK") }
                             catch (e: MpdAck) { sendAck(writer, idx, lineToken(line), e); hadError = true }
                             catch (_: CloseSignal) { sock.close(); return }
                         }
-                        if (!hadError && !okEach && !binaryResponseSent.get()) send(writer, "OK")
+                        if (!hadError && !okEach && binaryResponseSent.get() != true) send(writer, "OK")
                         continue
                     }
                     binaryResponseSent.set(false)
-                    try { execLine(raw, writer, reader); if (!binaryResponseSent.get()) send(writer, "OK") }
+                    try { execLine(raw, writer, reader); if (binaryResponseSent.get() != true) send(writer, "OK") }
                     catch (e: MpdAck) { sendAck(writer, 0, lineToken(raw), e) }
                     catch (_: CloseSignal) { break }
                 }
@@ -1818,7 +1818,7 @@ class MpdServer(private val context: Context) {
                 }
             }
             if (audioFile != null && tracks.isNotEmpty()) {
-                val audioPath = if (audioFile!!.startsWith("/") || audioFile!!.contains("://")) audioFile!! else File(f.parentFile, audioFile!!).absolutePath
+                val audioPath = if (audioFile.startsWith("/") || audioFile.contains("://")) audioFile else File(f.parentFile, audioFile).absolutePath
                 val audioUri = Uri.fromFile(File(audioPath)).toString()
                 return tracks.mapIndexed { idx, tr ->
                     val next = tracks.getOrNull(idx + 1)?.startMs ?: C.TIME_UNSET

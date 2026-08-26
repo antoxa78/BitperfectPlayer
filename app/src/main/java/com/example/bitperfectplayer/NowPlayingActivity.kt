@@ -836,7 +836,7 @@ class NowPlayingActivity : BaseActivity() {
     private inner class BrowseAdapter(items: List<BrowseItem>) : android.widget.ArrayAdapter<BrowseItem>(this, R.layout.list_item_browse, items) {
         override fun getView(pos: Int, cv: android.view.View?, p: android.view.ViewGroup): android.view.View {
             val v = cv ?: android.view.LayoutInflater.from(context).inflate(R.layout.list_item_browse, p, false)
-            val it = getItem(pos)!!
+            val it = getItem(pos) ?: return v
             v.findViewById<TextView>(R.id.item_text).text = it.name
             v.findViewById<ImageView>(R.id.item_icon).setImageResource(it.icon)
             return v
@@ -917,7 +917,7 @@ class NowPlayingActivity : BaseActivity() {
     private fun parseM3uLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> {
         val items = mutableListOf<MediaItem>(); val bp = base?.toString()?.substringBeforeLast("/")
         try { val r = java.io.BufferedReader(java.io.InputStreamReader(s)); var line: String?; var ct: String? = null
-            while (r.readLine().also { line = it } != null) { val t = line!!.trim().removePrefix("\uFEFF"); if (t.isEmpty()) continue
+            while (r.readLine().also { line = it } != null) { val t = line?.trim()?.removePrefix("\uFEFF") ?: continue; if (t.isEmpty()) continue
                 if (t.startsWith("#EXTINF:")) { val c = t.indexOf(','); if (c!=-1) ct = t.substring(c+1) }
                 else if (!t.startsWith("#")) { val u = resolvePlaylistEntry(t.replace("\\","/"), bp); if (u!=null) items.add(buildPlaylistItem(u, ct)); ct=null }
             }
@@ -927,7 +927,7 @@ class NowPlayingActivity : BaseActivity() {
     private fun parsePlsLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> {
         val items = mutableListOf<MediaItem>(); val bp = base?.toString()?.substringBeforeLast("/")
         try { val r = java.io.BufferedReader(java.io.InputStreamReader(s)); val props = linkedMapOf<String,String>(); var line: String?
-            while (r.readLine().also { line = it } != null) { val t = line!!.trim().removePrefix("\uFEFF"); if (t.isEmpty()||t.startsWith("[")) continue; val eq = t.indexOf('='); if (eq!=-1) props[t.substring(0,eq).trim().lowercase()] = t.substring(eq+1).trim() }
+            while (r.readLine().also { line = it } != null) { val t = line?.trim()?.removePrefix("\uFEFF") ?: continue; if (t.isEmpty()||t.startsWith("[")) continue; val eq = t.indexOf('='); if (eq!=-1) props[t.substring(0,eq).trim().lowercase()] = t.substring(eq+1).trim() }
             val cnt = props.remove("numberofentries")?.toIntOrNull() ?: 0
             for (i in 1..cnt) { val f = props.remove("file$i") ?: continue; val u = resolvePlaylistEntry(f.replace("\\","/"), bp) ?: continue; val tl = props.remove("title$i") ?: u.lastPathSegment ?: f.substringAfterLast("/").substringBeforeLast("."); items.add(buildPlaylistItem(u, tl)) }
         } catch (e: Exception) { e.printStackTrace() }; return items
@@ -942,7 +942,7 @@ class NowPlayingActivity : BaseActivity() {
             class Trk(val num: Int, var t: String? = null, var a: String? = null, var start: Long = 0)
             val trks = mutableListOf<Trk>(); var curTrk: Trk? = null
             while (r.readLine().also { line = it } != null) {
-                val t = line!!.trim().removePrefix("\uFEFF"); val u = t.uppercase()
+                val t = line?.trim()?.removePrefix("\uFEFF") ?: continue; val u = t.uppercase()
                 when {
                     u.startsWith("FILE") -> curFile = t.substringAfter("\"").substringBeforeLast("\"")
                     u.startsWith("TITLE") && curTrk == null -> albT = t.substringAfter("\"").substringBeforeLast("\"")

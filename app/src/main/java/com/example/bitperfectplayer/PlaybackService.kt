@@ -45,6 +45,7 @@ import androidx.media3.session.MediaSessionService
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -240,8 +241,8 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
-    /** mediaId of the currently playing item — written on the main thread only. */
-    @Volatile private var activeMediaId: String? = null
+    /** mediaId of the currently playing item — protected by icyInfoLock. */
+    private var activeMediaId: String? = null
     private val icyInfoLock = Any()
 
     // ── Position saver ────────────────────────────────────────────────────────
@@ -931,7 +932,7 @@ class PlaybackService : MediaSessionService() {
             val scheme = dataSpec.uri.scheme
             lastUri = if (scheme == "http" || scheme == "https") dataSpec.uri.toString() else null
             active = if (scheme == "smb") smbSrc else defaultSrc
-            return active!!.open(dataSpec)
+            return active?.open(dataSpec) ?: throw IOException("No data source available")
         }
         override fun read(b: ByteArray, o: Int, l: Int): Int = active?.read(b, o, l) ?: -1
         override fun getUri(): Uri? = active?.uri

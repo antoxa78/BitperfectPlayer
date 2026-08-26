@@ -268,7 +268,7 @@ class MainActivity : BaseActivity() {
             var currentTitle: String? = null
 
             while (reader.readLine().also { line = it } != null) {
-                var trimmed = line!!.trim().removePrefix("\uFEFF")
+                var trimmed = line?.trim()?.removePrefix("\uFEFF") ?: continue
                 if (trimmed.isEmpty()) continue
 
                 if (trimmed.startsWith("#EXTINF:")) {
@@ -324,7 +324,7 @@ class MainActivity : BaseActivity() {
             val props  = linkedMapOf<String, String>()
             var line: String?
             while (reader.readLine().also { line = it } != null) {
-                var trimmed = line!!.trim().removePrefix("\uFEFF")
+                var trimmed = line?.trim()?.removePrefix("\uFEFF") ?: continue
                 if (trimmed.isEmpty() || trimmed.startsWith("[")) continue
                 val eq = trimmed.indexOf('=')
                 if (eq != -1) props[trimmed.substring(0, eq).trim().lowercase()] = trimmed.substring(eq + 1).trim()
@@ -491,7 +491,7 @@ class MainActivity : BaseActivity() {
             var currentTrack: CueTrack? = null
 
             while (reader.readLine().also { line = it } != null) {
-                val trimmed = line!!.trim().removePrefix("\uFEFF")
+                val trimmed = line?.trim()?.removePrefix("\uFEFF") ?: continue
                 val upper = trimmed.uppercase()
 
                 when {

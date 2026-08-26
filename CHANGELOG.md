@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.3 - 2026-08-26
+
+### Fixed
+
+- **SMB data source thread safety:** Added synchronization to all SmbDataSource methods to prevent race conditions when ExoPlayer accesses the data source from multiple threads.
+- **MPD queue version race condition:** `scheduleVersionBump()` now increments the pending bump token inside the queue lock to prevent two threads from obtaining the same token.
+- **MPD nullable Boolean crash:** `binaryResponseSent.get()` (a nullable `ThreadLocal<Boolean>`) is now compared with `!= true` instead of using the `!` operator, preventing potential `NullPointerException`.
+- **Null-safe URI authority access:** `DocumentsContract.buildTreeDocumentUri()` calls no longer use `!!` on `uri.authority`, preventing crashes on malformed URIs.
+- **Playlist parser null safety:** M3U, PLS, and CUE parser loops no longer use `line!!`, safely handling null reads.
+- **Browse adapter null safety:** `getItem()!!` in list adapters replaced with null-safe returns to prevent crashes on invalid positions.
+- **SMB file resource cleanup:** `SmbDataSource.close()` now nulls the `SmbFile` reference alongside `SmbRandomAccessFile` to ensure full resource release.
+
+### Improved
+
+- **Removed redundant `@Volatile`** on `PlaybackService.activeMediaId` which is already protected by `icyInfoLock`.
+
 ## 2.8.2 - 2026-08-24
 
 ### Fixed
