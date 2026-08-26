@@ -687,9 +687,16 @@ class MpdServer(private val context: Context) {
                 val b = args[1].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad pos")
                 hop { c ->
                     if (a == b) return@hop
-                    // swap via two moves
+                    // Swap via two moves. Media3 moveMediaItems(from, to, newIndex) removes
+                    // [from, to) then inserts at newIndex in the post-removal list.
+                    // a < b: move a-item to position b (shifts b-item left to b-1), then move
+                    //        the b-item (now at b-1) back to position a.
+                    // a > b: move a-item to position b (shifts b-item right to b+1), then move
+                    //        the b-item (now at b+1) to position a in the post-removal list.
+                    //        The post-removal list has one fewer item before index a, so the
+                    //        target position is a (not a+1).
                     if (a < b) { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b - 1, b, a) }
-                    else { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b + 1, b + 2, a + 1) }
+                    else       { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b + 1, b + 2, a) }
                 }
             }
             "swapid" -> {
@@ -700,7 +707,7 @@ class MpdServer(private val context: Context) {
                 hop { c ->
                     if (a == b) return@hop
                     if (a < b) { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b - 1, b, a) }
-                    else { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b + 1, b + 2, a + 1) }
+                    else       { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b + 1, b + 2, a) }
                 }
             }
             "shuffle" -> {
@@ -922,12 +929,15 @@ class MpdServer(private val context: Context) {
     private fun mbEscape(s: String): String = s.replace("\"", "\\\"").take(100)
 
     private val artHttpClient: OkHttpClient by lazy {
-        // Tight timeouts: the full online lookup (up to 3 requests) must complete
-        // within the remote client's ~10s socket read timeout, or the artwork
-        // request is aborted and no art is shown.
+        // The worst-case lookup path is 3 sequential HTTP calls:
+        //   MusicBrainz query → Cover Art Archive download → iTunes fallback.
+        // Each call must fit within a budget that keeps the total response time
+        // under the Remote client's 10 s socket read timeout (MpdClient.kt:45).
+        // Budget: 3 × (1 s connect + 1.5 s read) = 7.5 s — leaves ≥2 s margin
+        // for network RTT and response streaming.
         OkHttpClient.Builder()
-            .connectTimeout(2, TimeUnit.SECONDS)
-            .readTimeout(3, TimeUnit.SECONDS)
+            .connectTimeout(1, TimeUnit.SECONDS)
+            .readTimeout(1500, TimeUnit.MILLISECONDS)
             .build()
     }
 
