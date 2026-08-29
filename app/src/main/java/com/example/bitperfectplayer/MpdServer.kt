@@ -38,7 +38,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
+import jcifs.smb.SmbFile
 
 /**
  * Embedded MPD-protocol server. Drives playback **only** through a
@@ -68,6 +70,7 @@ class MpdServer(private val context: Context) {
         const val ACK_NO_EXIST = 50
         const val ACK_SYSTEM = 52
         const val ACK_UPDATE_ALREADY = 54
+        const val ACK_ERROR = 56
 
         val SUPPORTED_COMMANDS = listOf(
             "close", "kill", "ping", "password", "commands", "notcommands",
@@ -406,6 +409,7 @@ class MpdServer(private val context: Context) {
                             binaryResponseSent.set(false)
                             try { execLine(line, writer, reader); if (okEach && binaryResponseSent.get() != true) send(writer, "OK") }
                             catch (e: MpdAck) { sendAck(writer, idx, lineToken(line), e); hadError = true }
+                            catch (e: Exception) { sendAck(writer, idx, lineToken(line), MpdAck(ACK_ERROR, e.message ?: "error")); hadError = true }
                             catch (_: CloseSignal) { sock.close(); return }
                         }
                         if (!hadError && !okEach && binaryResponseSent.get() != true) send(writer, "OK")
@@ -414,6 +418,7 @@ class MpdServer(private val context: Context) {
                     binaryResponseSent.set(false)
                     try { execLine(raw, writer, reader); if (binaryResponseSent.get() != true) send(writer, "OK") }
                     catch (e: MpdAck) { sendAck(writer, 0, lineToken(raw), e) }
+                    catch (e: Exception) { sendAck(writer, 0, lineToken(raw), MpdAck(ACK_ERROR, e.message ?: "error")) }
                     catch (_: CloseSignal) { break }
                 }
             } catch (e: Exception) { if (running) Log.d(TAG, "client: ${e.message}") }
@@ -802,6 +807,27 @@ class MpdServer(private val context: Context) {
         var title: String? = null
 
         try {
+            // Network-share files: look for common cover images in the SMB folder
+            // beside the track, mirroring the local folder-art behavior below.
+            if (uri.trim().startsWith("smb://") || uri.trim().startsWith("/smb://")) {
+                val trackUri = uri.trim().removePrefix("/")
+                try {
+                    val trackFile = SmbFile(trackUri, SmbContext.getContextForUri(trackUri))
+                    if (trackFile.exists() && !trackFile.isDirectory()) {
+                        val parent = SmbFile(trackFile.parent!! + "/", SmbContext.getContextForUri(trackUri))
+                        val artNames = arrayOf("cover.jpg", "folder.jpg", "cover.png", "folder.png", "album.jpg", "artwork.jpg")
+                        for (name in artNames) {
+                            val artFile = SmbFile(trackFile.parent!! + "/" + name, SmbContext.getContextForUri(trackUri))
+                            if (artFile.exists() && artFile.isFile) {
+                                val bytes = artFile.inputStream.use { it.readBytes() }
+                                if (bytes.isNotEmpty()) return bytes
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "No SMB folder art for $trackUri: ${e.message}")
+                }
+            } else {
             val file = resolveLocalPath(uri)
             if (file.exists() && file.isFile) {
                 // 2. Local folder artwork — the player's own UI goes straight from
@@ -826,6 +852,7 @@ class MpdServer(private val context: Context) {
                     album = it.album.ifBlank { null }
                     title = it.title.ifBlank { null }
                 }
+            }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error getting artwork for $uri", e)
@@ -1262,9 +1289,84 @@ class MpdServer(private val context: Context) {
         return f
     }
 
+    // ── SMB share browsing (virtual smb:// roots) ─────────────────────────
+
+    private fun isSmbPath(p: String): Boolean = p.trim().startsWith("smb://") || p.trim().startsWith("/smb://")
+
+    /**
+     * Loads the player's configured network shares from the "SmbShares" prefs
+     * (the same store MainFragment uses) and returns each as an smb:// root URI
+     * with embedded credentials, e.g. smb://user:pass@ip/share/.
+     */
+    private fun smbShareRoots(): List<String> {
+        val roots = ArrayList<String>()
+        try {
+            val prefs = appContext.getSharedPreferences("SmbShares", Context.MODE_PRIVATE)
+            val json = prefs.getString("shares", "[]") ?: "[]"
+            val arr = JSONArray(json)
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val ip = obj.optString("ip").trim()
+                val share = obj.optString("share").trim()
+                if (ip.isEmpty() || share.isEmpty()) continue
+                val user = obj.optString("user").trim()
+                val pass = obj.optString("pass")
+                val encShare = Uri.encode(share)
+                val uri = if (user.isNotEmpty()) {
+                    "smb://${Uri.encode(user)}:${Uri.encode(pass)}@$ip/$encShare/"
+                } else {
+                    "smb://$ip/$encShare/"
+                }
+                roots.add(uri)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to load SMB share roots", e)
+        }
+        return roots
+    }
+
+    private fun writeSmbLsInfo(mpdUri: String, out: StringBuilder) {
+        try {
+            // jcifs-ng child .path includes the share segment only when the parent
+            // URI ends with '/'. The remote normalizes away that trailing slash (it
+            // sends "smb://host/share" not "smb://host/share/"), which would make
+            // child paths lose the share ("smb://host/child"). Re-add it so the
+            // emitted child URIs keep the full "smb://host/share/child" prefix.
+            val dirUri = mpdUri.trim().let { if (it.endsWith("/")) it else "$it/" }
+            val dir = SmbFile(dirUri, SmbContext.getContextForUri(dirUri))
+            if (!dir.exists() || !dir.isDirectory) throw MpdAck(ACK_NO_EXIST, "No such directory")
+            val children = try { dir.listFiles() } catch (e: Exception) { null } ?: throw MpdAck(ACK_NO_EXIST, "No such directory")
+            val sorted = children.sortedWith(compareBy({ !it.isDirectory() }, { it.name.lowercase() }))
+            for (f in sorted) {
+                val name = f.name.trimEnd('/')
+                if (name.startsWith(".")) continue
+                val isDir = f.isDirectory()
+                if (isDir) {
+                    out.append("directory: ").append(f.path.trimEnd('/')).append('/').append('\n')
+                } else if (MpdLibrary.isAudioFile(name)) {
+                    out.append("file: ").append(f.path).append('\n')
+                    out.append("Title: ").append(name).append('\n')
+                } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8")) {
+                    out.append("playlist: ").append(f.path).append('\n')
+                }
+            }
+        } catch (e: MpdAck) {
+            throw e
+        } catch (e: Exception) {
+            // jcifs-ng throws here (e.g. "The network name cannot be found.") for
+            // unreachable/invalid shares. Surface it as a normal MPD ACK so the
+            // client sees the error instead of the connection being dropped.
+            throw MpdAck(ACK_NO_EXIST, e.message ?: "No such directory")
+        }
+    }
+
     private fun writeLsInfo(arg: String?, out: StringBuilder) {
         // /storage and empty both list roots — MALP sometimes does lsinfo "/storage"
         if (arg.isNullOrBlank() || arg == "/" || arg == "/storage" || arg == "storage") {
+            // Network shares appear first (virtual roots)
+            for (root in smbShareRoots()) {
+                out.append("directory: ").append(root).append('\n')
+            }
             for ((root, label) in storageRoots()) {
                 out.append("directory: ").append(root.absolutePath).append('\n')
                 out.append("Last-Modified: ").append(iso8601(root.lastModified())).append('\n')
@@ -1275,6 +1377,11 @@ class MpdServer(private val context: Context) {
                     ?.sortedBy { it.name.lowercase() }
                     ?.forEach { out.append("playlist: ").append(it.nameWithoutExtension).append('\n'); out.append("Last-Modified: ").append(iso8601(it.lastModified())).append('\n') }
             }
+            return
+        }
+        // Network share browsing — the mpdUri is a virtual smb:// directory.
+        if (isSmbPath(arg)) {
+            writeSmbLsInfo(arg.trim().removePrefix("/"), out)
             return
         }
         val dir = resolveLocalPath(arg)
@@ -1525,7 +1632,8 @@ class MpdServer(private val context: Context) {
     private fun expandUri(mpdUri: String): List<MediaItem> {
         val u = mpdUri.trim()
         if (u.startsWith("http://") || u.startsWith("https://")) return listOf(streamItem(u))
-        if (u.startsWith("content://") || u.startsWith("smb://")) return listOf(genericItem(u))
+        if (u.startsWith("smb://") || u.startsWith("/smb://")) return expandSmbUri(u.removePrefix("/"))
+        if (u.startsWith("content://")) return listOf(genericItem(u))
         // try stored playlist name first
         findPlaylist(u)?.let { return parseM3uFile(it) }
         val f = try { resolveLocalPath(u) } catch (e: MpdAck) {
@@ -1541,6 +1649,47 @@ class MpdServer(private val context: Context) {
             f.name.lowercase().endsWith(".cue") -> parseCueFile(f)
             MpdLibrary.isAudioFile(f.name) -> listOf(fileToMediaItem(f, library.lookup(f.absolutePath)))
             else -> throw MpdAck(ACK_NO_EXIST, "Not a playable file")
+        }
+    }
+
+    /**
+     * Expands an smb:// URI into playable MediaItems. A directory is enumerated
+     * recursively (exactly like the player's own "add to playlist" UI); a single
+     * audio file becomes one item. Each MediaItem keeps the full smb:// URI with
+     * embedded credentials so ExoPlayer's SmbDataSource can authenticate.
+     */
+    private fun expandSmbUri(smbUri: String): List<MediaItem> {
+        try {
+            val trimmed = smbUri.trim()
+            val file = SmbFile(trimmed, SmbContext.getContextForUri(trimmed))
+            if (!file.exists()) throw MpdAck(ACK_NO_EXIST, "No such file or directory")
+            if (!file.isDirectory()) {
+                if (!MpdLibrary.isAudioFile(file.name)) throw MpdAck(ACK_NO_EXIST, "Not a playable file")
+                return listOf(genericItem(file.path))
+            }
+            // Force a trailing slash for the walk so jcifs-ng child .path values
+            // keep the full share prefix (smb://host/share/child), not just
+            // smb://host/child. The remote often sends the directory URI without
+            // the trailing slash.
+            val dirUri = if (trimmed.endsWith("/")) trimmed else "$trimmed/"
+            val out = mutableListOf<MediaItem>()
+            fun walk(d: SmbFile) {
+                val kids = try { d.listFiles()?.sortedWith(compareBy({ !it.isDirectory() }, { it.name.lowercase() })) } catch (e: Exception) { null } ?: return
+                for (c in kids) {
+                    if (c.name.startsWith(".")) continue
+                    if (c.isDirectory()) walk(c)
+                    else if (MpdLibrary.isAudioFile(c.name)) out.add(genericItem(c.path))
+                }
+            }
+            walk(SmbFile(dirUri, SmbContext.getContextForUri(dirUri)))
+            return out
+        } catch (e: MpdAck) {
+            throw e
+        } catch (e: Exception) {
+            // jcifs-ng throws here (e.g. "The network name cannot be found.") for
+            // unreachable/invalid shares. Surface it as a normal MPD ACK so the
+            // client sees the error instead of the connection being dropped.
+            throw MpdAck(ACK_NO_EXIST, e.message ?: "No such file or directory")
         }
     }
 
