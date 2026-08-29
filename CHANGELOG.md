@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.5 - 2026-08-29
+
+### Added
+
+- **SMB network share browsing over MPD:** Configured Samba shares are now exposed as virtual `smb://` roots in `lsinfo`, so remote MPD clients can browse them. `smb://` URIs (files or directories) expand into playable media items with embedded credentials — the player streams directly from the share via jcifs-ng; no files are transferred.
+- **Folder album-art for `smb://` tracks** in MPD `albumart` responses.
+
+### Fixed
+
+- **MPD client connection drops on unroutable SMB hosts:** Jcifs exceptions (e.g. "network name cannot be found") are now converted into proper MPD ACK errors instead of closing the client socket.
+- **Stray exceptions in the MPD command loop** now return `ACK 56` instead of terminating the connection.
+
+### Improved
+
+- `smb://` directory URIs are normalized with a trailing slash so jcifs-ng child paths keep the full share prefix (`smb://host/share/child`).
+
 ## 2.8.3 - 2026-08-26
 
 ### Fixed

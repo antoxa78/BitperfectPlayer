@@ -1,6 +1,6 @@
 #!/bin/bash
 # Script to rename the APK to the release name
-VERSION="2.8.3"
+VERSION="2.8.5"
 APK_PATH="app/build/outputs/apk/release/app-release.apk"
 DEST_PATH="app/build/outputs/apk/release/Bitperfect-Player$VERSION.release.apk"
 
