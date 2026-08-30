@@ -617,10 +617,6 @@ class PlaybackService : MediaSessionService() {
         instance = this
         bitPerfectManager = BitPerfectManager(this)
 
-        // Build the jcifs SMB context off the main thread so the first media-source
-        // creation (which can run on the main thread during addMediaItems) is cheap.
-        Thread { SmbContext.prewarm() }.start()
-
         httpFactory = OkHttpDataSource.Factory(
             OkHttpClient.Builder()
                 .connectTimeout(HTTP_TIMEOUT_SECS, TimeUnit.SECONDS)
@@ -662,6 +658,13 @@ class PlaybackService : MediaSessionService() {
                 }
             })
             .build()
+
+        // Build the jcifs SMB context off the main thread so the first media-source
+        // creation (which can run on the main thread during addMediaItems) is cheap.
+        // This must happen AFTER the OkHttpClient is built: pre-warming registers the
+        // BouncyCastle provider, and doing that concurrently with OkHttp's TLS setup
+        // makes SSLContext.init fail with "BKS not found".
+        Thread { SmbContext.prewarm() }.start()
         mainHandler.post(savePositionRunnable)
 
         // Restore the saved queue right away (before the MPD server is reachable)
