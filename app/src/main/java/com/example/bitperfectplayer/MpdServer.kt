@@ -1644,11 +1644,46 @@ class MpdServer(private val context: Context) {
         if (!f.exists()) throw MpdAck(ACK_NO_EXIST, "No such file or directory")
         return when {
             f.isDirectory -> collectDir(f)
+            f.name.lowercase().endsWith(".iso") -> expandSacdIsoLocal(f)
             f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8") -> parseM3uFile(f)
             f.name.lowercase().endsWith(".pls") -> parsePlsFile(f)
             f.name.lowercase().endsWith(".cue") -> parseCueFile(f)
             MpdLibrary.isAudioFile(f.name) -> listOf(fileToMediaItem(f, library.lookup(f.absolutePath)))
             else -> throw MpdAck(ACK_NO_EXIST, "Not a playable file")
+        }
+    }
+
+    /** Expands a local SACD ISO into its stereo tracks (via the native decoder). */
+    private fun expandSacdIsoLocal(f: File): List<MediaItem> {
+        val access = try {
+            LocalSacdRandomAccess(f)
+        } catch (e: Exception) {
+            Log.w(TAG, "SACD ISO open failed: ${f.path}", e)
+            return emptyList()
+        }
+        val uri = Uri.fromFile(f).toString()
+        return try {
+            SacdSupport.buildTrackMediaItems(access, SacdSupport.AREA_STEREO, null, uri)
+                .getOrDefault(emptyList())
+        } catch (e: Exception) {
+            Log.w(TAG, "SACD ISO expand failed: ${f.path}", e)
+            emptyList()
+        } finally {
+            access.close()
+        }
+    }
+
+    /** Expands an SMB-hosted SACD ISO into its stereo tracks. */
+    private fun expandSacdIsoSmb(smbFile: SmbFile): List<MediaItem> {
+        val access = SmbSacdRandomAccess(smbFile)
+        return try {
+            SacdSupport.buildTrackMediaItems(access, SacdSupport.AREA_STEREO, null, smbFile.path)
+                .getOrDefault(emptyList())
+        } catch (e: Exception) {
+            Log.w(TAG, "SACD ISO expand failed: ${smbFile.path}", e)
+            emptyList()
+        } finally {
+            access.close()
         }
     }
 
@@ -1664,6 +1699,7 @@ class MpdServer(private val context: Context) {
             val file = SmbFile(trimmed, SmbContext.getContextForUri(trimmed))
             if (!file.exists()) throw MpdAck(ACK_NO_EXIST, "No such file or directory")
             if (!file.isDirectory()) {
+                if (file.name.lowercase().endsWith(".iso")) return expandSacdIsoSmb(file)
                 if (!MpdLibrary.isAudioFile(file.name)) throw MpdAck(ACK_NO_EXIST, "Not a playable file")
                 return listOf(genericItem(file.path))
             }
@@ -1678,6 +1714,7 @@ class MpdServer(private val context: Context) {
                 for (c in kids) {
                     if (c.name.startsWith(".")) continue
                     if (c.isDirectory()) walk(c)
+                    else if (c.name.lowercase().endsWith(".iso")) out.addAll(expandSacdIsoSmb(c))
                     else if (MpdLibrary.isAudioFile(c.name)) out.add(genericItem(c.path))
                 }
             }
@@ -1700,6 +1737,7 @@ class MpdServer(private val context: Context) {
             for (c in kids) {
                 if (c.name.startsWith(".")) continue
                 if (c.isDirectory) walk(c)
+                else if (c.name.lowercase().endsWith(".iso")) out.addAll(expandSacdIsoLocal(c))
                 else if (MpdLibrary.isAudioFile(c.name)) out.add(fileToMediaItem(c, library.lookup(c.absolutePath)))
                 else if (c.name.lowercase().endsWith(".m3u") || c.name.lowercase().endsWith(".m3u8")) out.addAll(parseM3uFile(c))
             }
