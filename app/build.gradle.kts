@@ -34,8 +34,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // The SACD DSD decoder currently only needs the device's native ABI.
-            abiFilters += listOf("arm64-v8a")
+            // Include all common ABIs so the APK installs on any device (e.g. 32-bit
+            // armeabi-v7a Android TV boxes). The NEON fast path is aarch64-guarded;
+            // other ABIs fall back to the scalar decoder.
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
     }
 
