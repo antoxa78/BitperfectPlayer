@@ -1286,12 +1286,29 @@ class MainFragment : BrowseSupportFragment() {
                 val isPlaylistFile = !file.isDirectory() && isPlayable(file.name) &&
                     (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue"))
                 
+                // Ensure we use a context with credentials if needed for recursion
+                val credentialContext = SmbContext.getContextForUri(file.path)
+
                 fun scanRecursive(f: SmbFile) {
                     if (f.isDirectory()) {
                         f.listFiles()?.forEach { scanRecursive(it) }
                     } else if (isPlayable(f.name)) {
                         val lower = f.name.lowercase()
-                        if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
+                        if (lower.endsWith(".iso")) {
+                            try {
+                                val sacdAccess = SmbSacdRandomAccess(SmbFile(f.path, credentialContext))
+                                val sacdResult = SacdSupport.buildTrackMediaItems(
+                                    sacdAccess, SacdSupport.AREA_STEREO, null, f.path
+                                )
+                                sacdAccess.close()
+                                sacdResult.onSuccess { android.util.Log.i("SacdAdd", "smb iso ${f.path} -> ${it.size} items") }
+                                sacdResult.onFailure { android.util.Log.w("SacdAdd", "smb iso ${f.path} failed", it) }
+                                sacdResult.getOrNull()?.let { itemsToAdd.addAll(it) }
+                            } catch (e: Exception) {
+                                android.util.Log.w("SacdAdd", "smb iso ${f.path} threw", e)
+                                e.printStackTrace()
+                            }
+                        } else if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                             f.getInputStream().use { 
                                 val parsed = mainActivity?.parseM3uFromStream(it, f.parent) ?: emptyList()
                                 if (parsed.isNotEmpty()) {
@@ -1324,8 +1341,6 @@ class MainFragment : BrowseSupportFragment() {
                     }
                 }
 
-                // Ensure we use a context with credentials if needed for recursion
-                val credentialContext = SmbContext.getContextForUri(file.path)
                 val rootFile = SmbFile(file.path, credentialContext)
                 scanRecursive(rootFile)
 
@@ -1715,7 +1730,18 @@ class MainFragment : BrowseSupportFragment() {
                     file.listFiles()?.forEach { scanRecursive(it) }
                 } else if (isPlayable(file.name)) {
                     val lower = file.name.lowercase()
-                    if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
+                    if (lower.endsWith(".iso")) {
+                        try {
+                            val sacdAccess = LocalSacdRandomAccess(file)
+                            val sacdResult = SacdSupport.buildTrackMediaItems(
+                                sacdAccess, SacdSupport.AREA_STEREO, null, Uri.fromFile(file).toString()
+                            )
+                            sacdAccess.close()
+                            sacdResult.getOrNull()?.let { itemsToAdd.addAll(it) }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    } else if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                         try {
                             java.io.FileInputStream(file).use { stream ->
                                 val parsed = mainActivity?.parseM3uFromStream(stream, file.parent) ?: emptyList()
@@ -1804,7 +1830,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso")
         return extensions.any { filename.lowercase().endsWith(it) }
     }
 

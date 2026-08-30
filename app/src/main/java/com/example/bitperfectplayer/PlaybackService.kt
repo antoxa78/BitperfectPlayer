@@ -42,6 +42,8 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.metadata.icy.IcyInfo
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
@@ -463,8 +465,10 @@ class PlaybackService : MediaSessionService() {
             AppDataSource(this, httpFactory)
         }
 
-        val mediaSourceFactory = DefaultMediaSourceFactory(this, extractorsFactory)
-            .setDataSourceFactory(dataSourceFactory)
+        val mediaSourceFactory = SacdMediaSourceFactory(
+            DefaultMediaSourceFactory(this, extractorsFactory)
+                .setDataSourceFactory(dataSourceFactory)
+        )
 
         val settings = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
         val audioAttributes = AudioAttributes.Builder()
@@ -613,6 +617,10 @@ class PlaybackService : MediaSessionService() {
         instance = this
         bitPerfectManager = BitPerfectManager(this)
 
+        // Build the jcifs SMB context off the main thread so the first media-source
+        // creation (which can run on the main thread during addMediaItems) is cheap.
+        Thread { SmbContext.prewarm() }.start()
+
         httpFactory = OkHttpDataSource.Factory(
             OkHttpClient.Builder()
                 .connectTimeout(HTTP_TIMEOUT_SECS, TimeUnit.SECONDS)
@@ -622,7 +630,38 @@ class PlaybackService : MediaSessionService() {
                 .build()
         ).setUserAgent(USER_AGENT)
 
-        mediaSession = MediaSession.Builder(this, buildPlayer()).build()
+        mediaSession = MediaSession.Builder(this, buildPlayer())
+            .setCallback(object : MediaSession.Callback {
+                override fun onPlaybackResumption(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                    val resume = try {
+                        val settings = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+                        if (!settings.getBoolean(KEY_RESUME_PLAYBACK, false)) null
+                        else settings.getString("last_played_queue", null)?.let { queueJson ->
+                            val items = rebuildSavedQueueItems(JSONArray(queueJson))
+                            if (items.isEmpty()) null
+                            else {
+                                val index = settings.getInt("last_played_index", 0).coerceIn(0, items.lastIndex)
+                                val pos = settings.getLong("last_played_pos", 0)
+                                val restorePos = if (items[index].mediaId.startsWith("http://") || items[index].mediaId.startsWith("https://")) 0L else pos
+                                MediaSession.MediaItemsWithStartPosition(items, index, restorePos)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Playback resumption failed: ${e.message}")
+                        null
+                    }
+                    return if (resume != null) {
+                        Log.i(TAG, "Playback resumption: restored ${resume.mediaItems.size} items")
+                        Futures.immediateFuture(resume)
+                    } else {
+                        Futures.immediateFailedFuture(UnsupportedOperationException())
+                    }
+                }
+            })
+            .build()
         mainHandler.post(savePositionRunnable)
 
         // Restore the saved queue right away (before the MPD server is reachable)
@@ -795,32 +834,7 @@ class PlaybackService : MediaSessionService() {
             val player = mediaSession?.player ?: return
             if (player.mediaItemCount > 0) return
             val queueJson = settings.getString("last_played_queue", null) ?: return
-            val queueArray = JSONArray(queueJson)
-            val items = mutableListOf<MediaItem>()
-            for (i in 0 until queueArray.length()) {
-                val entry = queueArray.optJSONObject(i)
-                if (entry == null) continue
-                val mId = entry.optString("mediaId", "")
-                val uri = entry.optString("uri", mId)
-                val title = entry.optString("title", "")
-                val artist = entry.optString("artist", "")
-                val start = entry.optLong("start", 0)
-                val end = entry.optLong("end", C.TIME_UNSET)
-                if (uri.isEmpty()) continue
-                val fallbackTitle = uri.substringAfterLast('/').substringBeforeLast('.').ifBlank { mId }
-                val meta = MediaMetadata.Builder().setTitle(title.ifBlank { fallbackTitle })
-                if (artist.isNotBlank()) meta.setArtist(artist)
-                val b = MediaItem.Builder()
-                    .setMediaId(mId)
-                    .setUri(uri.toUri())
-                    .setMediaMetadata(meta.build())
-                if (start > 0 || end != C.TIME_UNSET) {
-                    val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(start)
-                    if (end != C.TIME_UNSET) clip.setEndPositionMs(end)
-                    b.setClippingConfiguration(clip.build())
-                }
-                items.add(b.build())
-            }
+            val items = rebuildSavedQueueItems(JSONArray(queueJson))
             if (items.isEmpty()) return
             val index = settings.getInt("last_played_index", 0).coerceIn(0, items.lastIndex)
             val pos = settings.getLong("last_played_pos", 0)
@@ -832,6 +846,36 @@ class PlaybackService : MediaSessionService() {
         } catch (e: Exception) {
             Log.w(TAG, "Queue restore failed: ${e.message}")
         }
+    }
+
+    /** Rebuilds [MediaItem]s from the persisted "last_played_queue" JSON array. */
+    private fun rebuildSavedQueueItems(queueArray: JSONArray): List<MediaItem> {
+        val items = mutableListOf<MediaItem>()
+        for (i in 0 until queueArray.length()) {
+            val entry = queueArray.optJSONObject(i)
+            if (entry == null) continue
+            val mId = entry.optString("mediaId", "")
+            val uri = entry.optString("uri", mId)
+            val title = entry.optString("title", "")
+            val artist = entry.optString("artist", "")
+            val start = entry.optLong("start", 0)
+            val end = entry.optLong("end", C.TIME_UNSET)
+            if (uri.isEmpty()) continue
+            val fallbackTitle = uri.substringAfterLast('/').substringBeforeLast('.').ifBlank { mId }
+            val meta = MediaMetadata.Builder().setTitle(title.ifBlank { fallbackTitle })
+            if (artist.isNotBlank()) meta.setArtist(artist)
+            val b = MediaItem.Builder()
+                .setMediaId(mId)
+                .setUri(uri.toUri())
+                .setMediaMetadata(meta.build())
+            if (start > 0 || end != C.TIME_UNSET) {
+                val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(start)
+                if (end != C.TIME_UNSET) clip.setEndPositionMs(end)
+                b.setClippingConfiguration(clip.build())
+            }
+            items.add(b.build())
+        }
+        return items
     }
 
     /** Merges a piece of ICY info into the current holder (if it belongs to the active item). */

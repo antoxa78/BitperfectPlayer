@@ -39,6 +39,19 @@ object SmbContext {
     }
 
     /**
+     * Builds the (credential-free) base context up front so the first SMB operation —
+     * e.g. creating an SACD media source on the main thread during addMediaItems —
+     * never blocks the caller with a ~17ms jcifs-ng context construction.
+     */
+    fun prewarm() {
+        try {
+            get()
+        } catch (_: Exception) {
+            // Non-fatal: the context is rebuilt lazily on first real use.
+        }
+    }
+
+    /**
      * Build a context with explicit credentials embedded in the URL.
      * Used when browsing a share that requires a username/password not in the URL.
      */

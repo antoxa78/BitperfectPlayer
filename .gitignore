@@ -9,3 +9,4 @@
 local.properties
 *.apk
 *.aar
+/third_party/

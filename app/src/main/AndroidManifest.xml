@@ -68,6 +68,12 @@
             </intent-filter>
         </receiver>
 
+        <activity
+            android:name=".SacdTestActivity"
+            android:exported="true"
+            android:theme="@style/Theme.BitperfectPlayer"
+            android:screenOrientation="landscape" />
+
     </application>
 
 </manifest>

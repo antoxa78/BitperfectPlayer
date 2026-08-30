@@ -894,6 +894,7 @@ class NowPlayingActivity : BaseActivity() {
                 if (!isPlayable(f.name)) return
                 val lo = f.name.lowercase(); val fu = android.net.Uri.fromFile(f)
                 when {
+                    lo.endsWith(".iso") -> { try { val a = LocalSacdRandomAccess(f); val r = SacdSupport.buildTrackMediaItems(a, SacdSupport.AREA_STEREO, null, fu.toString()); a.close(); r.onSuccess { android.util.Log.i("SacdAdd", "local iso ${f.path} -> ${it.size} items") }; r.onFailure { android.util.Log.w("SacdAdd", "local iso ${f.path} failed", it) }; items.addAll(r.getOrDefault(emptyList())) } catch (e: Exception) { android.util.Log.w("SacdAdd", "local iso ${f.path} threw", e); e.printStackTrace() } }
                     lo.endsWith(".m3u")||lo.endsWith(".m3u8") -> { val p = try { java.io.FileInputStream(f).use { parseM3uLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
                     lo.endsWith(".cue") -> { val p = try { java.io.FileInputStream(f).use { parseCueLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
                     lo.endsWith(".pls") -> { val p = try { java.io.FileInputStream(f).use { parsePlsLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
@@ -1015,7 +1016,7 @@ class NowPlayingActivity : BaseActivity() {
         }
     }
 
-    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape").any { name.lowercase().endsWith(it) }
+    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso").any { name.lowercase().endsWith(it) }
 
     private fun getThemeColor(): Int {
         val idx = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
