@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.9.0 - 2026-08-30
+
+### Added
+
+- **SACD ISO playback (DSD/DST → PCM):** Super Audio CD images (`.iso`) play natively over SMB or local storage. A native decoder (sacd-ripper libsacd + FFmpeg dsd2pcm) converts DSD/DST to float32 PCM at 176.4 kHz and feeds it through the existing bit-perfect `AudioTrack` chain. Stereo tracks are listed as individual items with correct titles, artists, and durations.
+- **SACD ISO support in the MPD server:** ISOs now appear in `lsinfo`/`listall` and expand into their tracks when added/played from a remote client (MALP etc.).
+- **MediaSession playback resumption:** the persisted queue/index/position is restored when the system resumes playback after the process is killed.
+
+### Fixed
+
+- **Startup crash:** registering the BouncyCastle security provider before OkHttp's TLS setup could race `SSLContext.init` ("BKS not found"); the SMB context is now pre-warmed after the HTTP client is built.
+- **Playback reliability for SACD:** transient SMB errors no longer truncate a track (decode errors now retry instead of ending the stream), the extractor's native decoder no longer leaks on seeks, and the per-track SMB connection is closed on release.
+- **Decode throughput:** the DSD→PCM decimation FIR is NEON-vectorized and the two channels decode in parallel, raising throughput from ~0.7× to ~1.7× realtime so playback no longer drains its buffer and stutters.
+
 ## 2.8.5 - 2026-08-29
 
 ### Added
