@@ -45,8 +45,8 @@ BitperfectPlayer is licensed under the **GNU General Public License v3.0** (GPL-
 
 The app incorporates third-party code that requires copyleft licensing:
 
-*   **sacd-ripper** (`libsacd`, `libcommon`, `libdstdec`) — GPL-2.0-or-later — SACD ISO reading and DST decoding.
-*   **FFmpeg** (`dsd.c`/`dsd.h`, `libavutil`) — LGPL-2.1-or-later — DSD → PCM decoding (based on Sebastian Gesemann's BSD-licensed `dsd2pcm`).
+*   **sacd-ripper** (`libsacd`, `libcommon`, `libdstdec`) — GPL-2.0-or-later.
+*   **FFmpeg** (`dsd.c`/`dsd.h`, `libavutil`) — LGPL-2.1-or-later.
 *   **jcifs-ng** — LGPL-2.1 — SMB/CIFS networking.
 *   **AndroidX Media3** and **OkHttp** — Apache-2.0.
 *   **Bouncy Castle** — MIT.
