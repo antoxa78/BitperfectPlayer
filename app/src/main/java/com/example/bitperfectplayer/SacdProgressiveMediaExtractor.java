@@ -55,6 +55,12 @@ public final class SacdProgressiveMediaExtractor implements ProgressiveMediaExtr
             ExtractorOutput output) {
         input = new DefaultExtractorInput(dataReader, position, length);
         inputPosition = position;
+        // init() runs again whenever the loader restarts (seek that missed the
+        // buffer, period reset): the previous extractor's native decoder context
+        // would otherwise leak.
+        if (extractor != null) {
+            extractor.release();
+        }
         SacdMediaExtractor e = new SacdMediaExtractor(reader, area, track, outHz);
         e.init(output);
         extractor = e;
@@ -67,6 +73,9 @@ public final class SacdProgressiveMediaExtractor implements ProgressiveMediaExtr
         }
         extractor = null;
         input = null;
+        // The reader is owned by this extractor: close its SMB socket/file now
+        // that the period is released (media3 creates a fresh access per source).
+        reader.close();
     }
 
     @Override

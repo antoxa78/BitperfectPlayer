@@ -458,7 +458,11 @@ Java_com_example_bitperfectplayer_SacdBridge_nativeSacdReadFloat(JNIEnv *env, jo
     }
 
     long frames = sacd_pcm_read(ctx->r, ctx->scratch, jMaxFrames);
-    if (frames <= 0) return (*env)->NewByteArray(env, 0);
+    /* frames < 0: decode error (e.g. transient SMB failure) -> return NULL so the
+     * extractor signals a load error and media3 retries instead of truncating the
+     * track. frames == 0: clean EOF -> empty array. */
+    if (frames < 0) return NULL;
+    if (frames == 0) return (*env)->NewByteArray(env, 0);
 
     size_t nbytes = (size_t)frames * (size_t)ch * sizeof(float);
     jbyteArray out = (*env)->NewByteArray(env, (jsize)nbytes);

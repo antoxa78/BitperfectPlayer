@@ -156,6 +156,7 @@ struct sacd_pcm_reader {
     /* Channel-parallel decode workers (one per channel; DSD2PCM + FIR are
      * independent across channels, and there are idle cores on the device). */
     int  workers_started;
+    int  workers_created; /* number of worker threads actually created */
     pthread_t worker[2];
     pthread_mutex_t w_mtx[2];
     pthread_cond_t w_cv[2];
@@ -554,7 +555,10 @@ static void *dsd_worker_main(void *arg)
 }
 
 /* Starts the per-channel worker threads (stereo). Idempotent; returns 0 on
- * success. On failure the decode falls back to running channels inline. */
+ * success. On failure any already-created workers are stopped and the decode
+ * falls back to running channels inline. The sync primitives are created here
+ * and destroyed in dsd_workers_stop, so this is safe to call again after a
+ * release()/setup() cycle (e.g. a backward seek re-opening the decoder). */
 static int dsd_workers_start(sacd_pcm_reader_t *r)
 {
     if (r->workers_started) return 0;
@@ -566,9 +570,13 @@ static int dsd_workers_start(sacd_pcm_reader_t *r)
         r->w_arg[c].r = r;
         r->w_arg[c].c = c;
         if (pthread_create(&r->worker[c], NULL, dsd_worker_main, &r->w_arg[c]) != 0) {
-            r->w_stop[c] = 1;
+            r->workers_created = c; /* workers 0..c-1 exist and must be reaped */
+            dsd_workers_stop(r);
+            pthread_cond_destroy(&r->w_cv[c]);
+            pthread_mutex_destroy(&r->w_mtx[c]);
             return -1;
         }
+        r->workers_created++;
     }
     r->workers_started = 1;
     return 0;
@@ -576,14 +584,16 @@ static int dsd_workers_start(sacd_pcm_reader_t *r)
 
 static void dsd_workers_stop(sacd_pcm_reader_t *r)
 {
-    if (!r->workers_started) return;
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < r->workers_created; c++) {
         pthread_mutex_lock(&r->w_mtx[c]);
         r->w_stop[c] = 1;
         pthread_cond_broadcast(&r->w_cv[c]);
         pthread_mutex_unlock(&r->w_mtx[c]);
         pthread_join(r->worker[c], NULL);
+        pthread_cond_destroy(&r->w_cv[c]);
+        pthread_mutex_destroy(&r->w_mtx[c]);
     }
+    r->workers_created = 0;
     r->workers_started = 0;
 }
 

@@ -70,7 +70,7 @@
 
         <activity
             android:name=".SacdTestActivity"
-            android:exported="true"
+            android:exported="false"
             android:theme="@style/Theme.BitperfectPlayer"
             android:screenOrientation="landscape" />
 

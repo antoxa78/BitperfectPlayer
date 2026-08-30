@@ -15,6 +15,9 @@ interface SacdRandomAccess {
 
     /** Total image size in bytes. */
     fun length(): Long
+
+    /** Releases the underlying file handle/socket. Safe to call more than once. */
+    fun close()
 }
 
 /** [SacdRandomAccess] backed by an SMB share (jcifs). */
@@ -71,7 +74,7 @@ class SmbSacdRandomAccess(private val smbFile: SmbFile) : SacdRandomAccess {
     override fun length(): Long = smbFile.length()
 
     @Synchronized
-    fun close() {
+    override fun close() {
         raf?.let {
             try {
                 it.close()
@@ -104,7 +107,7 @@ class LocalSacdRandomAccess(private val file: java.io.File) : SacdRandomAccess {
     override fun length(): Long = file.length()
 
     @Synchronized
-    fun close() {
+    override fun close() {
         try {
             raf.close()
         } catch (_: IOException) {

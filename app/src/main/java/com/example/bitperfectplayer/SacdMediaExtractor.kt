@@ -53,12 +53,15 @@ class SacdMediaExtractor(
         if (!seekMapQueued || handle == 0L) return
         val frame = (timeUs * sampleRate / 1_000_000L).coerceAtLeast(0L)
         if (frame != lastReadFrame) {
-            try {
-                SacdBridge.nativeSacdSeek(handle, frame)
+            val ok = try {
+                SacdBridge.nativeSacdSeek(handle, frame) == 0
             } catch (_: Exception) {
-                // A failed seek is not fatal; playback continues from the current point.
+                false
             }
-            lastReadFrame = frame
+            // Only advance the timestamp counter when the native seek succeeded;
+            // otherwise the decoder keeps its position but samples would be
+            // mislabelled with the target time.
+            if (ok) lastReadFrame = frame
         }
     }
 
@@ -122,7 +125,15 @@ class SacdMediaExtractor(
             SacdBridge.nativeSacdReadFloat(handle, maxFrames)
         } catch (e: Exception) {
             android.util.Log.w(TAG, "nativeSacdReadFloat threw", e)
-            ByteArray(0)
+            null
+        }
+        if (data == null) {
+            // A decode failure (e.g. a transient SMB error) must NOT be treated as
+            // end-of-stream — that would truncate the track and skip to the next
+            // item. Surface it as a load error so media3's retry policy recovers.
+            throw ParserException.createForUnsupportedContainerFeature(
+                "SACD decode failed while reading the ISO"
+            )
         }
         if (data.isEmpty()) {
             endOfStream = true
@@ -170,6 +181,6 @@ class SacdMediaExtractor(
 
     companion object {
         private const val TAG = "SacdExt"
-        private const val READ_BYTES = 96 * 1024 // ~96 KB of packed int24
+        private const val READ_BYTES = 96 * 1024 // ~96 KB of interleaved float32
     }
 }

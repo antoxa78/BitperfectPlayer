@@ -53,9 +53,15 @@ class SacdMediaSourceFactory(
     }
 
     private fun createSacdSource(info: SacdSupport.TrackInfo, mediaItem: MediaItem): MediaSource {
-        val access = SacdSupport.buildRandomAccess(info.srcUri)
+        // Each extractor instance owns its own reader (and closes it in release()),
+        // so two periods of the same source never share an SMB connection.
         val progressiveExtractorFactory = ProgressiveMediaExtractor.Factory {
-            SacdProgressiveMediaExtractor(access, info.area, info.track, info.outHz)
+            SacdProgressiveMediaExtractor(
+                SacdSupport.buildRandomAccess(info.srcUri),
+                info.area,
+                info.track,
+                info.outHz
+            )
         }
         val dataSourceFactory = DataSource.Factory { SacdPassthroughDataSource() }
         return ProgressiveMediaSource.Factory(dataSourceFactory, progressiveExtractorFactory)

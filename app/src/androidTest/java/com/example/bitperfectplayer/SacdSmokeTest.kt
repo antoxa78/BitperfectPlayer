@@ -101,7 +101,7 @@ class SacdSmokeTest {
 
         val frameSize = ch * 4
         val frames = 16384
-        val read1 = SacdBridge.nativeSacdReadFloat(handle, frames)
+        val read1 = requireNotNull(SacdBridge.nativeSacdReadFloat(handle, frames))
         assertTrue("expected $frames frames of float, got ${read1.size / frameSize}",
             read1.size == frames * frameSize)
         val firstSample = read1.copyOf(8)
@@ -112,15 +112,15 @@ class SacdSmokeTest {
         //    output frames differ across a re-open, then samples must match).
         val mid = totalFrames / 2
         assertEquals(0, SacdBridge.nativeSacdSeek(handle, mid))
-        val readMid = SacdBridge.nativeSacdReadFloat(handle, frames)
+        val readMid = requireNotNull(SacdBridge.nativeSacdReadFloat(handle, frames))
         assertTrue(readMid.size == read1.size)
         assertFalse("seeked data should differ from track start",
             readMid.copyOfRange(0, 8).contentEquals(firstSample))
 
         assertEquals(0, SacdBridge.nativeSacdSeek(handle, 0L))
-        val reopenA = SacdBridge.nativeSacdReadFloat(handle, 300)
+        val reopenA = requireNotNull(SacdBridge.nativeSacdReadFloat(handle, 300))
         assertEquals(0, SacdBridge.nativeSacdSeek(handle, 0L))
-        val reopenB = SacdBridge.nativeSacdReadFloat(handle, 300)
+        val reopenB = requireNotNull(SacdBridge.nativeSacdReadFloat(handle, 300))
         assertTrue(reopenA.size == 300 * frameSize)
         var diff = -1
         for (i in reopenA.indices) {

@@ -34,8 +34,8 @@ object SacdBridge {
     /** Decodes up to maxFrames PCM frames into 24-bit packed bytes. Empty on EOF/error. */
     external fun nativeSacdReadInt24(handle: Long, maxFrames: Int): ByteArray
 
-    /** Decodes up to maxFrames PCM frames into interleaved float32 bytes. Empty on EOF/error. */
-    external fun nativeSacdReadFloat(handle: Long, maxFrames: Int): ByteArray
+    /** Decodes up to maxFrames PCM frames into interleaved float32 bytes. Empty on EOF, null on decode error. */
+    external fun nativeSacdReadFloat(handle: Long, maxFrames: Int): ByteArray?
 
     /** Seeks to an absolute output frame index. Returns 0 on success. */
     external fun nativeSacdSeek(handle: Long, frame: Long): Int
