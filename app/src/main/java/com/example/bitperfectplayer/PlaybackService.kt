@@ -81,8 +81,8 @@ class PlaybackService : MediaSessionService() {
 
         private const val BUFFER_MIN_MS        = 60_000
         private const val BUFFER_MAX_MS        = 120_000
-        private const val BUFFER_PLAYBACK_MS   = 2_500
-        private const val BUFFER_REBUFFER_MS   = 5_000
+        private const val BUFFER_PLAYBACK_MS   = 15_000
+        private const val BUFFER_REBUFFER_MS   = 15_000
         private const val BUFFER_MAX_BYTES     = 128 * 1024 * 1024
 
         private const val RECENT_LIST_MAX      = 20
