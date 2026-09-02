@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.9.1 - 2026-09-02
+
+### Fixed
+
+- **Install on 32-bit Android TV:** release APK now includes native libs for all ABIs (armeabi-v7a, arm64-v8a, x86, x86_64), fixing `INSTALL_FAILED_NO_MATCHING_ABIS` on 32-bit devices like Xiaomi Mi TV.
+- **Stream startup delay:** reduced minimum buffer from 60s to 5s — radio streams now start in ~5 seconds instead of ~60.
+- **Radio stream buffering:** increased playback back-buffer from 2.5s to 5s, giving more headroom to absorb network jitter during peak hours.
+
 ## 2.9.0 - 2026-08-30
 
 ### Added
