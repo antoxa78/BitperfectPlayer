@@ -79,7 +79,7 @@ class PlaybackService : MediaSessionService() {
         private const val RECONNECT_DELAY_MS   = 5_000L
         private const val MAX_RETRIES          = 5
 
-        private const val BUFFER_MIN_MS        = 5_000
+        private const val BUFFER_MIN_MS        = 15_000
         private const val BUFFER_MAX_MS        = 120_000
         private const val BUFFER_PLAYBACK_MS   = 15_000
         private const val BUFFER_REBUFFER_MS   = 15_000

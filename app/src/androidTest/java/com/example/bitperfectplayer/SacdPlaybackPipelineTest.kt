@@ -190,7 +190,7 @@ class SacdPlaybackPipelineTest {
                     .setAudioAttributes(androidx.media3.common.AudioAttributes.DEFAULT, /* handleAudioFocus= */ false)
                     .setLoadControl(
                         androidx.media3.exoplayer.DefaultLoadControl.Builder()
-                            .setBufferDurationsMs(5_000, 120_000, 15_000, 15_000)
+                            .setBufferDurationsMs(15_000, 120_000, 15_000, 15_000)
                             .setTargetBufferBytes(128 * 1024 * 1024)
                             .setPrioritizeTimeOverSizeThresholds(true)
                             .build()
