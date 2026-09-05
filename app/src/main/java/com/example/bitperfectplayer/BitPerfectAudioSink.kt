@@ -51,6 +51,15 @@ class BitPerfectAudioSink(
     private var playing = false
     private val audioTimestamp = AudioTimestamp()
 
+    /**
+     * When true, the userspace USB driver owns the DAC and this sink must not
+     * create its own direct AudioTrack on the USB output (that would fight the
+     * usbdevfs driver over the interface). Set by PlaybackService when the
+     * decent-player driver is engaged.
+     */
+    @Volatile
+    var driverOwnsUsbDevice: Boolean = false
+
     override fun setListener(listener: AudioSink.Listener) {
         this.listener = listener
         delegate.setListener(listener)
@@ -113,7 +122,15 @@ class BitPerfectAudioSink(
             return
         }
 
-        val outputDevice = preferredDevice ?: bitPerfectManager.findUsbOutputDevice()
+        val outputDevice = if (driverOwnsUsbDevice) {
+            // The usbdevfs driver owns the DAC. Route the delegate to whatever was
+            // explicitly forced (e.g. the wrapper's forceMediaToSpeaker); otherwise
+            // leave it null so DefaultAudioSink falls back to the default output
+            // (never the claimed DAC).
+            preferredDevice
+        } else {
+            preferredDevice ?: bitPerfectManager.findUsbOutputDevice()
+        }
         selectedDevice.set(outputDevice)
         delegate.setPreferredDevice(outputDevice)
         delegate.configure(format, specifiedBufferSize, outputChannels)
@@ -384,6 +401,7 @@ class BitPerfectAudioSink(
     }
 
     private fun isDirectCandidate(format: Format): Boolean {
+        if (driverOwnsUsbDevice) return false
         if (tunneling || format.sampleMimeType != androidx.media3.common.MimeTypes.AUDIO_RAW) return false
         return format.pcmEncoding == C.ENCODING_PCM_24BIT ||
             format.pcmEncoding == C.ENCODING_PCM_32BIT ||

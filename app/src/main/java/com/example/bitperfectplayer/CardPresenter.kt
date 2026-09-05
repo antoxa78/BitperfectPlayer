@@ -90,6 +90,7 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
         val lower = id.lowercase()
         return when {
             id.startsWith("action:USB DAC")              -> R.drawable.ic_dac
+            id.startsWith("action:Audio Output")       -> R.drawable.ic_audio
             id.startsWith("action:Add Local")         -> R.drawable.ic_add
             id.startsWith("action:External Drive")    -> R.drawable.ic_usb
             id.startsWith("action:Add SMB")           -> R.drawable.ic_network_music

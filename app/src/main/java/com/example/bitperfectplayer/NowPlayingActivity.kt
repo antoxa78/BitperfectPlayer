@@ -793,11 +793,22 @@ class NowPlayingActivity : BaseActivity() {
 
     // ── Format helpers ────────────────────────────────────────────────────────
 
+    /**
+     * The bit-perfect modes feed the source rate straight through, so the decoded
+     * sample rate is what the DAC receives.
+     */
+    @OptIn(UnstableApi::class)
+    private fun displaySampleRate(f: Format): Int {
+        if (f.sampleRate == Format.NO_VALUE || f.sampleRate <= 0) return -1
+        return f.sampleRate
+    }
+
     @OptIn(UnstableApi::class)
     private fun formatInfoParts(f: Format): List<String> {
         val p = mutableListOf<String>()
         if (f.bitrate != Format.NO_VALUE && f.bitrate > 0) p.add("${f.bitrate / 1000} kbps")
-        if (f.sampleRate != Format.NO_VALUE && f.sampleRate > 0) p.add("${f.sampleRate} Hz")
+        val sr = displaySampleRate(f)
+        if (sr > 0) p.add("$sr Hz")
         val bd = when (f.pcmEncoding) { C.ENCODING_PCM_16BIT -> "16-bit"; C.ENCODING_PCM_24BIT -> "24-bit"; C.ENCODING_PCM_32BIT -> "32-bit"; C.ENCODING_PCM_FLOAT -> "Float"; else -> "" }
         if (bd.isNotEmpty()) p.add(bd)
         return p

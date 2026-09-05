@@ -15,7 +15,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import java.io.File
 import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
 import androidx.core.net.toUri
@@ -37,6 +39,7 @@ import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
@@ -75,6 +78,12 @@ class PlaybackService : MediaSessionService() {
         private const val KEY_AUTO_RECONNECT   = "auto_reconnect"
         private const val KEY_RESUME_PLAYBACK  = "resume_playback"
         private const val KEY_RECENT_FILES     = "recent_files"
+        private const val KEY_USBDEVFS_DRIVER  = "usbdevfs_driver"
+        // Audio output method (Settings → Audio Output). Migrates from the old
+        // boolean KEY_USBDEVFS_DRIVER on first read (true → USBDEVFS, false → BITPERFECT_ANDROID).
+        private const val KEY_AUDIO_OUTPUT_MODE = "audio_output_mode"
+        private const val AUDIO_OUTPUT_BITPERFECT_ANDROID = 1 // Bit-perfect via Android: direct AudioTrack at native rate
+        private const val AUDIO_OUTPUT_USBDEVFS           = 2 // Bit-perfect (USB driver): userspace usbdevfs driver owns the DAC
 
         private const val HTTP_TIMEOUT_SECS    = 20L
         private const val USER_AGENT           = "BitperfectPlayer/1.1 (Android TV)"
@@ -92,6 +101,23 @@ class PlaybackService : MediaSessionService() {
 
         private const val USB_SETTLE_MS        = 1_500L
         private const val USB_RESET_GAP_MS     = 400L
+        // After a live Settings → Audio Output switch the USBDEVFS_RESET soft-replug
+        // has re-enumerated the DAC, but the kernel needs a beat to re-probe and
+        // register the USB sound card before a new system AudioTrack should open.
+        // We poll /dev/snd for the unbind/rebind, but this budget is a bound, not
+        // a guarantee: opening too early can land in a half-enumerated device and
+        // wedge card 0 (silent until a physical replug), while a missed detection
+        // must never stall the mode switch for long.
+        private const val USB_REBIND_MAX_WAIT_MS = 10_000L
+        // Fixed grace used when /dev/snd cannot be listed (the unbind/rebind is
+        // unobservable) — long enough for the kernel to re-probe a slow TV box.
+        private const val USB_REBIND_GRACE_MS = 2_000L
+        // Startup find-USB retry: the DAC can be mid-re-enumeration when the
+        // service starts (esp. after our USBDEVFS_RESET soft-replug), so the
+        // first probe can miss it. Retry a few times; a soft reset does not
+        // re-broadcast ACTION_USB_DEVICE_ATTACHED, so nothing else re-arms.
+        private const val USB_PROBE_RETRY_MS    = 2_000L
+        private const val MAX_USB_PROBE_RETRIES = 4
         // Grace period after the player reports STATE_IDLE (sink released) before
         // rebuilding the AudioTrack, so the USB HAL finishes tearing down the old
         // session — a fixed 400ms delay alone is too short on slow TV boxes and
@@ -172,6 +198,11 @@ class PlaybackService : MediaSessionService() {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     Log.i(TAG, "USB device attached — will check for DAC in ${USB_SETTLE_MS}ms")
+                    // No attach-time claim: the usbdevfs driver must only take the
+                    // DAC while actively streaming. Claiming at attach steals the
+                    // device from the system audio HAL and silent-blocks every
+                    // other app (no HDMI fallback on this box). The driver claims
+                    // lazily in configure() on the next playback start.
                     // Cancel any previous pending settle check before re-posting (BUG-18).
                     mainHandler.removeCallbacks(usbSettleRunnable)
                     mainHandler.postDelayed(usbSettleRunnable, USB_SETTLE_MS)
@@ -191,9 +222,18 @@ class PlaybackService : MediaSessionService() {
         val dac = findUsbAudioDevice(this)
         if (dac != null) {
             Log.i(TAG, "USB DAC live: '${dac.deviceName}' — resetting sink [$reason]")
+            usbProbeRetries = 0
             resetAudioSink()
         } else {
             Log.d(TAG, "No live USB DAC found [$reason]")
+            // Bounded startup retry for the transient re-enumeration window
+            // (see USB_PROBE_RETRY_MS). Other reasons re-arm via broadcasts.
+            if (reason.contains("startup", ignoreCase = true)
+                && usbDevfsDriverEnabled()
+                && ++usbProbeRetries <= MAX_USB_PROBE_RETRIES) {
+                mainHandler.postDelayed({ checkAndResetUsbAudio("startup probe $usbProbeRetries") },
+                    USB_PROBE_RETRY_MS)
+            }
         }
     }
 
@@ -241,18 +281,253 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    // ── decent-player userspace USB driver integration ────────────────────────
+
+    /** Wrapped in PlaybackService.buildAudioSink when the usbdevfs driver is enabled. */
+    private var usbAudioSink: com.decent.usbaudio.media3.UsbAudioSink? = null
+
+    /** True while the usbdevfs driver owns the USB DAC (mirrors the wrapper's
+     *  onDriverOwnsUsbDeviceChanged callback; written from the release thread). */
+    @Volatile
+    private var usbDriverOwnsDac = false
+
+    /**
+     * Release the usbdevfs driver's claim on the USB DAC so the system audio
+     * HAL can use it again (pause, stop, sleep — whenever the player is not
+     * actively streaming). The driver re-claims lazily on the next play().
+     * The wrapper's onDriverOwnsUsbDeviceChanged(false) callback fires inside
+     * releaseUsbStream() (now on the release thread), so a second call right
+     * after (e.g. pause → STATE_IDLE) sees ownership already gone and is a no-op.
+     *
+     * @return true when a release (and USB reset) was actually triggered; false
+     *         when the driver does not own the DAC and there is nothing to release.
+     */
+    private fun releaseUsbDriverDac(): Boolean {
+        // NOTE: deliberately NOT gated on usbDevfsDriverEnabled(). If the wrapper
+        // exists and currently owns the DAC, its usbfs claims must be dropped
+        // regardless of the current mode — e.g. a live Settings → Audio Output
+        // switch from usbdevfs to a system mode must return the DAC to the HAL
+        // or the new AudioTrack opens into a still-claimed device and is silent.
+        val sink = usbAudioSink ?: return false
+        if (!usbDriverOwnsDac) {
+            // Driver does not own the DAC (released, never engaged, or a failed
+            // configure). Nothing to hand back — avoid a pointless USB reset.
+            Log.d(TAG, "DAC release skipped — driver does not own the DAC")
+            return false
+        }
+        return try {
+            sink.releaseUsbForIdle()
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "usbdevfs DAC release failed: ${t.message}")
+            false
+        }
+    }
+
+    /** Settings → Audio Output. Migrates the legacy usbdevfs_driver boolean on first read. */
+    private fun getAudioOutputMode(): Int {
+        val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+        if (!prefs.contains(KEY_AUDIO_OUTPUT_MODE)) {
+            val mapped = if (prefs.getBoolean(KEY_USBDEVFS_DRIVER, true)) {
+                AUDIO_OUTPUT_USBDEVFS
+            } else {
+                AUDIO_OUTPUT_BITPERFECT_ANDROID
+            }
+            prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, mapped).apply()
+            return mapped
+        }
+        val stored = prefs.getInt(KEY_AUDIO_OUTPUT_MODE, AUDIO_OUTPUT_USBDEVFS)
+        // The former "Default (Android audio)" mode (0) was removed; treat it as
+        // bit-perfect via Android so a persisted 0 keeps a valid audio path.
+        val mapped = if (stored == 0) AUDIO_OUTPUT_BITPERFECT_ANDROID else stored
+        if (mapped != stored) {
+            prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, mapped).apply()
+        }
+        return mapped
+    }
+
+    private fun usbDevfsDriverEnabled(): Boolean = getAudioOutputMode() == AUDIO_OUTPUT_USBDEVFS
+
+    /**
+     * Applied by Settings → Audio Output right after the new mode is saved. If the
+     * previous (usbdevfs) mode was streaming, its wrapper still owns the DAC via usbfs;
+     * that claim must be dropped and the USBDEVFS_RESET soft-replug given time to
+     * complete before the rebuilt sink's system AudioTrack opens the device — otherwise
+     * playback is silent (the HAL cannot open a claimed interface). The output sink is
+     * chosen when ExoPlayer builds its renderers, so the player itself is rebuilt in
+     * the new mode (queue/position/play-state restored) rather than merely restarted.
+     */
+    fun applyOutputModeAudioReset() {
+        val sink = usbAudioSink
+        if (sink == null) {
+            usbAudioSink = null
+            rebuildPlayerForOutputMode()
+            return
+        }
+        // Snapshot the system sound cards before the soft-replug so we can watch
+        // the USB card unbind/rebind (below) while the reset re-enumerates the DAC.
+        val cardsBefore = sndCards()
+        if (!releaseUsbDriverDac()) {
+            // The driver did not own the DAC — no USB reset was triggered, so there
+            // is no re-enumeration to wait out. Rebuild immediately instead of
+            // waiting for a card change that will never happen (BUG-21).
+            usbAudioSink = null
+            rebuildPlayerForOutputMode()
+            return
+        }
+        val main = mainHandler
+        Thread({
+            if (!waitForUsbRebind(sink, cardsBefore)) {
+                Log.w(TAG, "USB sound card did not re-register after soft-replug — " +
+                    "system-audio modes may stay silent until the DAC is physically replugged")
+            }
+            main.post {
+                if (usbAudioSink === sink) usbAudioSink = null
+                rebuildPlayerForOutputMode()
+            }
+        }, "usbModeSwitch").start()
+    }
+
+    /**
+     * Rebuilds ExoPlayer so the new audio-output mode's sink is really in use.
+     * The sink is decided inside DefaultRenderersFactory.buildAudioSink when the
+     * player builds its renderers, so changing the mode at runtime requires a
+     * fresh player (a plain sink/reset restart reuses the old renderer). The
+     * MediaSession stays put — its controllers (UI / MPD bridge) keep working —
+     * and the queue, position and play-intent are restored on the new player.
+     * Must be called on the main thread.
+     */
+    private fun rebuildPlayerForOutputMode() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { rebuildPlayerForOutputMode() }
+            return
+        }
+        val session = mediaSession ?: return
+        val old = session.player as? ExoPlayer ?: return
+        val items = (0 until old.mediaItemCount).map { old.getMediaItemAt(it) }
+        val index = old.currentMediaItemIndex
+        // Live streams (duration == TIME_UNSET) report an unbounded position;
+        // restoring it would seek past the end of a seekable station (BUG-19).
+        val position = if (old.duration == C.TIME_UNSET) 0L else old.currentPosition
+        val playWhenReady = old.playWhenReady
+        val mode = getAudioOutputMode()
+        Log.i(TAG, "Rebuilding player for audio output mode $mode " +
+            "[items=${items.size} idx=$index pos=$position playWhenReady=$playWhenReady]")
+
+        val fresh = buildPlayer()
+        session.setPlayer(fresh)
+        runCatching { old.release() }
+        // usbAudioSink was already cleared by applyOutputModeAudioReset before the
+        // rebuild; buildPlayer re-assigns it only when building in usbdevfs mode.
+
+        if (items.isNotEmpty()) {
+            fresh.setMediaItems(items, index, position)
+            fresh.playWhenReady = playWhenReady
+            if (playWhenReady) {
+                fresh.prepare()
+                fresh.play()
+            }
+        } else {
+            fresh.playWhenReady = playWhenReady
+        }
+        Log.i(TAG, "Player rebuilt in audio output mode $mode")
+    }
+
+    /** `/dev/snd` control cards (controlC0, controlC1, …) currently registered. */
+    private fun sndCards(): Set<String> =
+        File("/dev/snd").list()?.filterTo(HashSet()) { it.startsWith("controlC") } ?: emptySet()
+
+    /**
+     * Waits (blocking the calling background thread) for the DAC's USB sound card
+     * to unbind and rebind after the USBDEVFS_RESET soft-replug, so a fresh system
+     * AudioTrack never opens into a half-enumerated device (which can wedge card 0
+     * until a physical replug).
+     *
+     * Detection is deliberately tolerant: after re-enumeration the card usually
+     * re-registers under the SAME controlC index, so "a new name appeared" is not a
+     * reliable signal. Instead we first wait for a card that was present before the
+     * reset to disappear (unbind), then for a card to come back (rebind). Both stages
+     * are bounded by [USB_REBIND_MAX_WAIT_MS]; when /dev/snd is not listable the wait
+     * degenerates to a short fixed grace so the mode switch is never stalled (BUG-21).
+     * The caller always rebuilds the player afterwards — a missed detection only
+     * skips the extra grace period, it never blocks forever.
+     *
+     * @return true when an unbind+rebind was actually observed.
+     */
+    private fun waitForUsbRebind(
+        sink: com.decent.usbaudio.media3.UsbAudioSink,
+        cardsBefore: Set<String>
+    ): Boolean {
+        val deadline = SystemClock.uptimeMillis() + USB_REBIND_MAX_WAIT_MS
+
+        // The unbind can only happen once the release thread has run resetUsbDevice(),
+        // so first wait for any in-flight release to finish.
+        while (sink.isIdleReleaseInFlight() && SystemClock.uptimeMillis() < deadline) {
+            if (!sleepQuietly(10)) return false
+        }
+
+        // /dev/snd not observable: fall back to a fixed grace so the kernel has time
+        // to re-probe, then let the caller proceed.
+        if (cardsBefore.isEmpty()) {
+            sleepQuietly(USB_REBIND_GRACE_MS)
+            return false
+        }
+
+        // Stage 1: the old USB card unbinds — a card we saw before disappears, or a
+        // replacement card appears (the rebind can outpace our 100 ms polling).
+        var sawUnbind = false
+        while (SystemClock.uptimeMillis() < deadline) {
+            val now = sndCards()
+            if (now.isEmpty() || now.size < cardsBefore.size || now.any { it !in cardsBefore }) {
+                sawUnbind = true
+                break
+            }
+            if (!sleepQuietly(100)) return false
+        }
+        if (!sawUnbind) return false
+
+        // Stage 2: the USB card comes back. Accept the same or a different index.
+        while (SystemClock.uptimeMillis() < deadline) {
+            val now = sndCards()
+            if (now.isNotEmpty() && now.size >= cardsBefore.size) return true
+            if (!sleepQuietly(100)) return false
+        }
+        return false
+    }
+
+    private fun sleepQuietly(ms: Long): Boolean {
+        try {
+            Thread.sleep(ms)
+            return true
+        } catch (e: InterruptedException) {
+            return false
+        }
+    }
+
+    /** Build the current track's native-engine path check for the driver's LoadControl. */
+    private fun wrapLoadControlForUsb(d: DefaultLoadControl): LoadControl =
+        com.decent.usbaudio.media3.UsbAudioSink.wrapLoadControl(d) {
+            usbAudioSink?.isNativeEngineActive == true
+        }
+
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 Intent.ACTION_SCREEN_OFF -> {
                     mainHandler.removeCallbacks(wakeResetRunnable)
                     if (isActivelyPlaying()) {
+                        // Keep listening through suspend; playing resumes and
+                        // re-negotiates the USB DAC on wake. The suspend/wake
+                        // reset path (usbReceiver/checkAndResetUsbAudio) slits
+                        // and re-engages the driver automatically.
                         Log.i(TAG, "Screen off while playing — suspend tears the stream down; wake re-negotiates")
                     } else {
-                        // Release any lingering track before suspend so the USB
-                        // DAC (direct-only HAL on Android 11) is not pinned to
-                        // our rate through sleep — other apps fail to open it.
-                        Log.i(TAG, "Screen off — releasing audio track")
+                        // Not playing: release the usbdevfs driver's claim on the
+                        // DAC before suspend so it is not pinned through sleep —
+                        // and the kernel proxy pcm is rebind-able once we soft-
+                        // replug (USBDEVFS_RESET). Other apps can then use it.
+                        Log.i(TAG, "Screen off — releasing idle audio track + DAC")
+                        releaseUsbDriverDac()
                         mediaSession?.player?.stop()
                     }
                 }
@@ -272,6 +547,7 @@ class PlaybackService : MediaSessionService() {
                         // Zombie half-state (track attached, not producing audio)
                         // also pins the DAC — release it so other apps get sound.
                         Log.i(TAG, "Screen on — releasing idle audio track")
+                        releaseUsbDriverDac()
                         mediaSession?.player?.stop()
                     }
                 }
@@ -441,6 +717,7 @@ class PlaybackService : MediaSessionService() {
     // Generation counter: lets a stale STATE_IDLE event or safety-net timeout
     // from a previous reset be ignored once a newer reset supersedes it.
     private var sinkResetGeneration = 0
+    private var usbProbeRetries = 0
 
     // Set while a reset is waiting for the player to reach STATE_IDLE (the
     // AudioTrack has been released) before rebuilding the sink.
@@ -634,7 +911,43 @@ class PlaybackService : MediaSessionService() {
                     }
                 })
                 .build()
-                return BitPerfectAudioSink(sink, bitPerfectManager, selectedAudioDevice)
+                val bitPerfectSink = BitPerfectAudioSink(
+                    sink, bitPerfectManager, selectedAudioDevice
+                )
+                return when (getAudioOutputMode()) {
+                    AUDIO_OUTPUT_BITPERFECT_ANDROID -> {
+                        // Bit-perfect via Android: direct AudioTrack targeting the
+                        // DAC at its native rate through the system media stack.
+                        bitPerfectSink
+                    }
+                    else -> {
+                        // Bit-perfect (USB driver): userspace USB Audio 2.0 driver
+                        // (usbdevfs) bypasses the Android audio stack when a USB DAC
+                        // is present. The BitPerfectAudioSink below is the delegate
+                        // (muted, routed to speaker) so ExoPlayer's clock/position
+                        // tracking still works while the driver owns the DAC.
+                        com.decent.usbaudio.media3.UsbAudioSink(
+                            bitPerfectSink,
+                            context,
+                            com.decent.usbaudio.media3.UsbAudioSinkConfig(
+                                bitPerfectEnabled = true,
+                                // Keep the delegate's AudioTrack on the built-in speaker so a
+                                // stale mix rate never pins the DAC while the driver owns it.
+                                forceRouteToSpeaker = true
+                            ),
+                            // Sync the delegate's guard with the driver's actual USB ownership:
+                            // while the usbdevfs driver streams, BitPerfectAudioSink must not
+                            // open its own direct AudioTrack on the DAC.
+                            onDriverOwnsUsbDeviceChanged = { owns ->
+                                bitPerfectSink.driverOwnsUsbDevice = owns
+                                this@PlaybackService.usbDriverOwnsDac = owns
+                                Log.i(TAG, "UsbAudioSink driver ownership changed: releasedToDriver=$owns")
+                            }
+                        ).also {
+                            this@PlaybackService.usbAudioSink = it
+                        }
+                    }
+                }
             }
         }
 
@@ -662,13 +975,16 @@ class PlaybackService : MediaSessionService() {
             .experimentalSetDynamicSchedulingEnabled(true)
 
         if (settings.getBoolean(KEY_NETWORK_BUFFER, true)) {
-            builder.setLoadControl(
-                DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(BUFFER_MIN_MS, BUFFER_MAX_MS, BUFFER_PLAYBACK_MS, BUFFER_REBUFFER_MS)
-                    .setTargetBufferBytes(BUFFER_MAX_BYTES)
-                    .setPrioritizeTimeOverSizeThresholds(true)
-                    .build()
-            )
+            val lc = DefaultLoadControl.Builder()
+                .setBufferDurationsMs(BUFFER_MIN_MS, BUFFER_MAX_MS, BUFFER_PLAYBACK_MS, BUFFER_REBUFFER_MS)
+                .setTargetBufferBytes(BUFFER_MAX_BYTES)
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .build()
+            if (usbDevfsDriverEnabled()) {
+                builder.setLoadControl(wrapLoadControlForUsb(lc))
+            } else {
+                builder.setLoadControl(lc)
+            }
         }
 
         val player = builder.build()
@@ -683,7 +999,15 @@ class PlaybackService : MediaSessionService() {
             )
             .build()
 
-        return player.also { it.addListener(playerListener) }
+        return player.also {
+            it.addListener(playerListener)
+            if (usbDevfsDriverEnabled()) {
+                // Attach the usbdevfs driver to the player. It registers its own
+                // Player.Listener for track-path extraction + native engine lifecycle.
+                usbAudioSink?.attachToPlayer(it)
+                Log.i(TAG, "UsbAudioSink attached to player")
+            }
+        }
     }
 
     // ── Player listener ───────────────────────────────────────────────────────
@@ -767,6 +1091,9 @@ class PlaybackService : MediaSessionService() {
             // so the lock persists after pause and after sleep/wake.
             // Release the track on pause so the DAC returns to the default
             // mix rate; play() above re-prepares and re-negotiates fresh.
+            // With the usbdevfs driver, also drop its force-claims so other
+            // apps get the DAC back while we are paused.
+            releaseUsbDriverDac()
             if (bitPerfectManager.findUsbOutputDevice() != null) {
                 mediaSession?.player?.stop()
             }
@@ -797,6 +1124,9 @@ class PlaybackService : MediaSessionService() {
                 // Stop/end releases the active audio pipeline. Keep the preference scoped
                 // to an active track rather than leaving it set for the service lifetime.
                 bitPerfectManager.clear()
+                // Same for the usbdevfs driver: drop the DAC claims once the queue
+                // stops/ends so the system can use the DAC again.
+                releaseUsbDriverDac()
             }
 
             // Bit-perfect design note: a buffer underrun surfaces here as a plain
@@ -833,6 +1163,23 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         instance = this
         bitPerfectManager = BitPerfectManager(this)
+
+        // The usbdevfs driver only streams when the DAC is already granted to us.
+        // Request permission up front (the system dialog shows on the TV screen) so
+        // playback doesn't silently fall back to the AudioTrack path on the first track.
+        if (usbDevfsDriverEnabled()) {
+            runCatching {
+                val driver = com.decent.usbaudio.UsbAudioDevice.getInstance(this)
+                val dac = driver.findUsbAudioDevice()
+                if (dac != null && !driver.hasPermission(dac)) {
+                    driver.requestPermission(dac) { granted ->
+                        Log.i(TAG, "USB permission (driver): granted=$granted")
+                    }
+                }
+            }.onFailure {
+                Log.w(TAG, "USB permission request failed: ${it.message}")
+            }
+        }
 
         httpFactory = OkHttpDataSource.Factory(
             OkHttpClient.Builder()

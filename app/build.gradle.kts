@@ -27,8 +27,8 @@ android {
         applicationId = "com.github.antoxa78.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 44
-        versionName = "2.9.1"
+        versionCode = 45
+        versionName = "3.0.0"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -92,7 +92,26 @@ dependencies {
     implementation(libs.androidx.leanback)
     implementation(libs.jcifs.ng)
 
+    // decent-player userspace USB audio driver (vendored in third_party/)
+    implementation(project(":decent-usb-audio-driver"))
+    implementation(project(":decent-usb-audio-wrapper-media3"))
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
+}
+
+// Defensive version pin: keep the whole media3 stack on 1.5.1. The vendored
+// decent-player wrapper also builds against 1.5.1, but pinning here guarantees
+// no transitive path (a future wrapper bump or another media3 artifact) silently
+// upgrades ExoPlayer/session/common out from under the AudioSink APIs the app
+// relies on (verified against 1.5.1).
+configurations.configureEach {
+    resolutionStrategy {
+        force(
+            "androidx.media3:media3-exoplayer:1.5.1",
+            "androidx.media3:media3-common:1.5.1",
+            "androidx.media3:media3-session:1.5.1"
+        )
+    }
 }

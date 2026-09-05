@@ -1,15 +1,27 @@
 # Changelog
 
-## Unreleased
+## 3.0.0 - 2026-09-05
 
 ### Added
 
+- **Bit-perfect (USB driver) output mode:** a userspace USB Audio 2.0 driver (vendored from decent-player, `third_party/decent-player/libs/`) now streams PCM directly to the DAC over usbdevfs, bypassing the entire Android audio stack. Local FLAC files are decoded by a native engine writing straight to the USB isochronous endpoint; all other formats use the ExoPlayer pipeline through the driver. The driver claims the DAC only while actively streaming and soft-replugs (USBDEVFS_RESET) on release, so other apps and the system HAL can use the DAC whenever playback is idle.
+- **Settings → Audio Output:** new settings card to switch between "Bit-perfect via Android" (direct AudioTrack at the DAC's native rate through the system media stack) and "Bit-perfect (USB driver)". Switching at runtime releases the previous mode's DAC claim, waits for the USB sound card to re-register after the soft-replug, and rebuilds ExoPlayer in the new mode with the queue, position and play-state restored.
+- **USB attach handling:** the app now matches USB audio-class devices (`USB_DEVICE_ATTACHED` intent filter + `usb.host` feature), and the service requests USB permission up front so playback does not silently fall back to the AudioTrack path on the first track. A bounded startup probe retries while the DAC is mid-re-enumeration.
 - **Instant USB DAC recovery on wake:** the DAC's USB link is torn down during suspend and re-enumerates on wake — slowly and unreliably. The service now registers an `AudioDeviceCallback` and re-negotiates the audio sink the instant the DAC's audio side re-registers (the earliest moment a fresh bit-perfect session can open), instead of relying only on the single-shot wake check that can miss the re-link window.
 
 ### Fixed
 
+- **Audio Output switch could stall for up to 60 s:** the wait for the DAC's USB sound card to re-register after the soft-replug keyed on a *new* `controlC` name — but the card usually re-registers under the same index, and `/dev/snd` may not be listable at all, so the switch could hang for the full budget with silence. Detection now watches for the card to unbind and rebind (any index), the budget is bounded at 10 s with a short fixed grace when `/dev/snd` is unobservable, and the player rebuild always proceeds afterwards.
+- **Audio Output switch waited when nothing was released:** if the usbdevfs driver did not own the DAC (paused/idle), no USB reset was triggered, yet the switch still waited for a re-enumeration that could never happen. The release now reports whether it actually fired, and the rebuild is immediate when it did not.
+- **Re-selecting the active Audio Output mode tore the DAC down for nothing:** the dialog now no-ops when the selected mode equals the effective current mode (including the migrated legacy setting).
+- **Settings subtitle could disagree with the service:** the "Audio Output" card now applies the same legacy-`usbdevfs_driver` migration and removed-mode mapping as the service, so the displayed mode always matches actual playback.
 - **No other app can play audio after the Shield wakes from sleep (USB DAC):** on Android 11 the `usb_audio` HAL is direct-only — while the player's AudioTrack is attached, the DAC's output is pinned to the track's sample rate and every other app's 48 kHz stream fails with `EINVAL` (silence everywhere else). Media3 keeps the track attached on pause and the framework's dead-object auto-restore re-attaches it, so the lock outlived pause and sleep/wake. The track is now released whenever playback is not actively running: on pause, on screen-off, and on wake — the DAC returns to the default mix rate and other apps play again immediately. Resume re-negotiates a fresh bit-perfect stream (`play()` re-prepares from `STATE_IDLE`; the MPD server reports the released state as "pause", not "stop").
 - **Android 14+ stale bit-perfect mixer preference after sleep:** the uid-scoped `setPreferredMixerAttributes` preference survives suspend in AudioService; it is now cleared on `ACTION_SCREEN_ON`, and the sink is re-negotiated when playback is still active.
+
+### Changed
+
+- The legacy "usbdevfs driver" boolean setting is migrated to the new `audio_output_mode` preference on first read; the removed "Default (Android audio)" mode maps to "Bit-perfect via Android".
+- media3 is pinned to 1.5.1 across all configurations (the vendored driver wrapper builds against the same version).
 
 ## 2.9.1 - 2026-09-02
 

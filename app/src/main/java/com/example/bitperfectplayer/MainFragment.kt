@@ -2,6 +2,7 @@ package com.example.bitperfectplayer
 
 import android.app.AlertDialog
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -36,6 +37,10 @@ class MainFragment : BrowseSupportFragment() {
     private val KEY_AUTO_SCAN = "auto_scan"
     private val KEY_COLOR_SCHEME = "color_scheme"
     private val KEY_WAVEFORM_TYPE = "waveform_type"
+    private val KEY_AUDIO_OUTPUT_MODE = "audio_output_mode"
+    private val KEY_USBDEVFS_DRIVER  = "usbdevfs_driver"
+    private val AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
+    private val AUDIO_OUTPUT_USBDEVFS           = 2
     private val KEY_NETWORK_BUFFER = "network_buffer"
     private val KEY_AUTO_RECONNECT = "auto_reconnect"
     private var hasAttemptedResume = false
@@ -273,6 +278,7 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("Waveform Type", "Current: ${getWaveformTypeName()}"))
         settingsAdapter.add(createActionItem("Player Color Scheme", "Current: ${getColorSchemeName()}"))
         settingsAdapter.add(createActionItem("USB DAC", getUsbDacStatus()))
+        settingsAdapter.add(createActionItem("Audio Output", getAudioOutputSubtitle()))
         settingsAdapter.add(createActionItem("LAN Player Control", getLanControlSubtitle()))
         settingsAdapter.add(createActionItem("About", "Version and build info"))
         val settingsHeader = HeaderItem(4, "Settings")
@@ -2016,8 +2022,8 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun updateLanControlCard() {
         if (!::settingsAdapter.isInitialized) return
-        // LAN index is 8 when inserted after USB DAC (7)
-        val lanIndex = 8
+        // LAN index is 9 when inserted after USB DAC (7) and Audio Output (8)
+        val lanIndex = 9
         if (lanIndex < settingsAdapter.size()) {
             settingsAdapter.replace(lanIndex, createActionItem("LAN Player Control", getLanControlSubtitle()))
         }
@@ -2400,6 +2406,67 @@ class MainFragment : BrowseSupportFragment() {
                 requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                     .edit().putInt(KEY_COLOR_SCHEME, which).apply()
                 refreshWithCurrentFocus()
+            }
+            .setNegativeButton("Back", null)
+            .show()
+    }
+
+    private val audioOutputNames = arrayOf(
+        "Bit-perfect via Android", // AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
+        "Bit-perfect (USB driver)" // AUDIO_OUTPUT_USBDEVFS = 2
+    )
+    private val audioOutputModes = intArrayOf(1, 2)
+
+    /**
+     * Effective audio-output mode, mirroring PlaybackService.getAudioOutputMode():
+     * migrates the legacy usbdevfs_driver boolean on first read and treats the
+     * removed mode 0 ("Default (Android audio)") as bit-perfect via Android, so
+     * the settings subtitle always agrees with the service.
+     */
+    private fun getAudioOutputMode(prefs: SharedPreferences): Int {
+        if (!prefs.contains(KEY_AUDIO_OUTPUT_MODE)) {
+            val mapped = if (prefs.getBoolean(KEY_USBDEVFS_DRIVER, true)) {
+                AUDIO_OUTPUT_USBDEVFS
+            } else {
+                AUDIO_OUTPUT_BITPERFECT_ANDROID
+            }
+            prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, mapped).apply()
+            return mapped
+        }
+        val stored = prefs.getInt(KEY_AUDIO_OUTPUT_MODE, AUDIO_OUTPUT_USBDEVFS)
+        val mapped = if (stored == 0) AUDIO_OUTPUT_BITPERFECT_ANDROID else stored
+        if (mapped != stored) {
+            prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, mapped).apply()
+        }
+        return mapped
+    }
+
+    private fun getAudioOutputSubtitle(): String {
+        val mode = getAudioOutputMode(
+            requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        )
+        val index = audioOutputModes.indexOf(mode)
+        return if (index >= 0) audioOutputNames[index] else audioOutputNames[1]
+    }
+
+    private fun showAudioOutputDialog() {
+        val items = audioOutputNames.map { DialogOptionItem(it, R.drawable.ic_audio) }
+        val adapter = DialogOptionAdapter(requireContext(), items)
+        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Select Audio Output")
+            .setAdapter(adapter) { _, which ->
+                val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                val selected = audioOutputModes[which]
+                // Re-selecting the active mode must not tear the DAC down and rebuild
+                // the player for nothing (BUG-22).
+                if (selected != getAudioOutputMode(prefs)) {
+                    prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, selected).apply()
+                    refreshWithCurrentFocus()
+                    // Applying a new output mode means rebuilding the audio sink so the
+                    // chosen path (system / Android bit-perfect / usbdevfs driver) becomes
+                    // live. This also releases a still-claimed DAC from the previous mode.
+                    PlaybackService.instance?.applyOutputModeAudioReset()
+                }
             }
             .setNegativeButton("Back", null)
             .show()
@@ -3060,6 +3127,9 @@ class MainFragment : BrowseSupportFragment() {
             }
             actionId == "action:USB DAC" -> {
                 showUsbDacDialog()
+            }
+            actionId == "action:Audio Output" -> {
+                showAudioOutputDialog()
             }
             actionId == "action:LAN Player Control" -> {
                 showLanControlDialog()
