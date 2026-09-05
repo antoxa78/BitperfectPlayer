@@ -8,6 +8,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbManager
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -89,6 +92,15 @@ class PlaybackService : MediaSessionService() {
 
         private const val USB_SETTLE_MS        = 1_500L
         private const val USB_RESET_GAP_MS     = 400L
+        // Grace period after the player reports STATE_IDLE (sink released) before
+        // rebuilding the AudioTrack, so the USB HAL finishes tearing down the old
+        // session — a fixed 400ms delay alone is too short on slow TV boxes and
+        // the rebuilt track can inherit the stale sample rate (reset does nothing).
+        private const val USB_RESET_TEARDOWN_GRACE_MS = 600L
+        // Safety net: if the player never reports STATE_IDLE after stop() (should
+        // not happen), proceed with the rebuild anyway rather than stalling forever.
+        private const val USB_RESET_IDLE_TIMEOUT_MS  = 2_000L
+        private const val MAX_RESET_RETRIES           = 5
 
         private const val LAN_FG_NOTIF_ID      = 1002
         private const val MEDIA3_NOTIF_ID      = 1001 // Media3 DefaultMediaNotificationProvider default id
@@ -120,6 +132,23 @@ class PlaybackService : MediaSessionService() {
         /** Live reference to the running service — used by UI for resetAudioSink(). */
         @Volatile var instance: PlaybackService? = null
             private set
+
+        /**
+         * Returns the live service instance, starting the service first if it is
+         * not running (Android TV kills it when the UI is closed). Note that
+         * onCreate() — which sets [instance] — runs on the main looper, so the
+         * caller may need to retry briefly after this returns null.
+         */
+        fun ensureRunning(context: Context): PlaybackService? {
+            val s = instance
+            if (s != null) return s
+            try {
+                context.startService(Intent(context, PlaybackService::class.java))
+            } catch (e: Exception) {
+                Log.w(TAG, "startService for reset failed: ${e.message}")
+            }
+            return instance
+        }
 
         /**
          * Latest ICY metadata from the stream currently being played.
@@ -166,6 +195,95 @@ class PlaybackService : MediaSessionService() {
         } else {
             Log.d(TAG, "No live USB DAC found [$reason]")
         }
+    }
+
+    // ── Sleep/wake handling ────────────────────────────────────────────────────
+    // When the Shield sleeps, the device suspends and the audio HAL session is
+    // torn down. On wake the USB DAC must re-enumerate before it can be used
+    // again — the USB host power-cycles the link during suspend. That
+    // re-enumeration is slow and unreliable (the DAC can take seconds to come
+    // back, or not come back at all), and while the audio stack is wedged, the
+    // policy keeps routing streams at the pre-sleep rate — other apps get no
+    // sound, or the player plays resampled. The AudioDeviceCallback below
+    // re-negotiates the sink the instant the DAC's audio side re-registers,
+    // which is the earliest moment a fresh bit-perfect session can be opened.
+    //
+    // On Android 14+ the uid-scoped preferred mixer attributes set by
+    // BitPerfectManager also survive suspend and keep blocking other apps'
+    // audio after wake; they are cleared on ACTION_SCREEN_ON below.
+
+    // Runnable field so a quick sleep-after-wake cancels the pending reset
+    // instead of running it while suspended, mirroring usbSettleRunnable.
+    private val wakeResetRunnable = Runnable { checkAndResetUsbAudio("wake") }
+
+    // Reacts to the USB DAC's audio-side (re)registration. Unlike the USB
+    // attach broadcast — which fires at the bus level, before the audio HAL
+    // and policy have picked the device up — this fires when the device is
+    // actually openable, which is exactly when the sink reset will succeed.
+    private val usbDeviceCallback = object : AudioDeviceCallback() {
+        private fun isUsb(device: AudioDeviceInfo) =
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                device.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+
+        override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
+            if (addedDevices.any(::isUsb)) {
+                Log.i(TAG, "USB audio device added — re-negotiating sink")
+                checkAndResetUsbAudio("device added")
+            }
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) {
+            if (removedDevices.any(::isUsb)) {
+                Log.i(TAG, "USB audio device removed — clearing bit-perfect state")
+                bitPerfectManager.clear()
+            }
+        }
+    }
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    mainHandler.removeCallbacks(wakeResetRunnable)
+                    if (isActivelyPlaying()) {
+                        Log.i(TAG, "Screen off while playing — suspend tears the stream down; wake re-negotiates")
+                    } else {
+                        // Release any lingering track before suspend so the USB
+                        // DAC (direct-only HAL on Android 11) is not pinned to
+                        // our rate through sleep — other apps fail to open it.
+                        Log.i(TAG, "Screen off — releasing audio track")
+                        mediaSession?.player?.stop()
+                    }
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    // Android 14+: the uid-scoped preferred mixer attributes
+                    // survive suspend and block other apps' audio — always clear.
+                    bitPerfectManager.clear()
+                    if (isActivelyPlaying()) {
+                        // The player still thinks it is playing, but its AudioTrack
+                        // is dead after suspend; its framework-level auto-restore
+                        // loop re-attaches a stream at our rate and locks the DAC
+                        // forever. Rebuild the sink (with the USB settle grace) so
+                        // the DAC session is re-negotiated from scratch.
+                        mainHandler.removeCallbacks(wakeResetRunnable)
+                        mainHandler.postDelayed(wakeResetRunnable, USB_SETTLE_MS)
+                    } else {
+                        // Zombie half-state (track attached, not producing audio)
+                        // also pins the DAC — release it so other apps get sound.
+                        Log.i(TAG, "Screen on — releasing idle audio track")
+                        mediaSession?.player?.stop()
+                    }
+                }
+            }
+        }
+    }
+
+    /** True while the player is actively producing audio (or trying to). */
+    private fun isActivelyPlaying(): Boolean {
+        val p = mediaSession?.player ?: return false
+        return p.playWhenReady &&
+            (p.playbackState == Player.STATE_READY || p.playbackState == Player.STATE_BUFFERING)
     }
 
     private var mediaSession: MediaSession? = null
@@ -320,12 +438,40 @@ class PlaybackService : MediaSessionService() {
     // cancel the previous pending restore before scheduling a new one (BUG-17).
     private var sinkRestoreRunnable: Runnable? = null
 
+    // Generation counter: lets a stale STATE_IDLE event or safety-net timeout
+    // from a previous reset be ignored once a newer reset supersedes it.
+    private var sinkResetGeneration = 0
+
+    // Set while a reset is waiting for the player to reach STATE_IDLE (the
+    // AudioTrack has been released) before rebuilding the sink.
+    private var awaitingSinkIdle = false
+    private var awaitingSinkGeneration = 0
+    private var resetRetries = 0
+
     fun resetAudioSink() {
-        val player = mediaSession?.player as? ExoPlayer ?: return
+        val player = mediaSession?.player as? ExoPlayer
+        if (player == null) {
+            // The service just started and the player is still being built —
+            // retry instead of silently dropping the reset (the UI already told
+            // the user the reset is happening). Bounded so a broken state does
+            // not spin forever.
+            if (++resetRetries > MAX_RESET_RETRIES) {
+                resetRetries = 0
+                Log.w(TAG, "resetAudioSink: player never became ready, giving up")
+                return
+            }
+            mainHandler.postDelayed({ resetAudioSink() }, USB_RESET_GAP_MS)
+            return
+        }
+        resetRetries = 0
+        if (++sinkResetGeneration == Int.MAX_VALUE) sinkResetGeneration = 1
+        val generation = sinkResetGeneration
 
         // Cancel any in-flight restore from a previous call before we stop the
         // player again, so the restore does not run against a stale item list.
         sinkRestoreRunnable?.let { mainHandler.removeCallbacks(it) }
+        sinkRestoreRunnable = null
+        awaitingSinkIdle = false
 
         // Capture the user's play INTENT, not isPlaying. A stream that is still
         // buffering reports isPlaying == false (it is only true in STATE_READY),
@@ -348,19 +494,53 @@ class PlaybackService : MediaSessionService() {
 
         val restoreRunnable = Runnable {
             sinkRestoreRunnable = null
+            awaitingSinkIdle = false
+            if (sinkResetGeneration != generation) return@Runnable
             val p = mediaSession?.player as? ExoPlayer ?: return@Runnable
-            // Restore the play intent even when there is nothing queued yet, so
-            // a later setMediaItems() call does not inherit the pause() state.
-            p.playWhenReady = playWhenReady
             if (items.isNotEmpty()) {
+                // Items first: restoring playWhenReady fires the pause-resume
+                // listener, which auto-prepares — it must target these items.
                 p.setMediaItems(items, index, position)
-                p.prepare()
-                if (playWhenReady) p.play()
+                p.playWhenReady = playWhenReady
+                // Skip prepare() when paused with a USB DAC attached: it would
+                // attach an AudioTrack and pin the DAC's rate (direct-only HAL),
+                // blocking other apps' audio while the player sits paused.
+                if (playWhenReady) {
+                    p.prepare()
+                    p.play()
+                }
+            } else {
+                // Restore the play intent even when there is nothing queued yet,
+                // so a later setMediaItems() call does not inherit the pause() state.
+                p.playWhenReady = playWhenReady
             }
             Log.i(TAG, "Audio sink reset complete")
         }
+
+        if (player.playbackState == Player.STATE_IDLE) {
+            // Already idle: no AudioTrack is active, so stop() will not emit a
+            // STATE_IDLE event to latch onto — restore on the plain gap.
+            sinkRestoreRunnable = restoreRunnable
+            mainHandler.postDelayed(restoreRunnable, USB_RESET_GAP_MS)
+            return
+        }
+
+        // Otherwise wait for the player to actually reach STATE_IDLE — the sink
+        // is released before that event is emitted — then rebuild after a short
+        // grace period so the USB HAL finishes tearing down the old session.
+        // A fixed delay alone is unreliable: on slow boxes teardown can outlast
+        // it and the new AudioTrack reopens the stale rate (no audible change).
+        // The safety net below covers the case where IDLE never lands.
+        awaitingSinkIdle = true
+        awaitingSinkGeneration = generation
         sinkRestoreRunnable = restoreRunnable
-        mainHandler.postDelayed(restoreRunnable, USB_RESET_GAP_MS)
+        mainHandler.postDelayed({
+            if (sinkResetGeneration == generation &&
+                sinkRestoreRunnable === restoreRunnable && awaitingSinkIdle) {
+                awaitingSinkIdle = false
+                restoreRunnable.run()
+            }
+        }, USB_RESET_IDLE_TIMEOUT_MS)
     }
 
     // ── Bit-perfect audio processor chain ─────────────────────────────────────
@@ -566,12 +746,49 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-            if (!playWhenReady) saveCurrentPosition()
+            if (playWhenReady) {
+                // Resume after a pause that released the track: play() from
+                // STATE_IDLE does not auto-prepare in Media3, so prepare
+                // explicitly to re-negotiate the stream (fresh bit-perfect
+                // session, or none at all when the DAC is gone).
+                val p = mediaSession?.player ?: return
+                if (p.playbackState == Player.STATE_IDLE && p.mediaItemCount > 0) {
+                    p.prepare()
+                }
+                return
+            }
+            saveCurrentPosition()
+            // The Android 11 usb_audio HAL is direct-only: while our
+            // AudioTrack is attached, the DAC's output is pinned to the
+            // track's sample rate and every other app's 48kHz stream fails
+            // with EINVAL ("Bad parameter: sampleRate 48000") — no sound
+            // anywhere else. Media3 pauses the track but keeps it attached,
+            // and the framework's dead-object auto-restore re-attaches it,
+            // so the lock persists after pause and after sleep/wake.
+            // Release the track on pause so the DAC returns to the default
+            // mix rate; play() above re-prepares and re-negotiates fresh.
+            if (bitPerfectManager.findUsbOutputDevice() != null) {
+                mediaSession?.player?.stop()
+            }
         }
 
         private var wasBuffering = false
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            // A reset waits for STATE_IDLE: that is the moment stop() has
+            // released the AudioTrack, so the rebuild can safely reopen the USB
+            // session with the current track's rate (without this, the rebuilt
+            // sink can inherit the stale Android-default rate and the reset
+            // appears to do nothing on slow HAL teardowns).
+            if (playbackState == Player.STATE_IDLE && awaitingSinkIdle) {
+                awaitingSinkIdle = false
+                if (awaitingSinkGeneration == sinkResetGeneration) {
+                    sinkRestoreRunnable?.let { restore ->
+                        mainHandler.removeCallbacks(restore)
+                        mainHandler.postDelayed(restore, USB_RESET_TEARDOWN_GRACE_MS)
+                    }
+                }
+            }
             if (playbackState == Player.STATE_READY) retryCount = 0
             if (playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING)
                 saveCurrentPosition()
@@ -679,6 +896,20 @@ class PlaybackService : MediaSessionService() {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         })
 
+        // Listen for sleep/wake so the audio track / bit-perfect mixer preference is
+        // not left holding the USB DAC after the device suspends (it would pin
+        // the DAC's sample rate and block every other app's audio after wake).
+        registerReceiver(screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        })
+
+        // Re-negotiate the sink the moment the USB DAC's audio side (re)appears
+        // after suspend — the re-enumeration is slow and flaky, and the wake
+        // check above can miss the window.
+        (getSystemService(Context.AUDIO_SERVICE) as AudioManager)
+            .registerAudioDeviceCallback(usbDeviceCallback, mainHandler)
+
         // On startup: if a USB DAC is already connected, reset the sink so
         // Android HAL negotiates bit-perfect output from the very first track.
         mainHandler.postDelayed({ checkAndResetUsbAudio("startup") }, USB_SETTLE_MS)
@@ -768,6 +999,11 @@ class PlaybackService : MediaSessionService() {
         mpdServer = null
         mainHandler.removeCallbacksAndMessages(null)
         try { unregisterReceiver(usbReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
+        try {
+            (getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
+                ?.unregisterAudioDeviceCallback(usbDeviceCallback)
+        } catch (_: Exception) {}
         mediaSession?.run { player.release(); release() }
         super.onDestroy()
     }
@@ -844,7 +1080,14 @@ class PlaybackService : MediaSessionService() {
             // Radio streams never have a meaningful position (BUG-19): restart at 0.
             val restorePos = if (items[index].mediaId.startsWith("http://") || items[index].mediaId.startsWith("https://")) 0L else pos
             player.setMediaItems(items, index, restorePos)
-            player.prepare()
+            // Prepare only when playback is actually wanted. prepare() with
+            // playWhenReady=false still attaches an AudioTrack to the USB DAC
+            // (direct-only HAL on Android 11), pinning its rate and blocking
+            // every other app's audio while the player sits paused. play()
+            // from IDLE auto-prepares, so the queued state is fully preserved.
+            if (player.playWhenReady || bitPerfectManager.findUsbOutputDevice() == null) {
+                player.prepare()
+            }
             Log.i(TAG, "Restored ${items.size} queued items (index $index)")
         } catch (e: Exception) {
             Log.w(TAG, "Queue restore failed: ${e.message}")

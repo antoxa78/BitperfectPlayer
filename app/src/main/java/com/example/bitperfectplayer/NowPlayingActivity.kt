@@ -51,6 +51,7 @@ class NowPlayingActivity : BaseActivity() {
         private const val PROGRESS_TICK_MS   = 1_000L
         private const val METADATA_DELAY_1   = 1_000L
         private const val METADATA_DELAY_2   = 3_000L
+        private const val DAC_RESET_SERVICE_RETRY_MS = 200L
 
         private val CLEANUP_REGEX = Regex("(?i)(\\s*\\(.*?remaster.*?\\)|\\s*\\[.*?explicit.*?\\]|\\s*\\(.*?live.*?\\)|\\s*\\(.*?feat.*?\\)|\\s*-\\s*single|\\s*-\\s*ep)")
         private val FOLDER_ART_NAMES = arrayOf("folder.jpg", "cover.jpg", "album.jpg", "folder.png", "cover.png", "album.png", "front.jpg")
@@ -219,20 +220,42 @@ class NowPlayingActivity : BaseActivity() {
 
     /** Resets the audio sink via PlaybackService, with visual feedback. */
     private fun triggerDacReset() {
-        val svc = PlaybackService.instance
+        val svc = PlaybackService.ensureRunning(this)
         if (svc == null) {
-            Toast.makeText(this, "Playback service not running", Toast.LENGTH_SHORT).show()
+            // Service was killed while the app UI was closed (Android TV does
+            // this). startService has been sent; onCreate sets
+            // PlaybackService.instance on the main looper, so retry briefly
+            // before giving up — previously this path only showed a Toast and
+            // the tap appeared to do nothing.
+            Toast.makeText(this, "Starting playback service…", Toast.LENGTH_SHORT).show()
+            blinkDacButton()
+            handler.postDelayed({
+                val retried = PlaybackService.instance
+                if (retried != null) doDacReset(retried)
+                else Toast.makeText(this, "Playback service not running", Toast.LENGTH_SHORT).show()
+            }, DAC_RESET_SERVICE_RETRY_MS)
             return
         }
+        doDacReset(svc)
+    }
+
+    private fun doDacReset(svc: PlaybackService) {
         val dac = PlaybackService.findUsbAudioDevice(this)
         if (dac == null) {
             Toast.makeText(this, "No USB DAC detected", Toast.LENGTH_SHORT).show()
+            blinkDacButton()
             return
         }
         Toast.makeText(this, "Resetting DAC: ${dac.productName ?: "USB Audio"}…", Toast.LENGTH_SHORT).show()
         svc.resetAudioSink()
+        blinkDacButton()
+    }
+
+    /** Pulses the DAC button so every tap has visible feedback. */
+    private fun blinkDacButton() {
+        val targetAlpha = btnDacReset.alpha
         btnDacReset.animate().alpha(0.2f).setDuration(120).withEndAction {
-            btnDacReset.animate().alpha(1f).setDuration(280).start()
+            btnDacReset.animate().alpha(targetAlpha).setDuration(280).start()
         }.start()
     }
 

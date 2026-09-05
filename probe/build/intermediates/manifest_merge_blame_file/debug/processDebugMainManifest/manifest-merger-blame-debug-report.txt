@@ -1,0 +1,101 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.example.usbclaimprobe"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+7-->INJECTED
+8        android:minSdkVersion="28"
+8-->INJECTED
+9        android:targetSdkVersion="36" />
+9-->INJECTED
+10
+11    <uses-feature
+11-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:4:5-87
+12        android:name="android.hardware.usb.host"
+12-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:4:19-59
+13        android:required="false" />
+13-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:4:60-84
+14
+15    <permission
+15-->[androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:22:5-24:47
+16        android:name="com.example.usbclaimprobe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+16-->[androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:23:9-81
+17        android:protectionLevel="signature" />
+17-->[androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:24:9-44
+18
+19    <uses-permission android:name="com.example.usbclaimprobe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+19-->[androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:26:5-97
+19-->[androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:26:22-94
+20
+21    <application
+21-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:6:5-26:19
+22        android:allowBackup="false"
+22-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:7:9-36
+23        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+23-->[androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:28:18-86
+24        android:debuggable="true"
+25        android:extractNativeLibs="false"
+25-->INJECTED
+26        android:label="USBClaimProbe"
+26-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:8:9-38
+27        android:supportsRtl="true"
+27-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:9:9-35
+28        android:theme="@style/Theme.AppCompat.DayNight" >
+28-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:10:9-56
+29        <activity
+29-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:12:9-25:20
+30            android:name="com.example.usbclaimprobe.MainActivity"
+30-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:13:13-41
+31            android:exported="true" >
+31-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:14:13-36
+32            <intent-filter>
+32-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:15:13-18:29
+33                <action android:name="android.intent.action.MAIN" />
+33-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:16:17-69
+33-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:16:25-66
+34
+35                <category android:name="android.intent.category.LAUNCHER" />
+35-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:17:17-77
+35-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:17:27-74
+36            </intent-filter>
+37            <intent-filter>
+37-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:19:13-21:29
+38                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+38-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:20:17-90
+38-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:20:25-87
+39            </intent-filter>
+40
+41            <meta-data
+41-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:22:13-24:67
+42                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+42-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:23:17-79
+43                android:resource="@xml/usb_audio_device_filter" />
+43-->/home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:24:17-64
+44        </activity>
+45
+46        <provider
+46-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:24:9-32:20
+47            android:name="androidx.startup.InitializationProvider"
+47-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:25:13-67
+48            android:authorities="com.example.usbclaimprobe.androidx-startup"
+48-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:26:13-68
+49            android:exported="false" >
+49-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:27:13-37
+50            <meta-data
+50-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:29:13-31:52
+51                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+51-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:30:17-75
+52                android:value="androidx.startup" />
+52-->[androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:31:17-49
+53            <meta-data
+53-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:31:13-33:52
+54                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+54-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:32:17-78
+55                android:value="androidx.startup" />
+55-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:33:17-49
+56        </provider>
+57    </application>
+58
+59</manifest>

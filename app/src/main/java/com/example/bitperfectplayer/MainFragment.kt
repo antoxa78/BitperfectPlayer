@@ -1884,7 +1884,6 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun showUsbDacDialog() {
         val context = requireContext()
-        val svc = PlaybackService.instance
         // UsbManager check = live device presence (correct after power-off)
         val usbDac = PlaybackService.findUsbAudioDevice(context)
         // AudioManager check = audio capabilities (sample rates, bit depths, channel counts)
@@ -1944,12 +1943,25 @@ class MainFragment : BrowseSupportFragment() {
             .setMessage(msg)
             .setPositiveButton("OK", null)
             .setNeutralButton("Reset Audio Sink") { _, _ ->
-                if (svc != null) {
+                // Start the service if Android TV killed it while the UI was
+                // closed; retry once since onCreate() lands on the main looper.
+                val s = PlaybackService.ensureRunning(context)
+                if (s != null) {
                     Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
-                    svc.checkAndResetUsbAudio(reason = "manual from settings")
+                    s.checkAndResetUsbAudio(reason = "manual from settings")
                     refreshWithCurrentFocus()
                 } else {
-                    Toast.makeText(context, "Playback service not running", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Starting playback service…", Toast.LENGTH_SHORT).show()
+                    view?.postDelayed({
+                        val retried = PlaybackService.instance
+                        if (retried != null) {
+                            Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
+                            retried.checkAndResetUsbAudio(reason = "manual from settings")
+                            refreshWithCurrentFocus()
+                        } else {
+                            Toast.makeText(context, "Playback service not running", Toast.LENGTH_SHORT).show()
+                        }
+                    }, 200)
                 }
             }
             .show()

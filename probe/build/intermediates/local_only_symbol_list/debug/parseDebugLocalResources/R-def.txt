@@ -1,0 +1,3 @@
+R_DEF: Internal format may change without notice
+local
+xml usb_audio_device_filter

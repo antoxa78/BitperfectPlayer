@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Instant USB DAC recovery on wake:** the DAC's USB link is torn down during suspend and re-enumerates on wake — slowly and unreliably. The service now registers an `AudioDeviceCallback` and re-negotiates the audio sink the instant the DAC's audio side re-registers (the earliest moment a fresh bit-perfect session can open), instead of relying only on the single-shot wake check that can miss the re-link window.
+
+### Fixed
+
+- **No other app can play audio after the Shield wakes from sleep (USB DAC):** on Android 11 the `usb_audio` HAL is direct-only — while the player's AudioTrack is attached, the DAC's output is pinned to the track's sample rate and every other app's 48 kHz stream fails with `EINVAL` (silence everywhere else). Media3 keeps the track attached on pause and the framework's dead-object auto-restore re-attaches it, so the lock outlived pause and sleep/wake. The track is now released whenever playback is not actively running: on pause, on screen-off, and on wake — the DAC returns to the default mix rate and other apps play again immediately. Resume re-negotiates a fresh bit-perfect stream (`play()` re-prepares from `STATE_IDLE`; the MPD server reports the released state as "pause", not "stop").
+- **Android 14+ stale bit-perfect mixer preference after sleep:** the uid-scoped `setPreferredMixerAttributes` preference survives suspend in AudioService; it is now cleared on `ACTION_SCREEN_ON`, and the sink is re-negotiated when playback is still active.
+
 ## 2.9.1 - 2026-09-02
 
 ### Fixed

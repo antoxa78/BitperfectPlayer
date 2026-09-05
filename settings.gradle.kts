@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "BitperfectPlayer"
 include(":app")
+include(":probe")

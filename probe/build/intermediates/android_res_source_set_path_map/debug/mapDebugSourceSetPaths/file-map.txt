@@ -1,0 +1,8 @@
+com.example.usbclaimprobe-pngs-0 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/build/generated/res/pngs/debug
+com.example.usbclaimprobe-updated_navigation_xml-1 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/build/generated/updated_navigation_xml/debug
+com.example.usbclaimprobe-packageDebugResources-2 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+com.example.usbclaimprobe-packageDebugResources-3 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+com.example.usbclaimprobe-debug-4 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/build/intermediates/merged_res/debug/mergeDebugResources
+com.example.usbclaimprobe-debug-5 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/debug/res
+com.example.usbclaimprobe-main-6 /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/res
+gradleHome-0 /home/anton/.gradle

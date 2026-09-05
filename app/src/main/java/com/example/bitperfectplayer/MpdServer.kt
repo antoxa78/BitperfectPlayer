@@ -407,16 +407,30 @@ class MpdServer(private val context: Context) {
                         for ((idx, line) in lines.withIndex()) {
                             if (hadError) break
                             binaryResponseSent.set(false)
-                            try { execLine(line, writer, reader); if (okEach && binaryResponseSent.get() != true) send(writer, "OK") }
+                            try {
+                                execLine(line, writer, reader)
+                                // MPD acknowledges each command in an OK list with
+                                // "list_OK" (not "OK") and terminates the whole list
+                                // with "OK". gompd (used by ymuse) parses "list_OK"
+                                // strictly, so a bare "OK" made bulk adds fail with
+                                // "unexpected response: OK" (BUG).
+                                if (okEach && binaryResponseSent.get() != true) send(writer, "list_OK")
+                            }
                             catch (e: MpdAck) { sendAck(writer, idx, lineToken(line), e); hadError = true }
                             catch (e: Exception) { sendAck(writer, idx, lineToken(line), MpdAck(ACK_ERROR, e.message ?: "error")); hadError = true }
                             catch (_: CloseSignal) { sock.close(); return }
                         }
-                        if (!hadError && !okEach && binaryResponseSent.get() != true) send(writer, "OK")
+                        // command_list_begin → single "OK"; command_list_ok_begin →
+                        // final "OK" after the per-command "list_OK" responses.
+                        if (!hadError && binaryResponseSent.get() != true) send(writer, "OK")
                         continue
                     }
                     binaryResponseSent.set(false)
-                    try { execLine(raw, writer, reader); if (binaryResponseSent.get() != true) send(writer, "OK") }
+                    try {
+                        execLine(raw, writer, reader)
+                        if (idleConsumedCommand.get()) idleConsumedCommand.set(false)
+                        else if (binaryResponseSent.get() != true) send(writer, "OK")
+                    }
                     catch (e: MpdAck) { sendAck(writer, 0, lineToken(raw), e) }
                     catch (e: Exception) { sendAck(writer, 0, lineToken(raw), MpdAck(ACK_ERROR, e.message ?: "error")) }
                     catch (_: CloseSignal) { break }
@@ -472,6 +486,10 @@ class MpdServer(private val context: Context) {
     private val clientAuth = ThreadLocal.withInitial { false }
     private val clientSocket = ThreadLocal<Socket>()
     private val binaryResponseSent = ThreadLocal.withInitial { false }
+    // Set when an idle session consumed a command sent on the same connection;
+    // the client loop must then skip its trailing "OK" so the client never sees
+    // a double response (BUG: corrupted response stream).
+    private val idleConsumedCommand = ThreadLocal.withInitial { false }
 
     @Throws(MpdAck::class, CloseSignal::class)
     private fun execLine(line: String, writer: BufferedWriter, reader: BufferedReader? = null) {
@@ -549,13 +567,17 @@ class MpdServer(private val context: Context) {
                                 consumedCommand = true
                                 try {
                                     execLine(peek, writer, reader)
-                                    // Send OK for that command if needed is handled inside execLine's caller — we need to send OK here
-                                    // execLine for non-idle doesn't send OK itself; caller sends OK. So we mimic:
-                                    writer.write("OK\n"); writer.flush()
+                                    // execLine never sends the trailing OK itself;
+                                    // do it here (unless the command already sent
+                                    // its own binary response) and flag the outer
+                                    // loop to skip its OK for the idle command.
+                                    if (binaryResponseSent.get() != true) { writer.write("OK\n"); writer.flush() }
+                                    idleConsumedCommand.set(true)
                                 } catch (e: MpdAck) {
                                     // Surface the error to the client instead of swallowing it (BUG: silent "nothing happens")
                                     val cmdTok = try { tokenize(peek).firstOrNull() ?: "" } catch (_: Exception) { "" }
                                     sendAck(writer, 0, cmdTok, e)
+                                    idleConsumedCommand.set(true)
                                 } catch (_: Exception) {}
                                 idleWaiters.remove(waiter)
                                 break
@@ -1026,6 +1048,11 @@ class MpdServer(private val context: Context) {
             val state = when (c.playbackState) {
                 Player.STATE_READY -> if (c.isPlaying) "play" else "pause"
                 Player.STATE_BUFFERING -> if (c.playWhenReady) "play" else "pause"
+                // With a USB DAC connected, pause() releases the AudioTrack
+                // (direct-only usb_audio HAL pins the DAC otherwise), so the
+                // player sits at STATE_IDLE with the queue and position intact —
+                // that is a pause, not a stop, to MPD clients.
+                Player.STATE_IDLE -> if (!c.playWhenReady && c.mediaItemCount > 0) "pause" else "stop"
                 else -> "stop"
             }
             val fmt = findAudioFormat(c)
