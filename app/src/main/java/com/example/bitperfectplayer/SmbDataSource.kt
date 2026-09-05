@@ -13,19 +13,21 @@ import java.io.IOException
 @OptIn(UnstableApi::class)
 class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
 
+    private val lock = Any()
     private var smbFile: SmbFile? = null
     private var randomAccessFile: SmbRandomAccessFile? = null
     private var uri: Uri? = null
     private var bytesRemaining: Long = 0L
     private var opened = false
 
-    override fun open(dataSpec: DataSpec): Long {
+    override fun open(dataSpec: DataSpec): Long = synchronized(lock) {
         transferInitializing(dataSpec)
         uri = dataSpec.uri
 
         try {
-            smbFile = SmbFile(uri.toString(), SmbContext.getContextForUri(uri.toString()))
-            randomAccessFile = SmbRandomAccessFile(smbFile!!, "r").also { raf ->
+            val smbFileInstance = SmbFile(uri.toString(), SmbContext.getContextForUri(uri.toString()))
+            smbFile = smbFileInstance
+            randomAccessFile = SmbRandomAccessFile(smbFileInstance, "r").also { raf ->
                 if (dataSpec.position > 0) raf.seek(dataSpec.position)
             }
 
@@ -41,12 +43,12 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
 
         opened = true
         transferStarted(dataSpec)
-        return bytesRemaining
+        return@synchronized bytesRemaining
     }
 
-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        if (length == 0) return 0
-        if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int = synchronized(lock) {
+        if (length == 0) return@synchronized 0
+        if (bytesRemaining == 0L) return@synchronized C.RESULT_END_OF_INPUT
 
         val isUnbounded = bytesRemaining == C.LENGTH_UNSET.toLong()
         val bytesToRead = if (isUnbounded) length else minOf(bytesRemaining, length.toLong()).toInt()
@@ -57,25 +59,27 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             throw IOException(e)
         }
 
-        if (bytesRead == -1) return C.RESULT_END_OF_INPUT
+        if (bytesRead == -1) return@synchronized C.RESULT_END_OF_INPUT
 
         if (!isUnbounded) bytesRemaining -= bytesRead
 
         bytesTransferred(bytesRead)
-        return bytesRead
+        return@synchronized bytesRead
     }
 
-    override fun getUri(): Uri? = uri
+    override fun getUri(): Uri? = synchronized(lock) { uri }
 
-    override fun close() {
+    override fun close() = synchronized(lock) {
         uri = null
         try {
             randomAccessFile?.close()
+            smbFile = null
         } catch (e: IOException) {
             // Re-throw so ExoPlayer can handle it; finally ensures state is always cleaned up
             throw IOException(e)
         } finally {
             randomAccessFile = null
+            smbFile = null
             if (opened) {
                 opened = false
                 transferEnded()

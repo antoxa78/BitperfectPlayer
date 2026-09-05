@@ -30,8 +30,20 @@ abstract class BaseActivity : FragmentActivity() {
     protected val screensaverRunnable = Runnable { showScreensaver() }
     protected var isScreensaverActive  = false
 
+    // Bounce animation handler kept as a field so it can be cancelled when the
+    // screensaver is hidden or the activity is destroyed (BUG-15).
+    private val bounceHandler = Handler(Looper.getMainLooper())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+    }
+
+    override fun onDestroy() {
+        // Stop the bounce animation and screensaver timer so the handlers do not
+        // fire on a dead window after the activity is torn down (BUG-16).
+        hideScreensaver()
+        screensaverHandler.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 
     override fun onUserInteraction() {
@@ -101,8 +113,9 @@ abstract class BaseActivity : FragmentActivity() {
 
         onScreensaverCreated(container)
 
-        // Bouncing animation
-        val bounceHandler = Handler(Looper.getMainLooper())
+        // Bouncing animation — uses the class-level bounceHandler so it can be
+        // cancelled by hideScreensaver() / onDestroy() (BUG-15).
+        bounceHandler.removeCallbacksAndMessages(null)
         bounceHandler.post(object : Runnable {
             private var dx = BOUNCE_STEP_PX
             private var dy = BOUNCE_STEP_PX
@@ -131,6 +144,7 @@ abstract class BaseActivity : FragmentActivity() {
 
     protected fun hideScreensaver() {
         isScreensaverActive = false
+        bounceHandler.removeCallbacksAndMessages(null)   // stop the bounce loop (BUG-15)
         window.decorView.findViewWithTag<View>(SCREENSAVER_TAG)?.let { overlay ->
             (overlay.parent as? ViewGroup)?.removeView(overlay)
         }

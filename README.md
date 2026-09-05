@@ -38,4 +38,18 @@ Built using Kotlin, AndroidX Media3 (ExoPlayer), and Leanback.
 *   `eu.agno3.jcifs:jcifs-ng`
 
 ---
+
+## License
+
+BitperfectPlayer is licensed under the **GNU General Public License v3.0** (GPL-3.0). See [LICENSE](LICENSE) for the full text.
+
+The app incorporates third-party code that requires copyleft licensing:
+
+*   **sacd-ripper** (`libsacd`, `libcommon`, `libdstdec`) — GPL-2.0-or-later.
+*   **FFmpeg** (`dsd.c`/`dsd.h`, `libavutil`) — LGPL-2.1-or-later.
+*   **jcifs-ng** — LGPL-2.1 — SMB/CIFS networking.
+*   **AndroidX Media3** and **OkHttp** — Apache-2.0.
+*   **Bouncy Castle** — MIT.
+
+Full attribution is in [NOTICE](NOTICE).
 *Developed for audiophiles who want the best sound quality on their Stereo System.*
