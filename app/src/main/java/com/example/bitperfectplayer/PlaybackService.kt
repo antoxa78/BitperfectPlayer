@@ -277,6 +277,15 @@ class PlaybackService : MediaSessionService() {
             if (removedDevices.any(::isUsb)) {
                 Log.i(TAG, "USB audio device removed — clearing bit-perfect state")
                 bitPerfectManager.clear()
+                // The vendored usbdevfs driver (decent-player) has no disconnect
+                // detection of its own — its native engine only reacts to I/O
+                // errors on its next transfer, which may not happen promptly (or
+                // at all, if playback is paused) after a physical unplug. Without
+                // this, usbDriverOwnsDac can stay stale-true and every other DAC-
+                // losing path here (pause/idle/screen off/onDestroy) already pairs
+                // bitPerfectManager.clear() with releaseUsbDriverDac() — this was
+                // the one asymmetric spot.
+                releaseUsbDriverDac()
             }
         }
     }
@@ -701,6 +710,42 @@ class PlaybackService : MediaSessionService() {
                     .commit()
             }
         }
+    }
+
+    /**
+     * Releases every resource that exclusively claims the DAC and invokes
+     * [onReleased] once it is actually safe to kill the process — not merely
+     * once release has been *requested*. For a caller about to call
+     * System.exit(0) (the Exit menu / back-button confirmation in MainFragment):
+     * stopService()/Service.onDestroy() run asynchronously on the main looper,
+     * so calling System.exit(0) right after them is a race process death
+     * usually wins — exactly like BUG-6 for saveCurrentPositionSync(), but for
+     * the DAC instead of the saved position.
+     *
+     * A short fixed delay is not enough to fix that race: releaseUsbForIdle()
+     * only kicks off a USBDEVFS_RESET soft-replug on the driver's own release
+     * thread, and the kernel can take up to USB_REBIND_MAX_WAIT_MS to re-probe
+     * and re-register the USB sound card afterward — the same window
+     * applyOutputModeAudioReset() already blocks on before it will reuse the
+     * DAC. This does the same wait (bounded, so Exit can never hang forever)
+     * on a background thread and calls [onReleased] there — callers should
+     * treat that as "now it's safe", not the main thread.
+     */
+    fun prepareForProcessExit(onReleased: () -> Unit) {
+        try { mediaSession?.player?.stop() } catch (_: Exception) {}
+        bitPerfectManager.clear()
+        val sink = usbAudioSink
+        val cardsBefore = sndCards()
+        if (!releaseUsbDriverDac() || sink == null) {
+            // Nothing was actually released (not owning the DAC, or not in
+            // usbdevfs mode) — no rebind to wait for.
+            onReleased()
+            return
+        }
+        Thread({
+            waitForUsbRebind(sink, cardsBefore)
+            onReleased()
+        }, "exitDacRelease").start()
     }
 
     /**
@@ -1341,6 +1386,13 @@ class PlaybackService : MediaSessionService() {
         instance = null
         saveCurrentPosition()
         bitPerfectManager.clear()
+        // Hand the DAC back to the system HAL if the usbdevfs driver still owns it.
+        // bitPerfectManager.clear() only undoes the Android-mixer bit-perfect path
+        // (AUDIO_OUTPUT_BITPERFECT_ANDROID); without this, a service teardown while
+        // AUDIO_OUTPUT_USBDEVFS (the default mode) is streaming leaves the driver's
+        // raw usbfs claim on the DAC in place, so every other app trying to use that
+        // DAC stays silent even though this app has exited.
+        releaseUsbDriverDac()
         resetIcyInfo(null)
         try { mpdServer?.stop() } catch (_: Exception) {}
         mpdServer = null

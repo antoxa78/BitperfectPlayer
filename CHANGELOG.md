@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.3 - 2026-09-05
+
+### Fixed
+
+- **Still no sound in other apps after Exit (3.0.1's fix was insufficient):** `prepareForProcessExit()` requested the DAC release but only waited a fixed 300ms before calling `System.exit(0)`. `releaseUsbForIdle()` merely kicks off a USBDEVFS_RESET soft-replug on a background thread — the kernel can take several seconds to re-probe and re-register the USB sound card afterward (the same window `applyOutputModeAudioReset()` already blocks on for the Settings → Audio Output switch). 300ms was nowhere near enough, so the process was still usually killed mid-reset. `prepareForProcessExit()` now takes a completion callback and does the same bounded wait-for-rebind (`waitForUsbRebind`, capped at 10s) on a background thread; both Exit handlers in `MainFragment.kt` (back-button confirmation and Settings menu) now call `System.exit(0)` from that callback instead of after a fixed delay. Exit can take noticeably longer in the worst case (up to ~10s) since it now genuinely waits for the kernel hand-back, but the app UI closes immediately either way.
+- **USB DAC unplugged mid-stream could leave a stale exclusive claim:** `onAudioDevicesRemoved` (fired when the system notices the USB audio device disappear) only called `bitPerfectManager.clear()`, unlike every other DAC-losing path (pause, idle/ended, screen off/on, onDestroy, exit) which also calls `releaseUsbDriverDac()`. The vendored usbdevfs driver has no disconnect detection of its own, so a physical unplug while it owned the DAC could leave `usbDriverOwnsDac` stale. Now calls `releaseUsbDriverDac()` too.
+
 ## 3.0.2 - 2026-09-05
 
 ### Fixed

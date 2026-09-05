@@ -129,11 +129,26 @@ class MainFragment : BrowseSupportFragment() {
                                     PlaybackService.instance?.stopPlaybackKeepLanControl()
                                     activity?.finishAffinity()
                                 } else {
+                                    // Request the DAC release before killing the process.
+                                    // releaseUsbForIdle() only starts a USBDEVFS_RESET soft-
+                                    // replug on a background thread — the kernel can take
+                                    // several seconds to re-probe the USB sound card
+                                    // afterward (the same window applyOutputModeAudioReset()
+                                    // already waits out). A short fixed delay before
+                                    // System.exit(0) was not enough for that race; wait for
+                                    // the (bounded) release instead, or the usbdevfs driver's
+                                    // exclusive USB claim stays in place, silencing every
+                                    // other app on that DAC until it is replugged.
                                     activity?.stopService(
                                         android.content.Intent(requireContext(), PlaybackService::class.java)
                                     )
                                     activity?.finishAffinity()
-                                    System.exit(0)
+                                    val service = PlaybackService.instance
+                                    if (service != null) {
+                                        service.prepareForProcessExit { System.exit(0) }
+                                    } else {
+                                        System.exit(0)
+                                    }
                                 }
                             }
                             .setNegativeButton("No", null)
@@ -3155,9 +3170,23 @@ class MainFragment : BrowseSupportFragment() {
                             PlaybackService.instance?.stopPlaybackKeepLanControl()
                             activity?.finishAffinity()
                         } else {
+                            // Request the DAC release before killing the process.
+                            // releaseUsbForIdle() only starts a USBDEVFS_RESET soft-replug
+                            // on a background thread — the kernel can take several seconds
+                            // to re-probe the USB sound card afterward (the same window
+                            // applyOutputModeAudioReset() already waits out). A short fixed
+                            // delay before System.exit(0) was not enough for that race;
+                            // wait for the (bounded) release instead, or the usbdevfs
+                            // driver's exclusive USB claim stays in place, silencing every
+                            // other app on that DAC until it is replugged.
                             activity?.stopService(android.content.Intent(requireContext(), PlaybackService::class.java))
                             activity?.finishAffinity()
-                            System.exit(0)
+                            val service = PlaybackService.instance
+                            if (service != null) {
+                                service.prepareForProcessExit { System.exit(0) }
+                            } else {
+                                System.exit(0)
+                            }
                         }
                     }
                     .setNegativeButton("No", null)
