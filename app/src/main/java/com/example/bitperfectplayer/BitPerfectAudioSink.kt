@@ -232,7 +232,16 @@ class BitPerfectAudioSink(
 
     override fun enableTunnelingV21() {
         tunneling = true
-        if (directMode) releaseDirectTrack()
+        if (directMode) {
+            releaseDirectTrack()
+            // Tunneling disqualifies direct mode (see isDirectCandidate()'s own
+            // tunneling check) — clear the flag here too, not just the track,
+            // or a handleBuffer() call arriving before the next configure()
+            // would silently rebuild a non-tunneled direct AudioTrack from the
+            // stale format instead of routing to the delegate.
+            directMode = false
+            directFormat = null
+        }
         delegate.enableTunnelingV21()
     }
 
@@ -368,7 +377,12 @@ class BitPerfectAudioSink(
         directTrack = null
         directConfig = null
         try { track.pause() } catch (_: Exception) {}
-        track.release()
+        // release() can throw on a track already in a bad state (e.g. dead
+        // object after the DAC drops mid-stream) — guard it like pause() above
+        // so teardown always completes and callers on ExoPlayer's playback
+        // thread (reset(), configure(), setAudioAttributes(), etc.) never
+        // crash mid-recovery.
+        try { track.release() } catch (_: Exception) {}
         bitPerfectManager.clear()
         if (config != null) listener?.onAudioTrackReleased(config)
     }

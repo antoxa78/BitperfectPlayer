@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.0.2 - 2026-09-05
+
+### Fixed
+
+- **Tunneling could silently rebuild a non-tunneled direct AudioTrack:** `BitPerfectAudioSink.enableTunnelingV21()` released the active direct track but left `directMode` set, so a `handleBuffer()` call arriving before the next `configure()` would re-create a plain direct `AudioTrack` from the stale format instead of routing to the (tunneled) delegate — contradicting `isDirectCandidate()`'s own tunneling check. `directMode`/`directFormat` are now cleared in the same step as the track.
+- **A dead `AudioTrack` could crash mid-teardown:** `releaseDirectTrack()` guarded `track.pause()` against exceptions but called `track.release()` unguarded; a track already in a bad state (e.g. dead object after the DAC drops mid-stream) could throw out of `reset()`/`configure()`/`setAudioAttributes()`/tunneling changes on ExoPlayer's playback thread. `release()` is now wrapped the same way as `pause()`.
+
+## 3.0.1 - 2026-09-05
+
+### Fixed
+
+- **No sound in other apps after exiting the player:** `PlaybackService.onDestroy()` cleared the Android bit-perfect mixer preference but never released the usbdevfs driver's exclusive USB claim on the DAC, so exiting while that mode (the default) was streaming left the DAC unusable for every other app. Worse, both Exit actions (back-button confirmation and the Settings menu) called `System.exit(0)` on the same tick as `stopService()`, which almost always won the race against the service's own (async) teardown and the driver's background release thread. `onDestroy()` now also calls `releaseUsbDriverDac()`, and the Exit handlers request the release synchronously via a new `PlaybackService.prepareForProcessExit()` and give it a short grace period before killing the process.
+
 ## 3.0.0 - 2026-09-05
 
 ### Added
