@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.0.4 - 2026-09-06
+
+### Fixed
+
+- **Still no sound in other apps after Exit on some devices (root cause):** `UsbAudioDevice.resetUsbDevice()` — the function that hands the DAC back to the system — issued `USBDEVFS_RESET` *before* releasing this app's force-claimed interfaces, with the actual release happening only afterward. While an interface is still claimed via usbfs there is no kernel driver attached to it for the reset's rebind cycle to act on, so the kernel simply preserved the app's own claim straight through the reset; releasing a moment later did not itself trigger a fresh driver probe. The DAC was therefore never genuinely handed back on any Exit, even though the process had already terminated — only a real physical unplug/replug (a from-scratch enumeration) actually restored other apps' sound. `resetUsbDevice()` now releases the streaming and control interfaces first, then resets, then closes the connection.
+- **USB rebind detection could falsely report success or exhaust its entire wait doing nothing:** on devices where `/dev/snd` cannot be listed at all (e.g. SELinux-restricted), the post-exit rebind wait had no way to detect the DAC coming back and either gave up after a blind fixed grace or, worse, could spend its whole 10s budget stuck waiting on the driver's internal "release in flight" flag before ever checking for the device — leaving zero time to actually observe the rebind. Detection now falls back to `AudioDeviceCallback.onAudioDevicesAdded` on those devices, registered up front and raced against every wait phase (not only consulted afterward), and a short settle delay is added once a rebind is observed before the process actually exits, matching how the app already treats that same event elsewhere (`USB_SETTLE_MS`) rather than acting on it instantly.
+
+### Removed
+
+- **Settings → Debug Log:** the on-device, adb-free log viewer added while diagnosing the above (needed because wireless debugging disables the USB port entirely on some Android TV boxes, making logcat unavailable with the DAC connected). No longer needed now that the underlying bug is fixed.
+
 ## 3.0.3 - 2026-09-05
 
 ### Fixed

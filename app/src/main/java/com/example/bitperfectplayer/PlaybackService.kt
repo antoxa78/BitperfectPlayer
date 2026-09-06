@@ -54,6 +54,7 @@ import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -109,9 +110,6 @@ class PlaybackService : MediaSessionService() {
         // wedge card 0 (silent until a physical replug), while a missed detection
         // must never stall the mode switch for long.
         private const val USB_REBIND_MAX_WAIT_MS = 10_000L
-        // Fixed grace used when /dev/snd cannot be listed (the unbind/rebind is
-        // unobservable) — long enough for the kernel to re-probe a slow TV box.
-        private const val USB_REBIND_GRACE_MS = 2_000L
         // Startup find-USB retry: the DAC can be mid-re-enumeration when the
         // service starts (esp. after our USBDEVFS_RESET soft-replug), so the
         // first probe can miss it. Retry a few times; a soft reset does not
@@ -185,6 +183,115 @@ class PlaybackService : MediaSessionService() {
          */
         @Volatile var icyInfo: IcyStreamInfo? = null
             private set
+
+        // ── On-device debug log (no adb required) ───────────────────────────
+        // Some devices (e.g. Mi Box S on Android TV 14) disable the USB port
+        // entirely while wireless debugging is on, and have no way to run
+        // USB debugging with a USB DAC attached at the same time — logcat is
+        // unavailable at exactly the moment the usbdevfs exit/DAC-release
+        // path needs to be observed. This mirrors the relevant Log.i() calls
+        // into a small on-disk file that Settings → Debug Log can display
+        // directly on the TV, independent of adb.
+        private const val DEBUG_LOG_FILE = "exit_debug.log"
+        private const val DEBUG_LOG_MAX_BYTES = 50_000
+        private val debugLogLock = Any()
+
+        // App-specific external storage (/storage/emulated/0/Android/data/<pkg>/files/)
+        // rather than internal filesDir: this directory needs no permission on API 19+,
+        // but critically it's readable via a plain `adb pull` — internal filesDir would
+        // require `run-as` (only works on a debuggable build) or root. This lets the
+        // user reproduce the bug with the DAC connected and adb fully disabled, then
+        // re-enable adb afterward (once the app has exited and the DAC is no longer
+        // needed) just to pull the file — no run-as, no root. Falls back to filesDir
+        // in the rare case external storage is unavailable (e.g. unmounted).
+        private fun debugLogDir(context: Context): File =
+            context.getExternalFilesDir(null) ?: context.filesDir
+
+        fun appendDebugLog(context: Context, message: String) {
+            Log.i(TAG, message)
+            synchronized(debugLogLock) {
+                try {
+                    val file = File(debugLogDir(context), DEBUG_LOG_FILE)
+                    val timestamp = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+                        .format(java.util.Date())
+                    file.appendText("$timestamp  $message\n")
+                    if (file.length() > DEBUG_LOG_MAX_BYTES) {
+                        val tail = file.readText().takeLast(DEBUG_LOG_MAX_BYTES / 2)
+                        file.writeText(tail)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "appendDebugLog failed: ${e.message}")
+                }
+            }
+        }
+
+        /** Reads the on-disk debug log for display in Settings → Debug Log. */
+        fun readDebugLog(context: Context): String = synchronized(debugLogLock) {
+            try {
+                val file = File(debugLogDir(context), DEBUG_LOG_FILE)
+                if (file.exists()) {
+                    // Leading path line so the adb pull target is visible right on the
+                    // TV screen without needing to derive it from the package name.
+                    "Log file: ${file.absolutePath}\n\n" +
+                        file.readText().ifBlank { "Debug log is empty." }
+                } else {
+                    "No debug log yet — exit the app once first, then check here.\n" +
+                        "(Will be written to ${file.absolutePath})"
+                }
+            } catch (e: Exception) {
+                "Failed to read debug log: ${e.message}"
+            }
+        }
+
+        /** Clears the on-disk debug log. */
+        fun clearDebugLog(context: Context) = synchronized(debugLogLock) {
+            try { File(debugLogDir(context), DEBUG_LOG_FILE).delete() } catch (_: Exception) {}
+        }
+
+        private fun audioDeviceTypeName(type: Int): String = when (type) {
+            AudioDeviceInfo.TYPE_USB_DEVICE -> "USB_DEVICE"
+            AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB_ACCESSORY"
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "USB_HEADSET"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "BUILTIN_SPEAKER"
+            AudioDeviceInfo.TYPE_HDMI -> "HDMI"
+            AudioDeviceInfo.TYPE_HDMI_ARC -> "HDMI_ARC"
+            else -> "TYPE_$type"
+        }
+
+        /**
+         * Live snapshot of every output device AudioManager (i.e. Android's audio
+         * policy layer — the same layer every other app's AudioTrack routes through)
+         * currently reports, with no adb and no filesystem access required. Added
+         * because on this hardware adb and the USB DAC are mutually exclusive
+         * (enabling wireless debugging disables the USB port entirely), so
+         * `adb shell dumpsys audio` can never be run while the bug is actually
+         * reproducible — this is the adb-free substitute: call it (e.g. from
+         * Settings → Debug Log) right after confirming another app has no sound,
+         * with BitperfectPlayer not currently playing, to see whether Android
+         * itself still considers the USB DAC a connected, available sink.
+         */
+        fun currentAudioOutputDevicesSnapshot(context: Context): String {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                ?: return "AudioManager unavailable"
+            val devices = try {
+                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            } catch (e: Exception) {
+                return "getDevices() failed: ${e.message}"
+            }
+            if (devices.isEmpty()) return "AudioManager reports NO output devices at all (unusual — even the built-in speaker should normally be listed)."
+            val hasUsb = devices.any {
+                it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                    it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            }
+            val lines = devices.joinToString("\n") { d ->
+                "  type=${audioDeviceTypeName(d.type)} id=${d.id} name=${d.productName} " +
+                    "channelCounts=${d.channelCounts.toList()} " +
+                    "encodings=${d.encodings.toList()} " +
+                    "sampleRates=${d.sampleRates.toList()}"
+            }
+            return "USB DAC present in AudioManager's output device list: $hasUsb\n$lines"
+        }
     }
 
     // ── USB DAC monitoring ────────────────────────────────────────────────────
@@ -442,9 +549,96 @@ class PlaybackService : MediaSessionService() {
         Log.i(TAG, "Player rebuilt in audio output mode $mode")
     }
 
-    /** `/dev/snd` control cards (controlC0, controlC1, …) currently registered. */
-    private fun sndCards(): Set<String> =
-        File("/dev/snd").list()?.filterTo(HashSet()) { it.startsWith("controlC") } ?: emptySet()
+    /**
+     * `/dev/snd` control cards (controlC0, controlC1, …) currently registered,
+     * or null if `/dev/snd` itself could not be listed (permission/IO error —
+     * genuinely unobservable). Kept distinct from an empty-but-listable result:
+     * the usbdevfs driver's force=true interface claims detach the kernel's
+     * snd-usb-audio driver for as long as it owns the DAC, so a *listable*
+     * /dev/snd legitimately has zero controlC entries for that device the
+     * entire time it is actively streaming — that is not the same situation
+     * as not being able to read the directory at all, and waitForUsbRebind()
+     * needs to tell them apart.
+     */
+    private fun sndCardsOrNull(): Set<String>? =
+        File("/dev/snd").list()?.filterTo(HashSet()) { it.startsWith("controlC") }
+
+    private fun sndCards(): Set<String> = sndCardsOrNull() ?: emptySet()
+
+    /**
+     * Holds a fresh, one-shot AudioDeviceCallback registration used only to
+     * detect a USB audio device becoming available again while waiting for the
+     * post-exit USB rebind — see [registerUsbDeviceAddedWatcher].
+     */
+    private class UsbDeviceAddedWatcher(
+        private val audioManager: AudioManager,
+        private val callback: AudioDeviceCallback,
+        val latch: CountDownLatch
+    ) {
+        val fired: Boolean get() = latch.count == 0L
+        fun unregister() {
+            try { audioManager.unregisterAudioDeviceCallback(callback) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Permission-free fallback for detecting the USB DAC coming back, for devices
+     * where /dev/snd cannot be listed at all (confirmed via on-device log on a
+     * Xiaomi Mi Box S / Android TV 14 — sndCardsOrNull() is always null there,
+     * almost certainly SELinux). AudioDeviceCallback.onAudioDevicesAdded fires
+     * when the audio HAL/policy actually opens the USB device again, which is
+     * independent of whether this app can read /dev/snd.
+     *
+     * Deliberately registered as a *fresh, one-shot* callback here rather than
+     * reusing [usbDeviceCallback]: that one is unregistered from onDestroy(),
+     * which runs on the main thread almost immediately after
+     * prepareForProcessExit() is invoked (MainFragment calls stopService()
+     * first), so waiting on it here would race onDestroy() and likely never
+     * see the event. This callback is registered directly against AudioManager
+     * with its own Handler on the main Looper, so it keeps working for the
+     * rest of the process's life regardless of the service's own teardown —
+     * exactly the window needed here (up to USB_REBIND_MAX_WAIT_MS before
+     * System.exit(0)).
+     *
+     * Returns null (nothing to wait on) if AudioManager isn't reachable or
+     * registration itself throws.
+     */
+    private fun registerUsbDeviceAddedWatcher(): UsbDeviceAddedWatcher? {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
+        val latch = CountDownLatch(1)
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
+                val usbDevice = addedDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                        it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                        it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+                if (usbDevice != null) {
+                    // Log what was actually reported, not just a boolean — if this
+                    // event turns out not to be a reliable signal of real usability
+                    // (observed on-device: other apps still silent afterward), the
+                    // device's own reported channel/encoding lists here are the next
+                    // best evidence of whether Android considered it fully populated
+                    // at the moment it fired.
+                    appendDebugLog(
+                        this@PlaybackService,
+                        "registerUsbDeviceAddedWatcher: onAudioDevicesAdded fired for " +
+                            "type=${usbDevice.type} id=${usbDevice.id} name=${usbDevice.productName} " +
+                            "channelCounts=${usbDevice.channelCounts.toList()} " +
+                            "encodings=${usbDevice.encodings.toList()}"
+                    )
+                    latch.countDown()
+                }
+            }
+        }
+        return try {
+            audioManager.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
+            UsbDeviceAddedWatcher(audioManager, callback, latch)
+        } catch (e: Exception) {
+            appendDebugLog(this, "registerUsbDeviceAddedWatcher: failed: ${e.message}")
+            null
+        }
+    }
 
     /**
      * Waits (blocking the calling background thread) for the DAC's USB sound card
@@ -456,52 +650,104 @@ class PlaybackService : MediaSessionService() {
      * re-registers under the SAME controlC index, so "a new name appeared" is not a
      * reliable signal. Instead we first wait for a card that was present before the
      * reset to disappear (unbind), then for a card to come back (rebind). Both stages
-     * are bounded by [USB_REBIND_MAX_WAIT_MS]; when /dev/snd is not listable the wait
-     * degenerates to a short fixed grace so the mode switch is never stalled (BUG-21).
-     * The caller always rebuilds the player afterwards — a missed detection only
-     * skips the extra grace period, it never blocks forever.
+     * are bounded by [USB_REBIND_MAX_WAIT_MS]. If /dev/snd starts out empty because
+     * the usbdevfs driver's force claim had the kernel driver detached (the normal
+     * state while it streams), this instead waits for a controlC entry to appear;
+     * if /dev/snd is not listable at all (permission/IO error — genuinely
+     * unobservable, distinguished via sndCardsOrNull()), detection falls back to
+     * an [UsbDeviceAddedWatcher] (AudioDeviceCallback), which is unaffected by
+     * /dev/snd access. All paths are still bounded by [USB_REBIND_MAX_WAIT_MS], so
+     * the caller is never stalled past that; the caller always proceeds afterwards
+     * regardless of the result — a missed detection only skips the confidence of a
+     * confirmed rebind, it never blocks forever.
      *
-     * @return true when an unbind+rebind was actually observed.
+     * The watcher is registered up front, before the isIdleReleaseInFlight() gate
+     * below, and raced against every subsequent step rather than only consulted
+     * afterward. On-device evidence showed why this matters: after a rapid
+     * pause/resume/underrun cycle right before Exit, isIdleReleaseInFlight() was
+     * observed staying true for the *entire* 10s budget, which — when the
+     * callback was only registered after that gate cleared — left zero time to
+     * actually detect the rebind at all (reboundObserved=false after exactly
+     * 10059ms). Listening from the start means a rebind that happens during that
+     * gate is still caught immediately instead of being missed or racing an
+     * already-expired deadline.
+     *
+     * @return true when the kernel re-registering the sound card was actually observed.
      */
     private fun waitForUsbRebind(
         sink: com.decent.usbaudio.media3.UsbAudioSink,
         cardsBefore: Set<String>
     ): Boolean {
         val deadline = SystemClock.uptimeMillis() + USB_REBIND_MAX_WAIT_MS
-
-        // The unbind can only happen once the release thread has run resetUsbDevice(),
-        // so first wait for any in-flight release to finish.
-        while (sink.isIdleReleaseInFlight() && SystemClock.uptimeMillis() < deadline) {
-            if (!sleepQuietly(10)) return false
-        }
-
-        // /dev/snd not observable: fall back to a fixed grace so the kernel has time
-        // to re-probe, then let the caller proceed.
-        if (cardsBefore.isEmpty()) {
-            sleepQuietly(USB_REBIND_GRACE_MS)
-            return false
-        }
-
-        // Stage 1: the old USB card unbinds — a card we saw before disappears, or a
-        // replacement card appears (the rebind can outpace our 100 ms polling).
-        var sawUnbind = false
-        while (SystemClock.uptimeMillis() < deadline) {
-            val now = sndCards()
-            if (now.isEmpty() || now.size < cardsBefore.size || now.any { it !in cardsBefore }) {
-                sawUnbind = true
-                break
+        val watcher = registerUsbDeviceAddedWatcher()
+        try {
+            // The unbind can only happen once the release thread has run resetUsbDevice(),
+            // so first wait for any in-flight release to finish — but never let this alone
+            // consume the whole budget; watcher (if any) is already listening throughout.
+            while (sink.isIdleReleaseInFlight() && SystemClock.uptimeMillis() < deadline) {
+                if (watcher?.fired == true) {
+                    appendDebugLog(this, "waitForUsbRebind: USB device re-added while release still in flight")
+                    return true
+                }
+                if (!sleepQuietly(10)) return false
             }
-            if (!sleepQuietly(100)) return false
-        }
-        if (!sawUnbind) return false
+            if (watcher?.fired == true) return true
 
-        // Stage 2: the USB card comes back. Accept the same or a different index.
-        while (SystemClock.uptimeMillis() < deadline) {
-            val now = sndCards()
-            if (now.isNotEmpty() && now.size >= cardsBefore.size) return true
-            if (!sleepQuietly(100)) return false
+            if (cardsBefore.isEmpty()) {
+                if (sndCardsOrNull() == null) {
+                    // /dev/snd genuinely not observable (permission/IO error, e.g.
+                    // SELinux-blocked on some Android TV boxes) — /dev/snd polling
+                    // can never work here. Fall back to AudioDeviceCallback, which
+                    // observes the audio HAL/policy layer instead of the filesystem.
+                    appendDebugLog(this, "waitForUsbRebind: /dev/snd not listable at all — waiting on AudioDeviceCallback instead")
+                    val remaining = deadline - SystemClock.uptimeMillis()
+                    val observed = watcher != null && (watcher.fired ||
+                        (remaining > 0 && watcher.latch.await(remaining, TimeUnit.MILLISECONDS)))
+                    appendDebugLog(this, "waitForUsbRebind: AudioDeviceCallback wait finished, observed=$observed")
+                    return observed
+                }
+                appendDebugLog(this, "waitForUsbRebind: /dev/snd listable but empty — polling for a card to appear")
+                // /dev/snd IS listable but currently has no controlC entry — the
+                // expected state while the usbdevfs driver owned the DAC (its
+                // force=true claim keeps the kernel driver detached the whole
+                // time it streams). This is the common case, not an edge case:
+                // wait for a card to actually appear instead of sleeping a fixed
+                // grace and declaring victory regardless — that previously let
+                // Exit report success and kill the process before the kernel
+                // driver had rebound at all, leaving system audio dead.
+                while (SystemClock.uptimeMillis() < deadline) {
+                    if (sndCards().isNotEmpty()) return true
+                    if (watcher?.fired == true) return true
+                    if (!sleepQuietly(100)) return false
+                }
+                return false
+            }
+
+            // Stage 1: the old USB card unbinds — a card we saw before disappears, or a
+            // replacement card appears (the rebind can outpace our 100 ms polling).
+            var sawUnbind = false
+            while (SystemClock.uptimeMillis() < deadline) {
+                val now = sndCards()
+                if (now.isEmpty() || now.size < cardsBefore.size || now.any { it !in cardsBefore }) {
+                    sawUnbind = true
+                    break
+                }
+                if (watcher?.fired == true) return true
+                if (!sleepQuietly(100)) return false
+            }
+            if (!sawUnbind) return watcher?.fired == true
+
+            // Stage 2: the USB card comes back. Accept the same or a different index.
+            while (SystemClock.uptimeMillis() < deadline) {
+                val now = sndCards()
+                if (now.isNotEmpty() && now.size >= cardsBefore.size) return true
+                if (watcher?.fired == true) return true
+                if (!sleepQuietly(100)) return false
+            }
+            return false
+        } finally {
+            watcher?.unregister()
         }
-        return false
     }
 
     private fun sleepQuietly(ms: Long): Boolean {
@@ -730,20 +976,61 @@ class PlaybackService : MediaSessionService() {
      * DAC. This does the same wait (bounded, so Exit can never hang forever)
      * on a background thread and calls [onReleased] there — callers should
      * treat that as "now it's safe", not the main thread.
+     *
+     * Ownership must be snapshotted *before* player.stop() below, not after:
+     * stop() synchronously fires onPlaybackStateChanged(STATE_IDLE), whose
+     * own listener already calls releaseUsbDriverDac() — so by the time this
+     * function went on to call it again afterward, usbDriverOwnsDac could
+     * already have flipped to false (the release was merely requested, not
+     * finished) and releaseUsbDriverDac() here would report "nothing to
+     * release", skipping the wait for a reset that is, in fact, still
+     * running. That silently reintroduced the exact race this function
+     * exists to close.
      */
     fun prepareForProcessExit(onReleased: () -> Unit) {
+        val sink = usbAudioSink
+        val wasOwned = usbDriverOwnsDac
+        val cardsBefore = sndCards()
+        appendDebugLog(this, "prepareForProcessExit: usbAudioSink=${sink != null} wasOwned=$wasOwned cardsBefore=$cardsBefore")
+
         try { mediaSession?.player?.stop() } catch (_: Exception) {}
         bitPerfectManager.clear()
-        val sink = usbAudioSink
-        val cardsBefore = sndCards()
-        if (!releaseUsbDriverDac() || sink == null) {
-            // Nothing was actually released (not owning the DAC, or not in
-            // usbdevfs mode) — no rebind to wait for.
+        releaseUsbDriverDac()
+
+        if (sink == null || !wasOwned) {
+            // The driver was not actively holding the DAC when Exit was
+            // pressed (not in usbdevfs mode, or already idle/paused) — there
+            // is nothing in flight to wait for.
+            appendDebugLog(this, "prepareForProcessExit: nothing to wait for — exiting immediately")
             onReleased()
             return
         }
+        val startedAt = SystemClock.uptimeMillis()
+        appendDebugLog(this, "prepareForProcessExit: waiting for USB rebind before exit")
         Thread({
-            waitForUsbRebind(sink, cardsBefore)
+            val rebound = waitForUsbRebind(sink, cardsBefore)
+            if (rebound) {
+                // On-device evidence: reboundObserved=true fired only 150-350ms after
+                // AudioDeviceCallback.onAudioDevicesAdded, yet other apps still had no
+                // sound afterward. That event is not trusted this fast anywhere else in
+                // this codebase — normal USB attach handling deliberately waits
+                // USB_SETTLE_MS after the same "device added" signal before touching the
+                // device, because the HAL/policy reports it before it is actually stable.
+                // Exiting (killing the whole process, including any native driver
+                // cleanup still finishing the handoff) within a few hundred ms of that
+                // same raw signal was very likely premature. Give it the same settle
+                // time used elsewhere before treating the rebind as durable.
+                appendDebugLog(this, "prepareForProcessExit: rebind observed — settling ${USB_SETTLE_MS}ms before exit")
+                sleepQuietly(USB_SETTLE_MS)
+            }
+            appendDebugLog(this, "prepareForProcessExit: wait finished after " +
+                "${SystemClock.uptimeMillis() - startedAt}ms, reboundObserved=$rebound — exiting now")
+            // Captured from inside this (about to die) process, right before exit —
+            // the most direct evidence available, with no adb needed, of whether
+            // Android's audio policy still considers the USB DAC an available sink
+            // at the exact moment we hand control back.
+            appendDebugLog(this, "prepareForProcessExit: final device snapshot:\n" +
+                currentAudioOutputDevicesSnapshot(this))
             onReleased()
         }, "exitDacRelease").start()
     }

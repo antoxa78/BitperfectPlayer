@@ -27,8 +27,8 @@ android {
         applicationId = "com.github.antoxa78.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 48
-        versionName = "3.0.3"
+        versionCode = 49
+        versionName = "3.0.4"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -63,6 +63,14 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Distinguishes this build in Settings → About (reads versionName)
+            // so it's obvious which APK is actually installed when comparing
+            // test results against a release build. Same applicationId as
+            // release (no suffix) so `adb install -r` upgrades in place and
+            // keeps settings/playlist/DAC preferences instead of resetting them.
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
