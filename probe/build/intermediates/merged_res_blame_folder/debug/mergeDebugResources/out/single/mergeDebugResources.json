@@ -1,0 +1,6 @@
+[
+    {
+        "merged": "com.example.usbclaimprobe-debug-19:/xml_usb_audio_device_filter.xml.flat",
+        "source": "com.example.usbclaimprobe-main-21:/xml/usb_audio_device_filter.xml"
+    }
+]

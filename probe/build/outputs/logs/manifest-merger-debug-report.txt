@@ -1,0 +1,211 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:2:1-28:12
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:2:1-28:12
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:2:1-28:12
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:2:1-28:12
+MERGED from [androidx.appcompat:appcompat-resources:1.6.1] /home/anton/.gradle/caches/9.5.0/transforms/d6360943461ea0c6d55c330e5fabd621/transformed/appcompat-resources-1.6.1/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.appcompat:appcompat:1.6.1] /home/anton/.gradle/caches/9.5.0/transforms/d75aaaa2e9f5c156ce87d2d3cf75e4f5/transformed/appcompat-1.6.1/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.fragment:fragment:1.3.6] /home/anton/.gradle/caches/9.5.0/transforms/e27a3faea7ac74b4007eb7b713e5d806/transformed/fragment-1.3.6/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.activity:activity:1.6.0] /home/anton/.gradle/caches/9.5.0/transforms/b2da4114886559b2976aa86fc35e195c/transformed/activity-1.6.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.drawerlayout:drawerlayout:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/dc2f3ae28f88962536307c80215f4484/transformed/drawerlayout-1.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.emoji2:emoji2-views-helper:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/df6bfd7d46642f85f22bfb683c4df193/transformed/emoji2-views-helper-1.2.0/AndroidManifest.xml:2:1-7:12
+MERGED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:17:1-35:12
+MERGED from [androidx.vectordrawable:vectordrawable-animated:1.1.0] /home/anton/.gradle/caches/9.5.0/transforms/b78fc6006bdffe9f6306b81a97db6e22/transformed/vectordrawable-animated-1.1.0/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.vectordrawable:vectordrawable:1.1.0] /home/anton/.gradle/caches/9.5.0/transforms/23b537044a493ab4a07c21a39127384e/transformed/vectordrawable-1.1.0/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.viewpager:viewpager:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/d97a6f326bea388909a80f1e39fe173e/transformed/viewpager-1.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.customview:customview:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/dea6a5f3639bb2ce2d40710bf70ca018/transformed/customview-1.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.loader:loader:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/7a619785fcd8abe2767abc445734afb9/transformed/loader-1.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:17:1-30:12
+MERGED from [androidx.lifecycle:lifecycle-viewmodel:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/450fc0da39523d9721c4e47310a623f9/transformed/lifecycle-viewmodel-2.5.1/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.lifecycle:lifecycle-viewmodel-savedstate:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/2257413d11741c16760ad33848396e91/transformed/lifecycle-viewmodel-savedstate-2.5.1/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.core:core-ktx:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/624fec1be1b4866017a3713623b9dcd5/transformed/core-ktx-1.10.1/AndroidManifest.xml:2:1-7:12
+MERGED from [androidx.savedstate:savedstate:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/894a3545d47965fb389a81e0cd4319b1/transformed/savedstate-1.2.0/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.annotation:annotation-experimental:1.3.0] /home/anton/.gradle/caches/9.5.0/transforms/1ea2dff0475a3d23311ae215eb1d10d4/transformed/annotation-experimental-1.3.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.cursoradapter:cursoradapter:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/3c1f9d62de20bca28d2cd074c1ac283b/transformed/cursoradapter-1.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:17:1-37:12
+MERGED from [androidx.lifecycle:lifecycle-runtime:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/830ed4bfc3c007ba882aae875886caba/transformed/lifecycle-runtime-2.5.1/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.interpolator:interpolator:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/2c4ea0a8464b388424afff91b2acba87/transformed/interpolator-1.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/d6611be1e9874307f136e0ecf38ef67b/transformed/versionedparcelable-1.1.1/AndroidManifest.xml:17:1-27:12
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:17:1-33:12
+MERGED from [androidx.tracing:tracing:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/205c20a94eff7c9975890d9137a834fc/transformed/tracing-1.0.0/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.lifecycle:lifecycle-livedata:2.0.0] /home/anton/.gradle/caches/9.5.0/transforms/b9ae4d4d2d1a77514733337a10ba144b/transformed/lifecycle-livedata-2.0.0/AndroidManifest.xml:17:1-22:12
+MERGED from [androidx.lifecycle:lifecycle-livedata-core:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/a0b54ff5b23716d6590c4665b1f3eb02/transformed/lifecycle-livedata-core-2.5.1/AndroidManifest.xml:17:1-24:12
+MERGED from [androidx.arch.core:core-runtime:2.1.0] /home/anton/.gradle/caches/9.5.0/transforms/6deefe5413214eb37d7831b6189e7d00/transformed/core-runtime-2.1.0/AndroidManifest.xml:17:1-24:12
+	package
+		INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+	android:versionName
+		INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+	android:versionCode
+		INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+	xmlns:android
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:2:11-69
+uses-feature#android.hardware.usb.host
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:4:5-87
+	android:required
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:4:60-84
+	android:name
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:4:19-59
+application
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:6:5-26:19
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:6:5-26:19
+MERGED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:23:5-33:19
+MERGED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:23:5-33:19
+MERGED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:28:5-89
+MERGED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:28:5-89
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:25:5-35:19
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:25:5-35:19
+MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/d6611be1e9874307f136e0ecf38ef67b/transformed/versionedparcelable-1.1.1/AndroidManifest.xml:24:5-25:19
+MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/d6611be1e9874307f136e0ecf38ef67b/transformed/versionedparcelable-1.1.1/AndroidManifest.xml:24:5-25:19
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:25:5-31:19
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:25:5-31:19
+	android:extractNativeLibs
+		INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+	android:appComponentFactory
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:28:18-86
+	android:supportsRtl
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:9:9-35
+	android:label
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:8:9-38
+	android:allowBackup
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:7:9-36
+	android:theme
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:10:9-56
+activity#com.example.usbclaimprobe.MainActivity
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:12:9-25:20
+	android:exported
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:14:13-36
+	android:name
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:13:13-41
+intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:15:13-18:29
+action#android.intent.action.MAIN
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:16:17-69
+	android:name
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:16:25-66
+category#android.intent.category.LAUNCHER
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:17:17-77
+	android:name
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:17:27-74
+intent-filter#action:name:android.hardware.usb.action.USB_DEVICE_ATTACHED
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:19:13-21:29
+action#android.hardware.usb.action.USB_DEVICE_ATTACHED
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:20:17-90
+	android:name
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:20:25-87
+meta-data#android.hardware.usb.action.USB_DEVICE_ATTACHED
+ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:22:13-24:67
+	android:resource
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:24:17-64
+	android:name
+		ADDED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml:23:17-79
+uses-sdk
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+MERGED from [androidx.appcompat:appcompat-resources:1.6.1] /home/anton/.gradle/caches/9.5.0/transforms/d6360943461ea0c6d55c330e5fabd621/transformed/appcompat-resources-1.6.1/AndroidManifest.xml:20:5-44
+MERGED from [androidx.appcompat:appcompat-resources:1.6.1] /home/anton/.gradle/caches/9.5.0/transforms/d6360943461ea0c6d55c330e5fabd621/transformed/appcompat-resources-1.6.1/AndroidManifest.xml:20:5-44
+MERGED from [androidx.appcompat:appcompat:1.6.1] /home/anton/.gradle/caches/9.5.0/transforms/d75aaaa2e9f5c156ce87d2d3cf75e4f5/transformed/appcompat-1.6.1/AndroidManifest.xml:20:5-44
+MERGED from [androidx.appcompat:appcompat:1.6.1] /home/anton/.gradle/caches/9.5.0/transforms/d75aaaa2e9f5c156ce87d2d3cf75e4f5/transformed/appcompat-1.6.1/AndroidManifest.xml:20:5-44
+MERGED from [androidx.fragment:fragment:1.3.6] /home/anton/.gradle/caches/9.5.0/transforms/e27a3faea7ac74b4007eb7b713e5d806/transformed/fragment-1.3.6/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.fragment:fragment:1.3.6] /home/anton/.gradle/caches/9.5.0/transforms/e27a3faea7ac74b4007eb7b713e5d806/transformed/fragment-1.3.6/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.activity:activity:1.6.0] /home/anton/.gradle/caches/9.5.0/transforms/b2da4114886559b2976aa86fc35e195c/transformed/activity-1.6.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.activity:activity:1.6.0] /home/anton/.gradle/caches/9.5.0/transforms/b2da4114886559b2976aa86fc35e195c/transformed/activity-1.6.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.drawerlayout:drawerlayout:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/dc2f3ae28f88962536307c80215f4484/transformed/drawerlayout-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.drawerlayout:drawerlayout:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/dc2f3ae28f88962536307c80215f4484/transformed/drawerlayout-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.emoji2:emoji2-views-helper:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/df6bfd7d46642f85f22bfb683c4df193/transformed/emoji2-views-helper-1.2.0/AndroidManifest.xml:5:5-44
+MERGED from [androidx.emoji2:emoji2-views-helper:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/df6bfd7d46642f85f22bfb683c4df193/transformed/emoji2-views-helper-1.2.0/AndroidManifest.xml:5:5-44
+MERGED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:21:5-44
+MERGED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:21:5-44
+MERGED from [androidx.vectordrawable:vectordrawable-animated:1.1.0] /home/anton/.gradle/caches/9.5.0/transforms/b78fc6006bdffe9f6306b81a97db6e22/transformed/vectordrawable-animated-1.1.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.vectordrawable:vectordrawable-animated:1.1.0] /home/anton/.gradle/caches/9.5.0/transforms/b78fc6006bdffe9f6306b81a97db6e22/transformed/vectordrawable-animated-1.1.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.vectordrawable:vectordrawable:1.1.0] /home/anton/.gradle/caches/9.5.0/transforms/23b537044a493ab4a07c21a39127384e/transformed/vectordrawable-1.1.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.vectordrawable:vectordrawable:1.1.0] /home/anton/.gradle/caches/9.5.0/transforms/23b537044a493ab4a07c21a39127384e/transformed/vectordrawable-1.1.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.viewpager:viewpager:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/d97a6f326bea388909a80f1e39fe173e/transformed/viewpager-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.viewpager:viewpager:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/d97a6f326bea388909a80f1e39fe173e/transformed/viewpager-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.customview:customview:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/dea6a5f3639bb2ce2d40710bf70ca018/transformed/customview-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.customview:customview:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/dea6a5f3639bb2ce2d40710bf70ca018/transformed/customview-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.loader:loader:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/7a619785fcd8abe2767abc445734afb9/transformed/loader-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.loader:loader:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/7a619785fcd8abe2767abc445734afb9/transformed/loader-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:20:5-44
+MERGED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:20:5-44
+MERGED from [androidx.lifecycle:lifecycle-viewmodel:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/450fc0da39523d9721c4e47310a623f9/transformed/lifecycle-viewmodel-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.lifecycle:lifecycle-viewmodel:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/450fc0da39523d9721c4e47310a623f9/transformed/lifecycle-viewmodel-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.lifecycle:lifecycle-viewmodel-savedstate:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/2257413d11741c16760ad33848396e91/transformed/lifecycle-viewmodel-savedstate-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.lifecycle:lifecycle-viewmodel-savedstate:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/2257413d11741c16760ad33848396e91/transformed/lifecycle-viewmodel-savedstate-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.core:core-ktx:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/624fec1be1b4866017a3713623b9dcd5/transformed/core-ktx-1.10.1/AndroidManifest.xml:5:5-44
+MERGED from [androidx.core:core-ktx:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/624fec1be1b4866017a3713623b9dcd5/transformed/core-ktx-1.10.1/AndroidManifest.xml:5:5-44
+MERGED from [androidx.savedstate:savedstate:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/894a3545d47965fb389a81e0cd4319b1/transformed/savedstate-1.2.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.savedstate:savedstate:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/894a3545d47965fb389a81e0cd4319b1/transformed/savedstate-1.2.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.annotation:annotation-experimental:1.3.0] /home/anton/.gradle/caches/9.5.0/transforms/1ea2dff0475a3d23311ae215eb1d10d4/transformed/annotation-experimental-1.3.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.annotation:annotation-experimental:1.3.0] /home/anton/.gradle/caches/9.5.0/transforms/1ea2dff0475a3d23311ae215eb1d10d4/transformed/annotation-experimental-1.3.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.cursoradapter:cursoradapter:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/3c1f9d62de20bca28d2cd074c1ac283b/transformed/cursoradapter-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.cursoradapter:cursoradapter:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/3c1f9d62de20bca28d2cd074c1ac283b/transformed/cursoradapter-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:21:5-23:41
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:21:5-23:41
+MERGED from [androidx.lifecycle:lifecycle-runtime:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/830ed4bfc3c007ba882aae875886caba/transformed/lifecycle-runtime-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.lifecycle:lifecycle-runtime:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/830ed4bfc3c007ba882aae875886caba/transformed/lifecycle-runtime-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.interpolator:interpolator:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/2c4ea0a8464b388424afff91b2acba87/transformed/interpolator-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.interpolator:interpolator:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/2c4ea0a8464b388424afff91b2acba87/transformed/interpolator-1.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/d6611be1e9874307f136e0ecf38ef67b/transformed/versionedparcelable-1.1.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.versionedparcelable:versionedparcelable:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/d6611be1e9874307f136e0ecf38ef67b/transformed/versionedparcelable-1.1.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:21:5-23:41
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:21:5-23:41
+MERGED from [androidx.tracing:tracing:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/205c20a94eff7c9975890d9137a834fc/transformed/tracing-1.0.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.tracing:tracing:1.0.0] /home/anton/.gradle/caches/9.5.0/transforms/205c20a94eff7c9975890d9137a834fc/transformed/tracing-1.0.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.lifecycle:lifecycle-livedata:2.0.0] /home/anton/.gradle/caches/9.5.0/transforms/b9ae4d4d2d1a77514733337a10ba144b/transformed/lifecycle-livedata-2.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.lifecycle:lifecycle-livedata:2.0.0] /home/anton/.gradle/caches/9.5.0/transforms/b9ae4d4d2d1a77514733337a10ba144b/transformed/lifecycle-livedata-2.0.0/AndroidManifest.xml:20:5-44
+MERGED from [androidx.lifecycle:lifecycle-livedata-core:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/a0b54ff5b23716d6590c4665b1f3eb02/transformed/lifecycle-livedata-core-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.lifecycle:lifecycle-livedata-core:2.5.1] /home/anton/.gradle/caches/9.5.0/transforms/a0b54ff5b23716d6590c4665b1f3eb02/transformed/lifecycle-livedata-core-2.5.1/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.arch.core:core-runtime:2.1.0] /home/anton/.gradle/caches/9.5.0/transforms/6deefe5413214eb37d7831b6189e7d00/transformed/core-runtime-2.1.0/AndroidManifest.xml:20:5-22:41
+MERGED from [androidx.arch.core:core-runtime:2.1.0] /home/anton/.gradle/caches/9.5.0/transforms/6deefe5413214eb37d7831b6189e7d00/transformed/core-runtime-2.1.0/AndroidManifest.xml:20:5-22:41
+	android:targetSdkVersion
+		INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /home/anton/Documents/Programming_Projects/BitperfectPlayer/probe/src/main/AndroidManifest.xml
+provider#androidx.startup.InitializationProvider
+ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:24:9-32:20
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:26:9-34:20
+MERGED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:26:9-34:20
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:26:9-30:34
+MERGED from [androidx.startup:startup-runtime:1.1.1] /home/anton/.gradle/caches/9.5.0/transforms/ecf9bd67ea387900d7f195e6c799b655/transformed/startup-runtime-1.1.1/AndroidManifest.xml:26:9-30:34
+	tools:node
+		ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:28:13-31
+	android:authorities
+		ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:26:13-68
+	android:exported
+		ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:27:13-37
+	android:name
+		ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:25:13-67
+meta-data#androidx.emoji2.text.EmojiCompatInitializer
+ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:29:13-31:52
+	android:value
+		ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:31:17-49
+	android:name
+		ADDED from [androidx.emoji2:emoji2:1.2.0] /home/anton/.gradle/caches/9.5.0/transforms/5be13c26df076c23b9d17492bbafc201/transformed/emoji2-1.2.0/AndroidManifest.xml:30:17-75
+permission#${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:22:5-24:47
+	android:protectionLevel
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:24:9-44
+	android:name
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:23:9-81
+permission#com.example.usbclaimprobe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:22:5-24:47
+	android:protectionLevel
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:24:9-44
+	android:name
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:23:9-81
+uses-permission#${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:26:5-97
+	android:name
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:26:22-94
+uses-permission#com.example.usbclaimprobe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:26:5-97
+	android:name
+		ADDED from [androidx.core:core:1.10.1] /home/anton/.gradle/caches/9.5.0/transforms/a664000b2a56a71c2264765822109736/transformed/core-1.10.1/AndroidManifest.xml:26:22-94
+meta-data#androidx.lifecycle.ProcessLifecycleInitializer
+ADDED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:31:13-33:52
+	android:value
+		ADDED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:33:17-49
+	android:name
+		ADDED from [androidx.lifecycle:lifecycle-process:2.4.1] /home/anton/.gradle/caches/9.5.0/transforms/1cd637905072a7a0a2c2f131716864b3/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:32:17-78

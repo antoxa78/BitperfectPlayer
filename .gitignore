@@ -1,5 +1,6 @@
 *.iml
 .gradle
+.kotlin/
 /local.properties
 /.idea/
 /build
@@ -9,3 +10,4 @@
 local.properties
 *.apk
 *.aar
+/third_party/

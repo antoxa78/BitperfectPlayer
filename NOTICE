@@ -1,0 +1,48 @@
+# Third-Party Notices
+
+BitperfectPlayer is licensed under the GNU General Public License v3.0 (see `LICENSE`).
+
+The following third-party components are used. Their respective licenses and
+copyright notices are reproduced here and in `app/src/main/cpp/third_party/`.
+
+## sacd-ripper
+
+- Copyright (c) 2010-2015 by respective authors.
+- https://github.com/sacd-ripper/sacd-ripper
+- Components used: `libsacd`, `libcommon`, `libdstdec` (SACD ISO reading and DST decoding).
+- License: **GNU General Public License v2.0 or later** (`app/src/main/cpp/third_party/sacd/COPYING`).
+
+## FFmpeg (dsd.c / dsd.h, libavutil)
+
+- Copyright (c) 2009, 2011 Sebastian Gesemann. All rights reserved.
+- Copyright (c) 2014 Peter Ross.
+- Based on the BSD-licensed `dsd2pcm` by Sebastian Gesemann.
+- https://ffmpeg.org
+- Components used: `dsd.c`, `dsd.h`, `reverse.c`, and `libavutil` headers (DSD → PCM stage).
+- License: **GNU Lesser General Public License v2.1 or later**
+  (`app/src/main/cpp/third_party/ffmpeg_dsd/COPYING.LGPLv2.1`).
+
+## jcifs-ng
+
+- https://github.com/AgNO3/jcifs-ng
+- SMB/CIFS client used for network-share streaming.
+- License: **GNU Lesser General Public License v2.1 or later**.
+
+## AndroidX Media3 (ExoPlayer)
+
+- Copyright (C) The Android Open Source Project.
+- https://developer.android.com/jetpack/androidx/releases/media3
+- License: **Apache License 2.0**.
+
+## OkHttp
+
+- Copyright (C) Square, Inc.
+- https://square.github.io/okhttp/
+- License: **Apache License 2.0**.
+
+## Bouncy Castle
+
+- Copyright (c) 2000 - 2021 The Legion of the Bouncy Castle Inc.
+- https://www.bouncycastle.org
+- Used for MD4 support required by SMB/NTLM authentication.
+- License: **MIT License**.
