@@ -10,4 +10,16 @@
 local.properties
 *.apk
 *.aar
-/third_party/
+# Vendored decent-player USB audio driver. Only the two build-required Android
+# modules under libs/ are tracked; the nested repo's docs/driver/player dirs, its
+# root metafiles, and the FLAC decoder module are excluded. Nested repo history
+# is preserved in a git bundle (third_party/decent-player/.git was removed).
+/third_party/decent-player/.git/
+/third_party/decent-player/driver/
+/third_party/decent-player/docs/
+/third_party/decent-player/player/
+/third_party/decent-player/libs/decent-media3-decoder-flac/
+/third_party/decent-player/CONTRIBUTING.md
+/third_party/decent-player/LICENSE
+/third_party/decent-player/NOTICE.md
+/third_party/decent-player/README.md
