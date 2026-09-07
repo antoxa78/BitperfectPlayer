@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.6 - 2026-09-07
+
+### Fixed
+
+- **DAC stays locked on the last played stream rate after Exit:** the usbdevfs release only stopped the stream, drained the in-flight URBs, and soft-replugged (`USBDEVFS_RESET`) so the kernel could rebind its USB-audio driver. But a UAC2 Clock Source's rate is a control value retained in the DAC's firmware — a USB reset re-enumerates the device without power-cycling it, so the last `SET_CUR` (the final track's rate) survived the hand-back and the DAC kept clocking/displaying it until physically unplugged. `releaseUsbForIdle()` now restores the DAC's default idle rate first: it selects alt-setting 0 (zero-bandwidth, freeing the ISO ring) and issues `SET_CUR` to the lowest rate advertised in the device's AS Format Type I descriptors (44.1 kHz fallback) before the soft-replug. This also covers the Settings → Audio Output switch, screen-off/pause, and the LAN-control exit path, all of which hand the DAC back through the same release.
+
 ## 3.0.5 - 2026-09-07
 
 ### Fixed
