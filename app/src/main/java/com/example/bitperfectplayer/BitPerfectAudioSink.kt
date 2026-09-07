@@ -417,7 +417,15 @@ class BitPerfectAudioSink(
     private fun isDirectCandidate(format: Format): Boolean {
         if (driverOwnsUsbDevice) return false
         if (tunneling || format.sampleMimeType != androidx.media3.common.MimeTypes.AUDIO_RAW) return false
-        return format.pcmEncoding == C.ENCODING_PCM_24BIT ||
+        // 16-bit PCM (plain CD-quality FLAC/WAV) needs the same direct-track +
+        // bit-perfect-mixer treatment as 24/32-bit: without it, a 16-bit track
+        // goes through the delegate's normal AudioTrack, which never asks
+        // BitPerfectManager for the Android 14+ MIXER_BEHAVIOR_BIT_PERFECT
+        // mixer attributes — so the system mixer is free to resample it to
+        // its internal rate (e.g. 44.1kHz -> 48kHz) even in "Bit-perfect via
+        // Android" mode.
+        return format.pcmEncoding == C.ENCODING_PCM_16BIT ||
+            format.pcmEncoding == C.ENCODING_PCM_24BIT ||
             format.pcmEncoding == C.ENCODING_PCM_32BIT ||
             format.pcmEncoding == C.ENCODING_PCM_FLOAT
     }

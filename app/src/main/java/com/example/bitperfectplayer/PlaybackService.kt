@@ -225,29 +225,6 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
-        /** Reads the on-disk debug log for display in Settings → Debug Log. */
-        fun readDebugLog(context: Context): String = synchronized(debugLogLock) {
-            try {
-                val file = File(debugLogDir(context), DEBUG_LOG_FILE)
-                if (file.exists()) {
-                    // Leading path line so the adb pull target is visible right on the
-                    // TV screen without needing to derive it from the package name.
-                    "Log file: ${file.absolutePath}\n\n" +
-                        file.readText().ifBlank { "Debug log is empty." }
-                } else {
-                    "No debug log yet — exit the app once first, then check here.\n" +
-                        "(Will be written to ${file.absolutePath})"
-                }
-            } catch (e: Exception) {
-                "Failed to read debug log: ${e.message}"
-            }
-        }
-
-        /** Clears the on-disk debug log. */
-        fun clearDebugLog(context: Context) = synchronized(debugLogLock) {
-            try { File(debugLogDir(context), DEBUG_LOG_FILE).delete() } catch (_: Exception) {}
-        }
-
         private fun audioDeviceTypeName(type: Int): String = when (type) {
             AudioDeviceInfo.TYPE_USB_DEVICE -> "USB_DEVICE"
             AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB_ACCESSORY"

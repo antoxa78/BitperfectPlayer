@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.5 - 2026-09-07
+
+### Fixed
+
+- **16-bit PCM never got the Android 14+ bit-perfect mixer:** `BitPerfectAudioSink.isDirectCandidate()` only matched `ENCODING_PCM_24BIT`/`_32BIT`/`_FLOAT`, so a plain 16-bit FLAC/WAV (ordinary CD-quality rips — the most common case) fell through to the delegate's regular `AudioTrack` in "Bit-perfect via Android" mode. That path never calls `BitPerfectManager.updateAudioTrack()`, so `MIXER_BEHAVIOR_BIT_PERFECT` was never requested for 16-bit tracks, leaving the system mixer free to silently resample them (e.g. 44.1kHz → 48kHz) to its internal rate. `isDirectCandidate()` now also matches `ENCODING_PCM_16BIT`, so 16-bit content gets the same direct-`AudioTrack` + bit-perfect-mixer negotiation as 24/32-bit content.
+- **Float→int conversion truncated instead of rounding:** `convertFloatToInt16/24/32()` in `usb-audio-output.cpp` (the path used for ExoPlayer-decoded, non-native-FLAC playback through the USB driver) cast the scaled float straight to an integer, which truncates toward zero — a consistent up-to-1-LSB downward bias on every sample. The round-trip is normally exact for on-spec input, but any upstream gain/mixing/resampling that isn't itself power-of-two-exact turns that bias real. Now rounds to nearest (`roundf`/`round`) before clamping and casting.
+- **Gapless transition into a different sample rate could stall the main thread:** `UsbAudioSink.configureUsbBitPerfect()` does blocking native ioctls plus a flat 50ms sleep for DAC PLL lock. When the native FLAC engine finished a track and a deferred cross-rate reconfiguration was pending, `cleanupFinishedEngine()` ran that call inline from `onMediaItemTransition()` — the player's application-thread callback, which is the main thread here since `ExoPlayer.Builder` is never given a custom `Looper`. A gapless transition into a track with a different sample rate/channel count therefore briefly stalled the main thread on every such transition. The deferred call now runs on a background thread; `configureUsbBitPerfect()` is guarded by a new `configureLock` so a concurrent call from `configure()` (ExoPlayer's renderer thread, for the same transition) waits for it instead of racing it on the same USB device/fd.
+
+### Removed
+
+- **Dead debug-log readers:** `PlaybackService.readDebugLog()` and `clearDebugLog()` had no remaining callers now that the Settings → Debug Log screen was removed in 3.0.4 — `appendDebugLog()` (still used by the exit/DAC-release path) and its supporting `debugLogDir`/`DEBUG_LOG_FILE`/`debugLogLock` are unaffected.
+
 ## 3.0.4 - 2026-09-06
 
 ### Fixed
