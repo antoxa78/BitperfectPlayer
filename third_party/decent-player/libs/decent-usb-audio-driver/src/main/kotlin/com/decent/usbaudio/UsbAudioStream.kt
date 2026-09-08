@@ -226,5 +226,15 @@ class UsbAudioStream(
          */
         @JvmStatic
         external fun nativeUsbResetOnly(fd: Int): Int
+
+        /**
+         * USBDEVFS_CONNECT on a single interface — asks the kernel to bind its
+         * default driver (snd-usb-audio) to the interface. The logical inverse
+         * of the DISCONNECT issued during a force=true claim. Needed after a
+         * release where the kernel does not auto-probe (e.g. Amlogic SoCs).
+         * @return 0 on success, negative on error
+         */
+        @JvmStatic
+        external fun nativeUsbConnect(fd: Int, ifaceId: Int): Int
     }
 }

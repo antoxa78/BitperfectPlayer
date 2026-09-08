@@ -12,6 +12,7 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
+import java.io.File
 
 
 /**
@@ -542,13 +543,18 @@ class UsbAudioDevice private constructor(private val context: Context) {
      * software path was doing achieved that same clean slate).
      *
      * Releasing before resetting at least removes the one confirmed reason
-     * the kernel had to skip rebinding. Whether Android's specific USB host
-     * stack on this hardware then actually rebinds its default driver
-     * without a real hotplug event is not something this app can fully
-     * control from userspace — if this still doesn't produce sound for
-     * other apps, that would point at a limitation below what any
-     * usbfs-level release/reset sequence can force, rather than a further
-     * app-side ordering or timing issue.
+     * the kernel had to skip rebinding. On-device evidence (logcat on a Mi TV
+     * box, Android 14): after this sequence the ALSA card files re-appear
+     * (pcmC2D0p + controlC2), the framework even routes other apps to
+     * OUT_USB_HEADSET — but the vendor audio HAL's USB output proxy then dies
+     * with a persistent `pcm oops: cannot prepare channel: No such device`
+     * because the underlying USB streaming PCM can only be re-armed by a real
+     * host-level disconnect/reconnect (a physical unplug, or a root sysfs
+     * unbind/bind via [forceKernelRebind]). A USBDEVFS_RESET merely
+     * re-enumerates on the same port, which the HAL provably never recovers
+     * from. So for other apps to regain the DAC, either the user physically
+     * replugs it, or the box must provide root for the sysfs fallback —
+     * nothing further at the usbfs level can force it.
      *
      * Trade-off: resuming playback after this now requires a full
      * [openDevice] (re-open, re-claim, re-parse descriptors) instead of
@@ -560,17 +566,32 @@ class UsbAudioDevice private constructor(private val context: Context) {
         val conn = connection ?: return
         val fd = conn.fileDescriptor
 
-        // Release BEFORE resetting — see doc comment above.
+        // Capture identity before closeDevice() nulls currentDevice — needed
+        // by the reconnect/sysfs fallbacks to locate the device after the fd
+        // is released.
         val device = currentDevice
+        val productNameForRebind = device?.productName
+        // Capture every audio interface id while the device is still known, so
+        // USBDEVFS_CONNECT can ask the kernel to bind snd-usb-audio to each one
+        // (a force=true claim previously disconnected that driver everywhere).
+        val audioInterfaceIds = device?.let { d ->
+            (0 until d.interfaceCount).asSequence()
+                .map { d.getInterface(it) }
+                .filter { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO }
+                .map { it.id }
+                .toList()
+        }?.distinct() ?: emptyList()
+
+        // Release BEFORE resetting — see doc comment above.
         val controlInterface = device?.let { d ->
             (0 until d.interfaceCount).map { d.getInterface(it) }
                 .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO && it.interfaceSubclass == 1 }
         }
         controlInterface?.let {
-            Log.i(TAG, "resetUsbDevice: releaseInterface(control) before reset: ${conn.releaseInterface(it)}")
+            Log.i(TAG, "resetUsbDevice: releaseInterface(control iface ${it.id}) before reset: ${conn.releaseInterface(it)}")
         }
         claimedInterface?.let {
-            Log.i(TAG, "resetUsbDevice: releaseInterface(streaming) before reset: ${conn.releaseInterface(it)}")
+            Log.i(TAG, "resetUsbDevice: releaseInterface(streaming iface ${it.id}) before reset: ${conn.releaseInterface(it)}")
         }
         claimedInterface = null
 
@@ -580,8 +601,161 @@ class UsbAudioDevice private constructor(private val context: Context) {
             .onFailure { Log.w(TAG, "USBDEVFS_RESET failed: ${it.message}") }
             .getOrNull()?.let { if (it != 0) Log.w(TAG, "USBDEVFS_RESET returned $it") }
 
+        // Explicitly ask the kernel to bind its default driver (snd-usb-audio)
+        // back to each audio interface. USBDEVFS_RESET alone does NOT reliably
+        // cause a re-probe on this hardware — on-device evidence (exit_debug.log
+        // on a Mi TV box) shows the device re-enumerates at the bus level and
+        // AudioManager reports it added, but /dev/snd never gains the USB card:
+        // no ALSA card == every other app silent until physical unplug/replug.
+        // USBDEVFS_CONNECT is the usbfs-level inverse of the DISCONNECT our
+        // force-claim issued; it triggers the kernel's own driver matching.
+        for (ifaceId in audioInterfaceIds) {
+            runCatching { UsbAudioStream.nativeUsbConnect(fd, ifaceId) }
+                .onFailure { Log.w(TAG, "USBDEVFS_CONNECT iface=$ifaceId failed: ${it.message}") }
+                .getOrNull()?.let { if (it != 0) Log.w(TAG, "USBDEVFS_CONNECT iface=$ifaceId returned $it") }
+        }
+
         // Finally close the connection fully.
         closeDevice()
+
+        // Seq 2 fallback: if USBDEVFS_CONNECT could not rebind the audio driver,
+        // try a sysfs unbind+bind of the whole USB device — a genuine
+        // disconnect/reconnect. Only reachable when the runtime actually allows
+        // the write (SELinux-permissive or root); failures are logged only.
+        forceKernelRebind(productNameForRebind)
+    }
+
+    /**
+     * Force the kernel to re-probe snd-usb-audio via a sysfs unbind/bind of the
+     * USB device — a genuine disconnect/reconnect that the USB core always
+     * processes, unlike [UsbAudioStream.nativeUsbResetOnly] (USBDEVFS_RESET),
+     * which on Amlogic SoCs re-enumerates the device at the bus level but does
+     * not cause the kernel audio driver to re-bind (on-device evidence:
+     * AudioDeviceCallback fires but /dev/snd never gains the USB card, so other
+     * apps remain silent until a physical unplug/replug).
+     *
+     * Must be called only AFTER [closeDevice] so no fd is still holding the
+     * interfaces (the kernel refuses to unbind a claimed device). The unbind
+     * removes the device from the bus, the bind re-probes it — snd-usb-audio
+     * then binds and /dev/snd gains the card. Bounded: every sysfs touch is
+     * best-effort and failures degrade to the pre-existing behavior (a silent
+     * USB DAC for other apps) rather than throwing into the exit path.
+     *
+     * @param productName The device product name captured before close, used to
+     *                    locate the device's sysfs node (e.g. "Audalytic DR70").
+     */
+    /**
+     * Force the kernel to re-probe snd-usb-audio via a sysfs unbind/bind of the
+     * USB device — a GENUINE disconnect/reconnect that the USB core always
+     * processes and that Android's UsbHostManager/UsbAlsaManager observe as a
+     * real device removal + re-add (the one thing usbfs can never produce: a
+     * USBDEVFS_RESET merely re-enumerates on the same port, so the vendor HAL's
+     * USB output proxy stays unregistered and other apps get no sound — on-device
+     * evidence: after every software-exit, the HAL routes to OUT_USB_HEADSET and
+     * then fails `pcm oops: cannot prepare channel: No such device` for the whole
+     * session until a physical unplug/replug).
+     *
+     * Normal Android SELinux policy denies a third-party app write access to
+     * /sys/bus/usb, so the direct write path usually fails — we then retry the
+     * same operation via `su` (Magisk / userdebug adbd root / SuperSU). When a
+     * su binary is present AND grants root, this produces the genuine host-level
+     * detach that fixes the box. On a locked/unrooted box it degrades to the
+     * pre-existing behavior (silent DAC for other apps) without ever throwing.
+     *
+     * Must be called only AFTER [closeDevice] so no fd is still holding the
+     * interfaces (the kernel refuses to unbind a claimed device).
+     *
+     * @param productName The device product name captured before close, used to
+     *                    locate the device's sysfs node (/sys/bus/usb/devices/N-N.N).
+     */
+    private fun forceKernelRebind(productName: String?) {
+        if (productName.isNullOrBlank()) {
+            Log.w(TAG, "forceKernelRebind: no product name to match against — skipping")
+            return
+        }
+        val sysfsDevices = File("/sys/bus/usb/devices")
+        if (!sysfsDevices.exists() || !sysfsDevices.canRead()) {
+            // The SELinux policy on this box blocks read ("not permitted to read...")
+            // and, with root, the shell can still list the node even though the app
+            // cannot — so try to discover the node through su too.
+            Log.w(TAG, "forceKernelRebind: /sys/bus/usb/devices not readable directly — will try via su")
+        }
+        val busId = findSysfsBusId(productName, sysfsDevices)
+        if (busId == null) {
+            Log.w(TAG, "forceKernelRebind: no sysfs node matching '$productName' — skipping")
+            return
+        }
+        Log.i(TAG, "forceKernelRebind: forcing kernel re-probe of $busId ($productName)")
+        if (writeSysfs("/sys/bus/usb/drivers/usb/unbind", busId, "unbind $busId")) {
+            // Give the kernel a moment to finish the detach before re-adding.
+            runCatching { Thread.sleep(200) }
+            writeSysfs("/sys/bus/usb/drivers/usb/bind", busId, "bind $busId")
+        } else {
+            Log.w(TAG, "forceKernelRebind: unbind failed (direct and su) — device left as-is; " +
+                    "other apps will need a physical replug")
+        }
+        // Don't block the exit path long; the kernel driver probes asynchronously
+        // and waitForUsbRebind() (in PlaybackService) observes the outcome.
+    }
+
+    private fun findSysfsBusId(productName: String, sysfsDevices: File): String? {
+        // Direct scan (app-readable sysfs or root uid).
+        val direct = runCatching {
+            sysfsDevices.listFiles()?.firstOrNull { dir ->
+                val product = File(dir, "product").takeIf { it.exists() }?.readText()?.trim()
+                product != null && product.contains(productName, ignoreCase = true)
+            }?.name
+        }.getOrNull()
+        if (direct != null) return direct
+        // Via su: have the shell scan and echo the node name back.
+        val out = runShellCapture(
+            "for p in /sys/bus/usb/devices/*/product; do " +
+                "if grep -qi \"$productName\" \"\$p\"; then basename \$(dirname \"\$p\"); break; fi; done"
+        ) ?: return null
+        return out.trim().ifEmpty { null }
+    }
+
+    /** Write value -> path, trying a direct write first, then escalating via su. */
+    private fun writeSysfs(path: String, value: String, tag: String): Boolean {
+        try {
+            File(path).writeText(value)
+            Log.i(TAG, "forceKernelRebind: $tag OK (direct) — ${path} <- $value")
+            return true
+        } catch (direct: Exception) {
+            Log.i(TAG, "forceKernelRebind: $tag direct write failed (${direct.message}) — trying su")
+        }
+        val ok = runShell(
+            "echo '$value' > '$path'"
+        )
+        Log.i(TAG, "forceKernelRebind: $tag via su ok=$ok")
+        return ok
+    }
+
+    private fun runShell(command: String): Boolean {
+        return runCatching {
+            val p = ProcessBuilder("su", "-c", command).start()
+            val out = p.inputStream.readBytes().toString(Charsets.UTF_8).trim()
+            val err = p.errorStream.readBytes().toString(Charsets.UTF_8).trim()
+            val code = p.waitFor()
+            Log.i(TAG, "forceKernelRebind: su -c '$command' -> exit=$code out='$out' err='$err'")
+            code == 0
+        }.getOrElse { e ->
+            Log.w(TAG, "forceKernelRebind: no usable su (${e.message})")
+            false
+        }
+    }
+
+    /** Run a plain shell command, returning its stdout (or null if su is unavailable). */
+    private fun runShellCapture(command: String): String? {
+        return runCatching {
+            val p = ProcessBuilder("su", "-c", command).start()
+            val out = p.inputStream.readBytes().toString(Charsets.UTF_8).trim()
+            p.waitFor()
+            out
+        }.getOrElse { e ->
+            Log.w(TAG, "forceKernelRebind: no usable su for shell command (${e.message})")
+            null
+        }
     }
 
     /**

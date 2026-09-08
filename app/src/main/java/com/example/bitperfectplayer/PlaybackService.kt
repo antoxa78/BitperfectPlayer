@@ -638,16 +638,18 @@ class PlaybackService : MediaSessionService() {
      * regardless of the result — a missed detection only skips the confidence of a
      * confirmed rebind, it never blocks forever.
      *
-     * The watcher is registered up front, before the isIdleReleaseInFlight() gate
-     * below, and raced against every subsequent step rather than only consulted
-     * afterward. On-device evidence showed why this matters: after a rapid
-     * pause/resume/underrun cycle right before Exit, isIdleReleaseInFlight() was
-     * observed staying true for the *entire* 10s budget, which — when the
-     * callback was only registered after that gate cleared — left zero time to
-     * actually detect the rebind at all (reboundObserved=false after exactly
-     * 10059ms). Listening from the start means a rebind that happens during that
-     * gate is still caught immediately instead of being missed or racing an
-     * already-expired deadline.
+     * The watcher is registered up front and consulted only after the
+     * isIdleReleaseInFlight() gate below clears. On-device evidence
+     * (exit_debug.log on a Mi TV box) showed exactly why the gate must NOT be
+     * raced: the AudioDeviceCallback can fire ~350ms into the release — while
+     * releaseUsbStream() is still running, i.e. long before the force=true usbfs
+     * interface claims are dropped and USBDEVFS_RESET re-enumerates the DAC.
+     * Trusting that early signal let Exit kill the process mid-release and leave
+     * the DAC claimed, so every other app stayed silent until a physical replug.
+     * Registering the watcher up front is still valuable: a rebind that lands
+     * during the gate is not lost, it is honored once the release actually
+     * completes. The gate itself is bounded by [USB_REBIND_MAX_WAIT_MS] so a
+     * genuinely stuck release never stalls Exit forever.
      *
      * @return true when the kernel re-registering the sound card was actually observed.
      */
@@ -658,14 +660,15 @@ class PlaybackService : MediaSessionService() {
         val deadline = SystemClock.uptimeMillis() + USB_REBIND_MAX_WAIT_MS
         val watcher = registerUsbDeviceAddedWatcher()
         try {
-            // The unbind can only happen once the release thread has run resetUsbDevice(),
-            // so first wait for any in-flight release to finish — but never let this alone
-            // consume the whole budget; watcher (if any) is already listening throughout.
+            // The unbind can only happen once the release thread has run
+            // resetUsbDevice() (interface release + USBDEVFS_RESET + closeDevice).
+            // On-device evidence (see the doc comment above) showed the
+            // AudioDeviceCallback can fire while releaseUsbStream() is STILL
+            // running — long before the force=true usbfs claims are dropped. So the
+            // gate is always waited out (bounded by the deadline); the watcher is
+            // only honored once the release has actually finished, guaranteeing the
+            // DAC was handed back before the process can be killed after this returns.
             while (sink.isIdleReleaseInFlight() && SystemClock.uptimeMillis() < deadline) {
-                if (watcher?.fired == true) {
-                    appendDebugLog(this, "waitForUsbRebind: USB device re-added while release still in flight")
-                    return true
-                }
                 if (!sleepQuietly(10)) return false
             }
             if (watcher?.fired == true) return true

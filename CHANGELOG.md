@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.7-beta1 - 2026-09-08
+
+### Fixed
+
+- **Kernel rebind of the USB-audio driver on Exit could be skipped on some hardware:** `resetUsbDevice()` relied on `USBDEVFS_RESET` alone to re-probe `snd-usb-audio` when handing the DAC back to the system. On a Mi TV box (Android 14) the reset re-enumerates the device at the bus level (Android reports the audio device "added"), but the ALSA card never reappeared — every other app stayed silent until a physical unplug/replug. The driver now also issues `USBDEVFS_CONNECT` on each audio interface after the reset (the exact inverse of the `DISCONNECT` its force-claim issued), which asks the kernel to run its own driver matching instead of relying on the reset side-effect.
+- **Sysfs unbind/bind hand-back fallback now works under root:** when the framework still cannot re-arm the vendor HAL (its USB output only recovers on a real host-level detach, which no usbfs call produces), `forceKernelRebind()` performs a genuine sysfs unbind/bind of the USB device. It now also escalates via `su` when the default SELinux policy blocks app-level `/sys/bus/usb` access, so a rooted box can hand the DAC back automatically where a locked one cannot.
+- **Exit no longer kills the process mid-release:** the post-exit USB-rebind wait used to trust the USB audio device "added" callback immediately, which can fire while `releaseUsbStream()` is still dropping its interface claims — letting Exit kill the process before the hand-back finished and leaving every other app silent. The release is now always waited out first (bounded by `USB_REBIND_MAX_WAIT_MS`), with the watcher honored only once the release has actually completed.
+
+### Notes
+
+- This is a **beta** of the ongoing "hand the USB DAC back to other apps after Exit" work. Diagnosis confirmed the framework can be handed back correctly, but on non-rooted boxes the vendor USB HAL still requires a real host-level disconnect (a physical replug) before other apps get sound, as described in 3.0.4.
+
 ## 3.0.6 - 2026-09-07
 
 ### Fixed

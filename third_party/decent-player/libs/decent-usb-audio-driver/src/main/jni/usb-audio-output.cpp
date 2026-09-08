@@ -663,6 +663,22 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbResetOnly(
     return 0;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_decent_usbaudio_UsbAudioStream_nativeUsbConnect(
+        JNIEnv *, jclass, jint fd, jint ifaceId) {
+    struct usbdevfs_ioctl cmd = {};
+    cmd.ifno = (unsigned int)ifaceId;
+    cmd.ioctl_code = USBDEVFS_CONNECT;
+    int ret = ioctl(fd, USBDEVFS_IOCTL, &cmd);
+    if (ret < 0) {
+        LOGI("USBDEVFS_CONNECT iface=%d errno=%d (%s) — kernel may have no default driver or already rebound",
+             ifaceId, errno, strerror(errno));
+    } else {
+        LOGI("USBDEVFS_CONNECT iface=%d OK — kernel driver re-bound", ifaceId);
+    }
+    return ret;
+}
+
 } // extern "C" — pause for non-JNI functions used by native-audio-engine
 
 // ── Integer padding (lossless, zero float) ──────────────────────────
