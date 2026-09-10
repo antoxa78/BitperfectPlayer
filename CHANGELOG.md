@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.1.0-beta1 - 2026-09-10
+
+### Added
+
+- **"Standard Android Output" audio output mode:** a third option in Settings → Audio Output alongside "Bit-perfect via Android" and "Bit-perfect (USB driver)". Uses the plain system audio pipeline — the normal Android mixer, normal resampling/volume ducking — with no direct/bit-perfect `AudioTrack` and no bit-perfect mixer-attribute negotiation. Useful when bit-perfect output isn't wanted or isn't working on a given device/DAC.
+
+### Fixed
+
+- **Wrong cover art shown on multi-disc releases:** `NowPlayingActivity.loadAlbumArt()`'s dedup/cache key was `artist|album` (falling back to the track title) only, with no reference to which folder the track actually came from. A box set split into per-disc folders (or any duplicate rip of an album kept in two places) has the same artist/album tags on every disc, so once art was fetched or matched for the first disc, every later disc's tracks matched the same cache key and kept showing that first disc's cover — including a wrong online (MusicBrainz/iTunes) match getting "stuck" across discs. The key now also folds in the track's source folder (`folderKeyFor()`), so each disc/folder is looked up independently while same-folder track changes still skip the redundant network lookup as before.
+
 ## 3.0.7-beta1 - 2026-09-08
 
 ### Fixed

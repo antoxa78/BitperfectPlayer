@@ -41,6 +41,7 @@ class MainFragment : BrowseSupportFragment() {
     private val KEY_USBDEVFS_DRIVER  = "usbdevfs_driver"
     private val AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
     private val AUDIO_OUTPUT_USBDEVFS           = 2
+    private val AUDIO_OUTPUT_STANDARD_ANDROID   = 3
     private val KEY_NETWORK_BUFFER = "network_buffer"
     private val KEY_AUTO_RECONNECT = "auto_reconnect"
     private var hasAttemptedResume = false
@@ -2427,10 +2428,11 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private val audioOutputNames = arrayOf(
-        "Bit-perfect via Android", // AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
-        "Bit-perfect (USB driver)" // AUDIO_OUTPUT_USBDEVFS = 2
+        "Bit-perfect via Android",  // AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
+        "Bit-perfect (USB driver)", // AUDIO_OUTPUT_USBDEVFS = 2
+        "Standard Android Output"  // AUDIO_OUTPUT_STANDARD_ANDROID = 3
     )
-    private val audioOutputModes = intArrayOf(1, 2)
+    private val audioOutputModes = intArrayOf(1, 2, 3)
 
     /**
      * Effective audio-output mode, mirroring PlaybackService.getAudioOutputMode():

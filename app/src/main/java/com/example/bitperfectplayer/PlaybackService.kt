@@ -85,6 +85,7 @@ class PlaybackService : MediaSessionService() {
         private const val KEY_AUDIO_OUTPUT_MODE = "audio_output_mode"
         private const val AUDIO_OUTPUT_BITPERFECT_ANDROID = 1 // Bit-perfect via Android: direct AudioTrack at native rate
         private const val AUDIO_OUTPUT_USBDEVFS           = 2 // Bit-perfect (USB driver): userspace usbdevfs driver owns the DAC
+        private const val AUDIO_OUTPUT_STANDARD_ANDROID   = 3 // Standard Android output: plain system AudioTrack through the normal mixer
 
         private const val HTTP_TIMEOUT_SECS    = 20L
         private const val USER_AGENT           = "BitperfectPlayer/1.1 (Android TV)"
@@ -1202,6 +1203,14 @@ class PlaybackService : MediaSessionService() {
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean
             ): AudioSink {
+                if (getAudioOutputMode() == AUDIO_OUTPUT_STANDARD_ANDROID) {
+                    // Standard Android output: the plain system audio pipeline, exactly
+                    // as any other app would use it — normal mixer, normal
+                    // resampling/ducking, no forced float encoding, no direct/bit-perfect
+                    // AudioTrack and no bit-perfect mixer-attribute negotiation.
+                    return DefaultAudioSink.Builder(context).build()
+                }
+
                 val sink = DefaultAudioSink.Builder(context)
                 .setEnableAudioTrackPlaybackParams(false)
                 .setEnableFloatOutput(true)

@@ -559,7 +559,13 @@ class NowPlayingActivity : BaseActivity() {
      *  5. Fallback: ic_audio icon tinted with theme color
      */
     private fun loadAlbumArt(uri: String, artist: String, album: String?, track: String) {
-        val artKey = "$artist|${album ?: track}"
+        // The cache key must include the track's source folder, not just its tags.
+        // Multi-disc releases (and duplicate rips of the same album in different
+        // folders) commonly share identical artist/album metadata across discs while
+        // each disc's folder has its own cover.jpg — keying on metadata alone meant
+        // the first disc's art (or a stale online match) stuck for every later disc,
+        // showing the wrong disc's cover once playback moved on.
+        val artKey = "$artist|${album ?: track}|${folderKeyFor(uri)}"
         if (artKey == lastArtKey) return
         lastArtKey = artKey
 
@@ -617,6 +623,37 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun sanitizeForSearch(text: String): String {
         return text.replace(CLEANUP_REGEX, "").trim()
+    }
+
+    /**
+     * Identifies the folder a track lives in, so the art cache/dedup key (see
+     * [loadAlbumArt]) distinguishes tracks that share artist/album tags but live in
+     * different folders — e.g. a "Disc 1"/"Disc 2" box-set split, where each disc's
+     * folder has its own cover.jpg. Falls back to the full URI (e.g. for http(s)
+     * streams, where there is no folder to speak of and each source is distinct anyway).
+     */
+    private fun folderKeyFor(uriString: String): String {
+        return try {
+            when {
+                uriString.startsWith("smb://") -> {
+                    uriString.substringBeforeLast("/", uriString)
+                }
+                uriString.startsWith("file://") || uriString.startsWith("/") -> {
+                    val path = if (uriString.startsWith("file://")) uriString.substring(7) else uriString
+                    java.io.File(path).parent ?: uriString
+                }
+                uriString.startsWith("content://") -> {
+                    val uri = uriString.toUri()
+                    if (android.provider.DocumentsContract.isDocumentUri(this, uri)) {
+                        val docId = android.provider.DocumentsContract.getDocumentId(uri)
+                        if (docId.contains("/")) "${uri.authority}:${docId.substringBeforeLast("/")}" else uriString
+                    } else uriString
+                }
+                else -> uriString
+            }
+        } catch (e: Exception) {
+            uriString
+        }
     }
 
     private fun fetchLocalFolderArt(uriString: String): Bitmap? {
