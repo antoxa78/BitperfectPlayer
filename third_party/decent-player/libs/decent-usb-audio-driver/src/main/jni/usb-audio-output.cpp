@@ -22,7 +22,16 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <sys/system_properties.h>
 #include <linux/usbdevice_fs.h>
+
+// Debug toggle: "adb shell setprop debug.decent.nofeedback 1" disables the
+// continuous async-feedback polling (keeps the one-shot initial read).
+static bool feedbackPollDisabled() {
+    char v[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.decent.nofeedback", v);
+    return v[0] == '1';
+}
 
 #ifndef USBDEVFS_URB_ISO_ASAP
 #define USBDEVFS_URB_ISO_ASAP 0x02
@@ -504,7 +513,9 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioStart(
         // automatically recycled in the reap loop during streaming.
         // The host controller schedules the feedback endpoint once per
         // microframe (~1 ms effective interval).
-        submitFeedbackUrb(ctx);
+        if (!feedbackPollDisabled()) {
+            submitFeedbackUrb(ctx);
+        }
     }
 
     LOGI("Start: rate=%d ch=%d bits=%d ring=%d slots×%dpkt fpmf=%.4f feedback=%s",

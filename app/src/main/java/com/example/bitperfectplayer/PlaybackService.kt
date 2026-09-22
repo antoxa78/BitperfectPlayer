@@ -15,6 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import java.io.File
@@ -379,6 +380,17 @@ class PlaybackService : MediaSessionService() {
 
     /** Wrapped in PlaybackService.buildAudioSink when the usbdevfs driver is enabled. */
     private var usbAudioSink: com.decent.usbaudio.media3.UsbAudioSink? = null
+
+    /** Held during active playback to keep the CPU awake (the USB DAC stream is
+     *  torn down if the CPU suspends mid-isochronous-URB). PARTIAL_WAKE_LOCK is
+     *  used so the screen can still turn off after its normal timeout.
+     *
+     *  NOTE: this does NOT (and cannot) prevent the Shield's own standby — that
+     *  is driven entirely by the device-level Settings.Secure timers
+     *  `attentive_timeout` and `sleep_timeout`, which must be set to "never"
+     *  (2147483647) for the DAC to stay powered during long playback. Acquired
+     *  on play, released on pause/stop/end. */
+    private var playbackWakeLock: PowerManager.WakeLock? = null
 
     /** True while the usbdevfs driver owns the USB DAC (mirrors the wrapper's
      *  onDriverOwnsUsbDeviceChanged callback; written from the release thread). */
@@ -1333,6 +1345,16 @@ class PlaybackService : MediaSessionService() {
 
     // ── Player listener ───────────────────────────────────────────────────────
 
+    /** Acquire the playback wake lock (idempotent — reference-counting disabled). */
+    private fun acquirePlaybackWakeLock() {
+        playbackWakeLock?.let { if (!it.isHeld) it.acquire() }
+    }
+
+    /** Release the playback wake lock (idempotent). */
+    private fun releasePlaybackWakeLock() {
+        playbackWakeLock?.let { if (it.isHeld) it.release() }
+    }
+
     private val playerListener = object : Player.Listener {
         private var retryCount = 0
 
@@ -1340,6 +1362,12 @@ class PlaybackService : MediaSessionService() {
             // Media3 promotes/demotes its own media notification as playback
             // starts/stops — keep our LAN keep-foreground in sync.
             updateLanForeground()
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            // Keep the device awake while actually playing so the Shield does not
+            // suspend (and power off USB, dropping the DAC) mid-listening.
+            if (isPlaying) acquirePlaybackWakeLock() else releasePlaybackWakeLock()
         }
 
         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -1484,6 +1512,17 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         instance = this
         bitPerfectManager = BitPerfectManager(this)
+
+        // PARTIAL_WAKE_LOCK: CPU-awake during playback, screen free to time out.
+        // (An earlier SCREEN_DIM_WAKE_LOCK was thought to suppress Android TV's
+        // inattentive-sleep timer; testing showed it did not — see
+        // https://source.android.com/docs/core/power/tv-standby. The Shield's
+        // standby is a Settings.Secure `attentive_timeout`/`sleep_timeout` timer
+        // over which wake locks have no effect, so the fix is those device
+        // settings, not the wake-lock level.)
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        playbackWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BitperfectPlayer:playback")
+            .apply { setReferenceCounted(false) }
 
         // The usbdevfs driver only streams when the DAC is already granted to us.
         // Request permission up front (the system dialog shows on the TV screen) so
@@ -1680,6 +1719,8 @@ class PlaybackService : MediaSessionService() {
                 ?.unregisterAudioDeviceCallback(usbDeviceCallback)
         } catch (_: Exception) {}
         mediaSession?.run { player.release(); release() }
+        releasePlaybackWakeLock()
+        playbackWakeLock = null
         super.onDestroy()
     }
 

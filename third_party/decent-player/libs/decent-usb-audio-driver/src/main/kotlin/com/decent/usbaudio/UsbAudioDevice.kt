@@ -566,14 +566,11 @@ class UsbAudioDevice private constructor(private val context: Context) {
         val conn = connection ?: return
         val fd = conn.fileDescriptor
 
-        // Capture identity before closeDevice() nulls currentDevice — needed
-        // by the reconnect/sysfs fallbacks to locate the device after the fd
-        // is released.
+        // Capture the device while it is still known (closeDevice() below nulls
+        // currentDevice). The audio interface ids are needed so USBDEVFS_CONNECT
+        // can ask the kernel to re-bind snd-usb-audio (a force=true claim
+        // previously disconnected that driver everywhere).
         val device = currentDevice
-        val productNameForRebind = device?.productName
-        // Capture every audio interface id while the device is still known, so
-        // USBDEVFS_CONNECT can ask the kernel to bind snd-usb-audio to each one
-        // (a force=true claim previously disconnected that driver everywhere).
         val audioInterfaceIds = device?.let { d ->
             (0 until d.interfaceCount).asSequence()
                 .map { d.getInterface(it) }
@@ -595,34 +592,27 @@ class UsbAudioDevice private constructor(private val context: Context) {
         }
         claimedInterface = null
 
-        // Now reset, with the interfaces actually unclaimed — this is the
-        // kernel's chance to bind its own driver.
+        // Re-enumerate the device so the kernel re-binds snd-usb-audio. This is
+        // required after our force=true claim detached the kernel driver: a plain
+        // releaseInterface + USBDEVFS_CONNECT is NOT sufficient on this hardware
+        // to bring the ALSA card back, which left the system/Android audio modes
+        // silent (regression). The earlier assumption that this reset caused the
+        // DR70 disconnects was wrong — those were HDMI-CEC / TV power-down events
+        // (whole-port USB power cut), not this per-device port reset.
         runCatching { UsbAudioStream.nativeUsbResetOnly(fd) }
             .onFailure { Log.w(TAG, "USBDEVFS_RESET failed: ${it.message}") }
             .getOrNull()?.let { if (it != 0) Log.w(TAG, "USBDEVFS_RESET returned $it") }
 
-        // Explicitly ask the kernel to bind its default driver (snd-usb-audio)
-        // back to each audio interface. USBDEVFS_RESET alone does NOT reliably
-        // cause a re-probe on this hardware — on-device evidence (exit_debug.log
-        // on a Mi TV box) shows the device re-enumerates at the bus level and
-        // AudioManager reports it added, but /dev/snd never gains the USB card:
-        // no ALSA card == every other app silent until physical unplug/replug.
-        // USBDEVFS_CONNECT is the usbfs-level inverse of the DISCONNECT our
-        // force-claim issued; it triggers the kernel's own driver matching.
+        // Best-effort: also ask the kernel to re-bind each audio interface. After
+        // the reset above this typically returns EBUSY (driver already re-bound).
         for (ifaceId in audioInterfaceIds) {
             runCatching { UsbAudioStream.nativeUsbConnect(fd, ifaceId) }
                 .onFailure { Log.w(TAG, "USBDEVFS_CONNECT iface=$ifaceId failed: ${it.message}") }
                 .getOrNull()?.let { if (it != 0) Log.w(TAG, "USBDEVFS_CONNECT iface=$ifaceId returned $it") }
         }
 
-        // Finally close the connection fully.
+        // Finally close the connection fully (releases any remaining claims).
         closeDevice()
-
-        // Seq 2 fallback: if USBDEVFS_CONNECT could not rebind the audio driver,
-        // try a sysfs unbind+bind of the whole USB device — a genuine
-        // disconnect/reconnect. Only reachable when the runtime actually allows
-        // the write (SELinux-permissive or root); failures are logged only.
-        forceKernelRebind(productNameForRebind)
     }
 
     /**

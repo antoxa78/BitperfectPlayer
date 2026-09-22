@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.0-beta2 - 2026-09-22
+
+### Fixed
+
+- **Android TV / NVIDIA Shield no longer falls asleep during music playback:** the Shield's standby often came from the Android TV *attentive-sleep* timer (`Settings.Secure.attentive_timeout`, default 5 minutes on many boxes), which puts the TV to sleep after that long with no remote input — even while audio is actively playing with the screen on. That sleep cuts USB power, drops the DAC, and interrupts the stream. The app now holds a `PARTIAL_WAKE_LOCK` for the duration of playback (keeping the CPU from suspending while letting the screen time out normally), and documents that wake locks alone **cannot** suppress the TV-standby timer — the device must also set the sleep timers to never:
+  ```
+  adb shell settings put secure attentive_timeout 2147483647
+  adb shell settings put secure sleep_timeout 2147483647
+  ```
+- **Android / standard audio output went silent after using the USB-driver mode (regression):** the previous build dropped the `USBDEVFS_RESET` from the driver's DAC-release path (believing it caused disconnects), which left the kernel's `snd-usb-audio` driver un-rebound — so switching out of "Bit-perfect (USB driver)" produced no sound. The reset is restored in `resetUsbDevice()`; the disconnect events it had been blamed for were actually HDMI-CEC/TV power-down cutting power to the whole USB port, not this per-device port reset. The sysfs unbind/bind fallback is no longer needed on the release path.
+
+### Notes
+
+- **Debug help for DAC front-display issues:** `adb shell setprop debug.decent.nofeedback 1` disables the continuous async-feedback polling (keeping the one-shot initial calibration read), for isolating clock-adaptation and display-update interactions with the DAC.
+
 ## 3.1.0-beta1 - 2026-09-10
 
 ### Added

@@ -10,6 +10,7 @@
 local.properties
 *.apk
 *.aar
+/probe/build/
 # Vendored decent-player USB audio driver. Only the two build-required Android
 # modules under libs/ are tracked; the nested repo's docs/driver/player dirs, its
 # root metafiles, and the FLAC decoder module are excluded. Nested repo history
