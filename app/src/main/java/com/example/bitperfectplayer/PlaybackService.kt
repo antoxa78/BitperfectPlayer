@@ -69,6 +69,16 @@ data class IcyStreamInfo(
     val url: String?
 )
 
+/** Whether Android TV's inattentive-sleep timer can interrupt playback (see PlaybackService). */
+enum class AttentiveSleepStatus {
+    /** WRITE_SECURE_SETTINGS granted — the app suspends the timer during playback. */
+    HANDLED_BY_APP,
+    /** The device's inattentive-sleep timer is already off ("Never"). */
+    ALREADY_OFF,
+    /** Timer is active and the app cannot touch it — needs the one-time adb grant. */
+    NEEDS_GRANT
+}
+
 @OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
 
@@ -134,6 +144,188 @@ class PlaybackService : MediaSessionService() {
         private const val LAN_FG_WATCHDOG_MS   = 60_000L
 
         private const val TAG_BITPERFECT       = "BitPerfectAudio"
+
+        // ── DSD output (Settings → DSD Output) ────────────────────────────────
+        /** "pcm" (default): SACD/DSF/DFF are converted to PCM in the app — works
+         *  with any DAC. "dop": DSD is sent as DoP (DSD over PCM) so a DoP-capable
+         *  DAC decodes native DSD itself; used only in "Bit-perfect (USB driver)"
+         *  mode, the one path that delivers the samples bit-exactly (DoP through
+         *  a mixer or a resampler would reach the DAC as noise). */
+        const val KEY_DSD_OUTPUT = "dsd_output"
+        const val DSD_OUTPUT_PCM = "pcm"
+        const val DSD_OUTPUT_DOP = "dop"
+
+        /** Output mode as the service will use it (legacy setting migration
+         *  included), read without side effects. */
+        fun effectiveAudioOutputMode(context: Context): Int {
+            val prefs = context.getSharedPreferences(PREFS_APP, Context.MODE_PRIVATE)
+            if (!prefs.contains(KEY_AUDIO_OUTPUT_MODE)) {
+                return if (prefs.getBoolean(KEY_USBDEVFS_DRIVER, true)) AUDIO_OUTPUT_USBDEVFS
+                       else AUDIO_OUTPUT_BITPERFECT_ANDROID
+            }
+            val stored = prefs.getInt(KEY_AUDIO_OUTPUT_MODE, AUDIO_OUTPUT_USBDEVFS)
+            return if (stored == 0) AUDIO_OUTPUT_BITPERFECT_ANDROID else stored
+        }
+
+        fun isDopSelected(context: Context): Boolean =
+            context.getSharedPreferences(PREFS_APP, Context.MODE_PRIVATE)
+                .getString(KEY_DSD_OUTPUT, DSD_OUTPUT_PCM) == DSD_OUTPUT_DOP
+
+        /** True when DSD sources should be emitted as DoP right now: selected,
+         *  USB-driver mode, and a USB DAC actually attached (without one the
+         *  sink falls back to system audio, where DoP would play as noise). */
+        fun isDopOutputActive(context: Context): Boolean =
+            isDopSelected(context) &&
+                effectiveAudioOutputMode(context) == AUDIO_OUTPUT_USBDEVFS &&
+                findUsbAudioDevice(context) != null
+
+        // ── Keep-awake state for the UI ───────────────────────────────────────
+        // True while playback is active (same condition as the playback wake
+        // lock). BaseActivity mirrors it into FLAG_KEEP_SCREEN_ON: on Android TV
+        // a PARTIAL_WAKE_LOCK does NOT stop the normal inactivity timeout
+        // (screen_off_timeout → screensaver → sleep_timeout "Put device to
+        // sleep") — PowerManager only counts the device as "kept awake" for a
+        // screen-level wake lock or a visible window with FLAG_KEEP_SCREEN_ON.
+        @Volatile var keepAwake: Boolean = false
+            private set
+        private val keepAwakeListeners =
+            java.util.concurrent.CopyOnWriteArraySet<(Boolean) -> Unit>()
+
+        /** Main thread only. [listener] is invoked immediately with the current state. */
+        fun addKeepAwakeListener(listener: (Boolean) -> Unit) {
+            keepAwakeListeners.add(listener)
+            listener(keepAwake)
+        }
+
+        fun removeKeepAwakeListener(listener: (Boolean) -> Unit) {
+            keepAwakeListeners.remove(listener)
+        }
+
+        /** Main thread only. */
+        private fun publishKeepAwake(value: Boolean) {
+            if (keepAwake == value) return
+            keepAwake = value
+            keepAwakeListeners.forEach { it(value) }
+        }
+
+        // ── Android TV inattentive sleep (attentive_timeout) ──────────────────
+        // Settings.Secure "attentive_timeout" (Android TV: Energy saver → "Turn
+        // off display" when inactive) puts the box to sleep after that long with
+        // no remote input. Unlike the normal timeout above it ignores every wake
+        // lock and FLAG_KEEP_SCREEN_ON by design — the only way an app can hold
+        // it off is to write the setting, which needs WRITE_SECURE_SETTINGS, a
+        // development permission the user grants once over adb:
+        //   adb shell pm grant <applicationId> android.permission.WRITE_SECURE_SETTINGS
+        // While playing, the value is set to "never" (-1). The user's own value
+        // is persisted first (so a crash/kill can never lose it) and put back
+        // once playback has been stopped for ATTENTIVE_RESTORE_GRACE_MS, on
+        // service teardown / Exit, on the next service start, and on boot.
+        private const val SETTING_ATTENTIVE_TIMEOUT  = "attentive_timeout" // Settings.Secure.ATTENTIVE_TIMEOUT is @hide
+        private const val ATTENTIVE_NEVER            = -1
+        private const val KEY_ATTENTIVE_OVERRIDDEN   = "attentive_timeout_overridden"
+        private const val KEY_ATTENTIVE_SAVED        = "attentive_timeout_saved"
+        private const val ATTENTIVE_SAVED_UNSET      = "__unset__"
+        private const val ATTENTIVE_RESTORE_GRACE_MS = 30_000L
+
+        fun canOverrideAttentiveSleep(context: Context): Boolean =
+            context.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        /** Framework default used when attentive_timeout is unset; null if unknown. */
+        private fun frameworkAttentiveDefaultMs(): Long? = try {
+            val res = android.content.res.Resources.getSystem()
+            val id = res.getIdentifier("config_attentiveTimeout", "integer", "android")
+            if (id != 0) res.getInteger(id).toLong() else null
+        } catch (_: Exception) { null }
+
+        /** Effective inattentive-sleep timeout in ms (<= 0 = off), or null if unknown. */
+        fun deviceAttentiveTimeoutMs(context: Context): Long? {
+            val raw = try {
+                android.provider.Settings.Secure.getString(context.contentResolver, SETTING_ATTENTIVE_TIMEOUT)
+            } catch (_: Exception) { null }
+            return raw?.toLongOrNull() ?: frameworkAttentiveDefaultMs()
+        }
+
+        fun attentiveSleepStatus(context: Context): AttentiveSleepStatus {
+            if (canOverrideAttentiveSleep(context)) return AttentiveSleepStatus.HANDLED_BY_APP
+            val t = deviceAttentiveTimeoutMs(context)
+            return if (t != null && t <= 0) AttentiveSleepStatus.ALREADY_OFF
+                   else AttentiveSleepStatus.NEEDS_GRANT
+        }
+
+        /**
+         * Suspend the inattentive-sleep timer for the duration of playback.
+         * Idempotent. Returns true when the timer is (now) off, false when the
+         * permission is missing or the write failed.
+         */
+        internal fun suppressAttentiveSleep(context: Context): Boolean {
+            val prefs = context.getSharedPreferences(PREFS_APP, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(KEY_ATTENTIVE_OVERRIDDEN, false)) return true
+            if (!canOverrideAttentiveSleep(context)) return false
+            val cr = context.contentResolver
+            return try {
+                val current = android.provider.Settings.Secure.getString(cr, SETTING_ATTENTIVE_TIMEOUT)
+                val currentMs = current?.toLongOrNull()
+                if (currentMs != null && currentMs <= 0) return true // already "never": nothing to undo later
+                // Persist the user's value BEFORE overwriting it, so a crash or
+                // kill between the two writes can never lose it.
+                prefs.edit()
+                    .putString(KEY_ATTENTIVE_SAVED, current ?: ATTENTIVE_SAVED_UNSET)
+                    .putBoolean(KEY_ATTENTIVE_OVERRIDDEN, true)
+                    .commit()
+                android.provider.Settings.Secure.putInt(cr, SETTING_ATTENTIVE_TIMEOUT, ATTENTIVE_NEVER)
+                Log.i(TAG, "Inattentive sleep suspended for playback (was ${current ?: "unset"})")
+                true
+            } catch (e: Exception) {
+                prefs.edit().remove(KEY_ATTENTIVE_OVERRIDDEN).remove(KEY_ATTENTIVE_SAVED).commit()
+                Log.w(TAG, "Could not suspend inattentive sleep: ${e.message}")
+                false
+            }
+        }
+
+        /**
+         * Put the user's attentive_timeout back if this app changed it. Safe to
+         * call at any time (no-op when nothing is overridden). If the value was
+         * changed from Android TV settings in the meantime, the user's new
+         * choice is kept.
+         */
+        fun restoreAttentiveSleep(context: Context, reason: String) {
+            val prefs = context.getSharedPreferences(PREFS_APP, Context.MODE_PRIVATE)
+            if (!prefs.getBoolean(KEY_ATTENTIVE_OVERRIDDEN, false)) return
+            if (!canOverrideAttentiveSleep(context)) {
+                // Keep the saved value — retried on the next service start / boot.
+                Log.w(TAG, "Cannot restore attentive_timeout [$reason]: WRITE_SECURE_SETTINGS no longer granted")
+                return
+            }
+            val cr = context.contentResolver
+            try {
+                val now = android.provider.Settings.Secure.getString(cr, SETTING_ATTENTIVE_TIMEOUT)
+                if (now?.toLongOrNull() == ATTENTIVE_NEVER.toLong()) {
+                    val saved = prefs.getString(KEY_ATTENTIVE_SAVED, null)
+                        ?.takeIf { it != ATTENTIVE_SAVED_UNSET }
+                    if (saved != null) {
+                        android.provider.Settings.Secure.putString(cr, SETTING_ATTENTIVE_TIMEOUT, saved)
+                    } else {
+                        // Was unset (framework default): clear it again, falling
+                        // back to writing the default explicitly.
+                        val cleared = runCatching {
+                            android.provider.Settings.Secure.putString(cr, SETTING_ATTENTIVE_TIMEOUT, null)
+                        }.getOrDefault(false)
+                        if (!cleared) {
+                            frameworkAttentiveDefaultMs()?.let {
+                                android.provider.Settings.Secure.putInt(cr, SETTING_ATTENTIVE_TIMEOUT, it.toInt())
+                            }
+                        }
+                    }
+                    Log.i(TAG, "Inattentive sleep restored to ${saved ?: "default"} [$reason]")
+                } else {
+                    Log.i(TAG, "attentive_timeout changed externally to $now — keeping it [$reason]")
+                }
+                prefs.edit().remove(KEY_ATTENTIVE_OVERRIDDEN).remove(KEY_ATTENTIVE_SAVED).commit()
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not restore attentive_timeout [$reason]: ${e.message}")
+            }
+        }
 
         // ── USB DAC detection ─────────────────────────────────────────────────
         /**
@@ -383,14 +575,31 @@ class PlaybackService : MediaSessionService() {
 
     /** Held during active playback to keep the CPU awake (the USB DAC stream is
      *  torn down if the CPU suspends mid-isochronous-URB). PARTIAL_WAKE_LOCK is
-     *  used so the screen can still turn off after its normal timeout.
+     *  used so it never forces the TV panel on by itself.
      *
-     *  NOTE: this does NOT (and cannot) prevent the Shield's own standby — that
-     *  is driven entirely by the device-level Settings.Secure timers
-     *  `attentive_timeout` and `sleep_timeout`, which must be set to "never"
-     *  (2147483647) for the DAC to stay powered during long playback. Acquired
-     *  on play, released on pause/stop/end. */
+     *  NOTE: on Android TV this alone does NOT stop the box from sleeping —
+     *  "screen off" there IS standby. Staying awake during playback is handled
+     *  by two more pieces, both driven from [updateSleepSuppression]:
+     *   - the normal inactivity timeout (screen_off_timeout / sleep_timeout) is
+     *     blocked by FLAG_KEEP_SCREEN_ON in the visible activity (BaseActivity,
+     *     via [keepAwake]); the app's own screensaver still blanks the panel;
+     *   - the inattentive-sleep timer (attentive_timeout) ignores all wake locks
+     *     and is suspended by writing the setting (needs the one-time adb grant
+     *     of WRITE_SECURE_SETTINGS — see [suppressAttentiveSleep]).
+     *  Acquired on play, released on pause/stop/end. */
     private var playbackWakeLock: PowerManager.WakeLock? = null
+
+    /** Posted when playback stops; puts the user's attentive_timeout back after a grace period. */
+    private val attentiveRestoreRunnable = Runnable { restoreAttentiveSleep(this, "playback stopped") }
+
+    /** Log the "needs adb grant" hint only once per service lifetime. */
+    private var attentiveHintLogged = false
+
+    /** Set on Exit / teardown: no further keep-awake or attentive_timeout
+     *  override. Without it, a wake-lock update still in flight from the USB
+     *  release (driver ownership flips false on its own thread) could re-apply
+     *  the override just before System.exit(). */
+    private var sleepSuppressionShutDown = false
 
     /** True while the usbdevfs driver owns the USB DAC (mirrors the wrapper's
      *  onDriverOwnsUsbDeviceChanged callback; written from the release thread). */
@@ -986,6 +1195,12 @@ class PlaybackService : MediaSessionService() {
         val cardsBefore = sndCards()
         appendDebugLog(this, "prepareForProcessExit: usbAudioSink=${sink != null} wasOwned=$wasOwned cardsBefore=$cardsBefore")
 
+        // System.exit() skips onDestroy() — put the user's sleep timer back now.
+        sleepSuppressionShutDown = true
+        mainHandler.removeCallbacks(attentiveRestoreRunnable)
+        publishKeepAwake(false)
+        restoreAttentiveSleep(this, "exit")
+
         try { mediaSession?.player?.stop() } catch (_: Exception) {}
         bitPerfectManager.clear()
         releaseUsbDriverDac()
@@ -1275,6 +1490,7 @@ class PlaybackService : MediaSessionService() {
                                 bitPerfectSink.driverOwnsUsbDevice = owns
                                 this@PlaybackService.usbDriverOwnsDac = owns
                                 Log.i(TAG, "UsbAudioSink driver ownership changed: releasedToDriver=$owns")
+                                updatePlaybackWakeLock()
                             }
                         ).also {
                             this@PlaybackService.usbAudioSink = it
@@ -1293,7 +1509,10 @@ class PlaybackService : MediaSessionService() {
 
         val mediaSourceFactory = SacdMediaSourceFactory(
             DefaultMediaSourceFactory(this, extractorsFactory)
-                .setDataSourceFactory(dataSourceFactory)
+                .setDataSourceFactory(dataSourceFactory),
+            context = this,
+            // DSF/DFF files read through the same data sources (local, content://, SMB).
+            dataSourceFactory = dataSourceFactory
         )
 
         val settings = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
@@ -1355,6 +1574,62 @@ class PlaybackService : MediaSessionService() {
         playbackWakeLock?.let { if (it.isHeld) it.release() }
     }
 
+    /**
+     * Keep the CPU/device awake while audio is actually being produced, across
+     * all three output modes. Media3's [Player.isPlaying] is only true in
+     * STATE_READY; with the usbdevfs driver the native engine can be streaming
+     * while ExoPlayer sits in STATE_BUFFERING (loading is blocked) — and since
+     * the bitstream bypasses Android's AudioTrack there is no implicit audio
+     * wake lock either — so the Shield's standby timer is free to fire and it
+     * powers the DAC down mid-listening. Hold the lock for playWhenReady in
+     * READY/BUFFERING and additionally while the usbdevfs driver owns the DAC.
+     *
+     * Safe from any thread: ExoPlayer's accessors throw IllegalStateException
+     * when called off the application thread, and this also gets invoked from
+     * the playback/background threads via onDriverOwnsUsbDeviceChanged, so the
+     * actual evaluation is always deferred to the main thread.
+     */
+    private fun updatePlaybackWakeLock() {
+        mainHandler.post {
+            val p = mediaSession?.player
+            val exoRequested = p != null && p.playWhenReady &&
+                (p.playbackState == Player.STATE_READY || p.playbackState == Player.STATE_BUFFERING)
+            val hold = exoRequested || (usbAudioSink != null && usbDriverOwnsDac)
+            if (hold) acquirePlaybackWakeLock() else releasePlaybackWakeLock()
+            updateSleepSuppression(hold)
+        }
+    }
+
+    /**
+     * Main thread only. Keeps the Android TV box out of standby while [active]:
+     * publishes [keepAwake] (→ FLAG_KEEP_SCREEN_ON in the visible activity,
+     * blocking the normal inactivity timeout) and suspends the inattentive-sleep
+     * timer when WRITE_SECURE_SETTINGS has been granted. When playback stops,
+     * the user's attentive_timeout is put back after a short grace so track
+     * changes and brief pauses do not flip the device setting back and forth.
+     */
+    private fun updateSleepSuppression(active: Boolean) {
+        if (sleepSuppressionShutDown) {
+            publishKeepAwake(false)
+            return
+        }
+        val wasActive = keepAwake
+        publishKeepAwake(active)
+        if (active) {
+            mainHandler.removeCallbacks(attentiveRestoreRunnable)
+            if (!suppressAttentiveSleep(this) && !attentiveHintLogged &&
+                attentiveSleepStatus(this) == AttentiveSleepStatus.NEEDS_GRANT) {
+                attentiveHintLogged = true
+                Log.w(TAG, "Android TV inattentive-sleep timer is active and cannot be suspended — " +
+                    "the box may still sleep mid-playback. Grant once: adb shell pm grant " +
+                    "$packageName android.permission.WRITE_SECURE_SETTINGS")
+            }
+        } else if (wasActive) {
+            mainHandler.removeCallbacks(attentiveRestoreRunnable)
+            mainHandler.postDelayed(attentiveRestoreRunnable, ATTENTIVE_RESTORE_GRACE_MS)
+        }
+    }
+
     private val playerListener = object : Player.Listener {
         private var retryCount = 0
 
@@ -1365,9 +1640,9 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            // Keep the device awake while actually playing so the Shield does not
-            // suspend (and power off USB, dropping the DAC) mid-listening.
-            if (isPlaying) acquirePlaybackWakeLock() else releasePlaybackWakeLock()
+            // Keep the device awake while audio is being produced so the Shield
+            // does not suspend (and power off USB, dropping the DAC) mid-listening.
+            updatePlaybackWakeLock()
         }
 
         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -1428,6 +1703,7 @@ class PlaybackService : MediaSessionService() {
                 if (p.playbackState == Player.STATE_IDLE && p.mediaItemCount > 0) {
                     p.prepare()
                 }
+                updatePlaybackWakeLock()
                 return
             }
             saveCurrentPosition()
@@ -1443,6 +1719,7 @@ class PlaybackService : MediaSessionService() {
             // With the usbdevfs driver, also drop its force-claims so other
             // apps get the DAC back while we are paused.
             releaseUsbDriverDac()
+            updatePlaybackWakeLock()
             if (bitPerfectManager.findUsbOutputDevice() != null) {
                 mediaSession?.player?.stop()
             }
@@ -1451,6 +1728,7 @@ class PlaybackService : MediaSessionService() {
         private var wasBuffering = false
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            updatePlaybackWakeLock()
             // A reset waits for STATE_IDLE: that is the moment stop() has
             // released the AudioTrack, so the rebuild can safely reopen the USB
             // session with the current track's rate (without this, the rebuilt
@@ -1513,13 +1791,18 @@ class PlaybackService : MediaSessionService() {
         instance = this
         bitPerfectManager = BitPerfectManager(this)
 
-        // PARTIAL_WAKE_LOCK: CPU-awake during playback, screen free to time out.
-        // (An earlier SCREEN_DIM_WAKE_LOCK was thought to suppress Android TV's
-        // inattentive-sleep timer; testing showed it did not — see
-        // https://source.android.com/docs/core/power/tv-standby. The Shield's
-        // standby is a Settings.Secure `attentive_timeout`/`sleep_timeout` timer
-        // over which wake locks have no effect, so the fix is those device
-        // settings, not the wake-lock level.)
+        // A previous process may have died (crash / force-stop / System.exit)
+        // while it had attentive_timeout suspended — put the user's value back.
+        restoreAttentiveSleep(this, "stale override from previous process")
+
+        // PARTIAL_WAKE_LOCK: keeps the CPU awake during playback. On Android TV
+        // it does not keep the box out of standby by itself — the two standby
+        // timers are handled separately (see updateSleepSuppression()):
+        //   - screen_off_timeout / sleep_timeout: blocked by FLAG_KEEP_SCREEN_ON
+        //     on the visible activity (a screen-level wake lock would also block
+        //     it, which is why the earlier SCREEN_DIM lock "half worked");
+        //   - attentive_timeout: ignores ALL wake locks and window flags; only
+        //     writing the setting (WRITE_SECURE_SETTINGS) suspends it.
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         playbackWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BitperfectPlayer:playback")
             .apply { setReferenceCounted(false) }
@@ -1721,6 +2004,11 @@ class PlaybackService : MediaSessionService() {
         mediaSession?.run { player.release(); release() }
         releasePlaybackWakeLock()
         playbackWakeLock = null
+        // The pending grace-period restore was dropped with the handler queue
+        // above — restore now and let the UI drop FLAG_KEEP_SCREEN_ON.
+        sleepSuppressionShutDown = true
+        publishKeepAwake(false)
+        restoreAttentiveSleep(this, "service destroyed")
         super.onDestroy()
     }
 

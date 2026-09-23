@@ -132,6 +132,17 @@ static void freeRing(UsbAudioContext *ctx) {
 
 // ── USB helpers ─────────────────────────────────────────────────────
 
+/**
+ * Worst-case bytes in one URB for this stream: the most frames a packet can
+ * carry (nominal frames per microframe, plus the ~1% the async feedback may
+ * push it up — handleFeedbackCompletion() accepts up to +1%), times bytes
+ * per frame, times packets per URB. Must fit in USB_AUDIO_URB_BUFFER_SIZE.
+ */
+static int maxUrbBytesFor(int sampleRate, int bytesPerFrame) {
+    int maxFramesPerPacket = (int)ceil(sampleRate / 8000.0 * 1.01);
+    return maxFramesPerPacket * bytesPerFrame * USB_AUDIO_PACKETS_PER_URB;
+}
+
 static double readFeedback(int fd, int ep) {
     uint8_t fb[4] = {};
     size_t sz = sizeof(struct usbdevfs_urb) + sizeof(struct usbdevfs_iso_packet_desc);
@@ -415,6 +426,17 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioCreate(
         jint rate, jint ch, jint bits, jint maxPkt) {
     LOGI("Create: fd=%d ep=0x%02x rate=%d ch=%d bits=%d maxPkt=%d",
          fd, epOut, rate, ch, bits, maxPkt);
+    // Refuse formats whose URBs would not fit the fixed ring-slot buffers
+    // (previously 705.6/768 kHz silently overflowed them). Returning 0 makes
+    // UsbAudioStream.isReady false, so the sink falls back to system audio.
+    int worstUrbBytes = maxUrbBytesFor(rate, (bits / 8) * ch);
+    if (worstUrbBytes > USB_AUDIO_URB_BUFFER_SIZE) {
+        LOGE("Create: rate=%d ch=%d bits=%d needs up to %d bytes per URB, "
+             "buffer is %d — format not supported by the USB driver",
+             rate, ch, bits, worstUrbBytes, USB_AUDIO_URB_BUFFER_SIZE);
+        return 0;
+    }
+
     auto *ctx = new(std::nothrow) UsbAudioContext();
     if (!ctx) return 0;
     ctx->fd = fd;
@@ -501,6 +523,14 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioStart(
 
     if (ctx->endpointFeedback > 0) {
         double fb = readFeedback(ctx->fd, ctx->endpointFeedback);
+        // Same ±1% sanity window as handleFeedbackCompletion(): a misparsed
+        // or bogus first reading must not size packets (it could otherwise
+        // blow URBs past USB_AUDIO_URB_BUFFER_SIZE).
+        if (fb > 0 && !(fb > nominalFpmf * 0.99 && fb < nominalFpmf * 1.01)) {
+            LOGW("Start: initial feedback %.4f fpmf outside ±1%% of nominal %.4f — ignoring",
+                 fb, nominalFpmf);
+            fb = 0;
+        }
         if (fb > 0) {
             ctx->calibratedFpmf = fb;
             LOGI("Start: initial feedback=%.4f fpmf (%.1f Hz), nominal=%.4f (%.1f Hz)",
@@ -698,14 +728,16 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbConnect(
 void padInt16ToInt32(const uint8_t *src, uint8_t *dst, int numSamples) {
     auto *out = reinterpret_cast<int32_t *>(dst);
     auto *in16 = reinterpret_cast<const int16_t *>(src);
-    for (int i = 0; i < numSamples; i++) out[i] = (int32_t)in16[i] << 16;
+    // Shift as unsigned: left-shifting a negative signed value is undefined
+    // behaviour before C++20 (same bits either way, but no UB in the bit-perfect path).
+    for (int i = 0; i < numSamples; i++) out[i] = (int32_t)((uint32_t)(int32_t)in16[i] << 16);
 }
 
 // int32 (24-bit sign-extended from libFLAC) → 32-bit: shift left 8
 void shiftInt32From24(const uint8_t *src, uint8_t *dst, int numSamples) {
     auto *out = reinterpret_cast<int32_t *>(dst);
     auto *in32 = reinterpret_cast<const int32_t *>(src);
-    for (int i = 0; i < numSamples; i++) out[i] = in32[i] << 8;
+    for (int i = 0; i < numSamples; i++) out[i] = (int32_t)((uint32_t)in32[i] << 8);
 }
 
 // 24-bit packed (3 bytes/sample) → 32-bit: read 3 bytes, sign-extend, shift left 8
@@ -714,7 +746,7 @@ void padInt24ToInt32(const uint8_t *src, uint8_t *dst, int numSamples) {
     for (int i = 0; i < numSamples; i++) {
         int32_t s = src[i*3] | (src[i*3+1] << 8) | (src[i*3+2] << 16);
         if (s & 0x800000) s |= 0xFF000000;  // sign-extend from 24 to 32 bits
-        out[i] = s << 8;  // shift to fill 32-bit range
+        out[i] = (int32_t)((uint32_t)s << 8);  // shift to fill 32-bit range (unsigned: no UB)
     }
 }
 
@@ -800,6 +832,17 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
                 free(mergedBuf);
                 return;
             }
+        }
+
+        // Last line of defence (create-time check above should make this
+        // unreachable, but the rate can also be changed after creation via
+        // nativeUsbAudioSetSampleRate): never write past the slot buffer.
+        if (urbBytes > USB_AUDIO_URB_BUFFER_SIZE) {
+            LOGE("submitPcmToUrbs: URB of %d bytes exceeds slot buffer %d — stopping stream",
+                 urbBytes, USB_AUDIO_URB_BUFFER_SIZE);
+            ctx->running.store(false);
+            free(mergedBuf);
+            return;
         }
 
         UrbSlot *slot = &ctx->ring[ctx->submitIdx];

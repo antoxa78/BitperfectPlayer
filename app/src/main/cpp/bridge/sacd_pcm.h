@@ -79,6 +79,22 @@ sacd_pcm_reader_t *sacd_pcm_open_cb(sacd_block_read_fn read, sacd_block_size_fn 
 void sacd_pcm_close(sacd_pcm_reader_t *r);
 
 /*
+ * Switches the reader to DoP (DSD over PCM) output: instead of converting DSD
+ * to PCM, each output sample carries 16 raw DSD bits under the 0x05/0xFA DoP
+ * marker, for DACs that decode DSD themselves. Requires a stereo area and an
+ * output rate of dsd_rate/16 (176400 for SACD's DSD64). Must be called before
+ * the first read. Returns 0 on success, -1 if not possible.
+ */
+int sacd_pcm_set_dop(sacd_pcm_reader_t *r, int enable);
+
+/*
+ * DoP mode only: reads up to `frames` frames as packed 24-bit little-endian
+ * DoP samples (3 bytes per channel sample) into `out`. Returns frames read,
+ * 0 at end of track, -1 on error.
+ */
+long sacd_pcm_read_dop24(sacd_pcm_reader_t *r, uint8_t *out, long frames);
+
+/*
  * Decodes up to `frames` output frames (one frame = `channels` interleaved
  * float samples) into `out`.
  *

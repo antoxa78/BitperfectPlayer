@@ -107,9 +107,33 @@ class NativeAudioEngine {
     fun getChannels(): Int =
         if (handle != 0L) nativeGetChannels(handle) else 0
 
-    /** FLAC file bits per sample (e.g., 24). */
+    /** FLAC file bits per sample (e.g., 24). Updates after a gapless switch. */
     fun getBitsPerSample(): Int =
         if (handle != 0L) nativeGetBitsPerSample(handle) else 0
+
+    // ── Gapless playback ───────────────────────────────────────────
+
+    /**
+     * Queue the FLAC file that should play right after the current one.
+     * The file is opened and parsed on a background thread (the fd is dup'd,
+     * so the caller may close its copy immediately). At end of stream the
+     * engine continues straight into it on the same USB stream — no drain,
+     * no gap — provided sample rate and channel count match; otherwise the
+     * engine ends normally and the player reconfigures as before.
+     * Replaces any previously queued track.
+     */
+    fun setNextFd(fd: Int): Boolean =
+        handle != 0L && nativeSetNextFd(handle, fd)
+
+    /** Drop the queued next track (e.g. the play queue changed). */
+    fun clearNext() {
+        if (handle != 0L) nativeClearNext(handle)
+    }
+
+    /** Number of gapless file switches performed so far (monotonic). After a
+     *  switch, [getPositionUs] counts from the start of the new file. */
+    fun getTrackSwitchCount(): Int =
+        if (handle != 0L) nativeGetTrackSwitchCount(handle) else 0
 
     // ── JNI declarations ───────────────────────────────────────────
 
@@ -125,6 +149,9 @@ class NativeAudioEngine {
     private external fun nativeGetChannels(handle: Long): Int
     private external fun nativeGetBitsPerSample(handle: Long): Int
     private external fun nativeIsRunning(handle: Long): Boolean
+    private external fun nativeSetNextFd(handle: Long, fd: Int): Boolean
+    private external fun nativeClearNext(handle: Long)
+    private external fun nativeGetTrackSwitchCount(handle: Long): Int
 
     companion object {
         private const val TAG = "NativeAudioEngine"

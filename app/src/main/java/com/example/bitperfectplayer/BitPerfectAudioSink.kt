@@ -4,6 +4,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioTimestamp
 import android.media.AudioTrack
+import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Format
@@ -15,6 +16,7 @@ import androidx.media3.exoplayer.analytics.PlayerId
 import androidx.media3.exoplayer.audio.AudioOffloadSupport
 import androidx.media3.exoplayer.audio.AudioSink
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -50,6 +52,16 @@ class BitPerfectAudioSink(
     private var directEnded = false
     private var playing = false
     private val audioTimestamp = AudioTimestamp()
+
+    /** Encoding the direct AudioTrack is opened with: the input encoding, or
+     *  PCM_32BIT / PCM_24BIT when float decoder output is converted so the track
+     *  matches an Android 14+ BIT_PERFECT mixer (see [chooseDirectOutputEncoding]). */
+    private var directOutputEncoding = C.ENCODING_INVALID
+    private var directConvertFloat = false
+    /** Reused native-order buffer holding the integer version of one input buffer. */
+    private var convertBuffer: ByteBuffer? = null
+    /** Converted data not yet fully accepted by a non-blocking AudioTrack.write(). */
+    private var pendingConverted: ByteBuffer? = null
 
     /**
      * When true, the userspace USB driver owns the DAC and this sink must not
@@ -114,7 +126,9 @@ class BitPerfectAudioSink(
             directFormat = format
             directChannelMask = channelMaskFor(format)
             directBufferSize = specifiedBufferSize
-            directFrameSize = Util.getPcmFrameSize(format.pcmEncoding, format.channelCount)
+            chooseDirectOutputEncoding(format)
+            pendingConverted = null
+            directFrameSize = Util.getPcmFrameSize(directOutputEncoding, format.channelCount)
             directWrittenFrames = 0L
             directBasePlaybackHead = 0L
             directStartMediaTimeUs = C.TIME_UNSET
@@ -158,6 +172,22 @@ class BitPerfectAudioSink(
 
         if (!buffer.hasRemaining()) return true
         if (directStartMediaTimeUs == C.TIME_UNSET) directStartMediaTimeUs = presentationTimeUs
+
+        if (directConvertFloat) {
+            // Convert the whole input buffer once; keep the result until the
+            // track has taken all of it (ExoPlayer re-offers the same, unconsumed
+            // input buffer while we return false).
+            val out = pendingConverted ?: convertFloatToInteger(buffer).also { pendingConverted = it }
+            val w = track.write(out, out.remaining(), AudioTrack.WRITE_NON_BLOCKING)
+            if (w < 0) {
+                throw AudioSink.WriteException(w, checkNotNull(directFormat), w == AudioTrack.ERROR_DEAD_OBJECT)
+            }
+            directWrittenFrames += w / directFrameSize
+            if (out.hasRemaining()) return false
+            pendingConverted = null
+            buffer.position(buffer.limit())
+            return true
+        }
 
         val written = track.write(buffer, buffer.remaining(), AudioTrack.WRITE_NON_BLOCKING)
         if (written < 0) {
@@ -271,6 +301,7 @@ class BitPerfectAudioSink(
     override fun flush() {
         if (directMode) {
             directTrack?.flush()
+            pendingConverted = null
             directWrittenFrames = 0L
             directBasePlaybackHead = directTrack?.playbackHeadPosition?.toLong()?.and(0xFFFFFFFFL) ?: 0L
             directStartMediaTimeUs = C.TIME_UNSET
@@ -299,7 +330,7 @@ class BitPerfectAudioSink(
         val minBufferSize = AudioTrack.getMinBufferSize(
             format.sampleRate,
             directChannelMask,
-            format.pcmEncoding
+            directOutputEncoding
         )
         if (minBufferSize <= 0) {
             throw initializationException(IllegalArgumentException("Unsupported direct PCM format"))
@@ -309,7 +340,7 @@ class BitPerfectAudioSink(
         val requestedBufferSize = maxOf(minBufferSize * 2, directBufferSize)
         val bufferSize = ((requestedBufferSize + frameSize - 1) / frameSize) * frameSize
         val config = AudioSink.AudioTrackConfig(
-            format.pcmEncoding,
+            directOutputEncoding,
             format.sampleRate,
             directChannelMask,
             tunneling,
@@ -326,7 +357,7 @@ class BitPerfectAudioSink(
 
         try {
             val audioFormat = AudioFormat.Builder()
-                .setEncoding(format.pcmEncoding)
+                .setEncoding(directOutputEncoding)
                 .setSampleRate(format.sampleRate)
                 .setChannelMask(directChannelMask)
                 .build()
@@ -376,6 +407,7 @@ class BitPerfectAudioSink(
         val config = directConfig
         directTrack = null
         directConfig = null
+        pendingConverted = null
         try { track.pause() } catch (_: Exception) {}
         // release() can throw on a track already in a bad state (e.g. dead
         // object after the DAC drops mid-stream) — guard it like pause() above
@@ -441,5 +473,68 @@ class BitPerfectAudioSink(
 
     private fun channelMaskFor(format: Format): Int {
         return Util.getAudioTrackChannelConfig(format.channelCount)
+    }
+
+    /**
+     * Decoders deliver float here (the sink advertises float so that 24-bit
+     * sources are not truncated to 16-bit), but Android 14+ USB bit-perfect
+     * mixers exist only for the DAC's integer formats: a float track never
+     * matches one and silently goes through the resampling system mixer. If the
+     * DAC offers a BIT_PERFECT mixer for int32 (else int24) at this rate, open
+     * the track in that format and convert — exact for any ≤24-bit source.
+     * Below Android 14 (e.g. Shield, Android 11: no 24/32-bit AudioTrack before
+     * API 31) nothing changes.
+     */
+    private fun chooseDirectOutputEncoding(format: Format) {
+        directOutputEncoding = format.pcmEncoding
+        directConvertFloat = false
+        if (format.pcmEncoding != C.ENCODING_PCM_FLOAT) return
+        val device = preferredDevice ?: bitPerfectManager.findUsbOutputDevice() ?: return
+        val intEncoding = bitPerfectManager.findBitPerfectIntegerEncoding(
+            device, format.sampleRate, directChannelMask
+        ) ?: return
+        directOutputEncoding = intEncoding
+        directConvertFloat = true
+        Log.i(TAG, "Float input -> ${if (intEncoding == C.ENCODING_PCM_32BIT) "int32" else "int24"} " +
+            "track for the BIT_PERFECT mixer (${format.sampleRate} Hz, ${format.channelCount} ch)")
+    }
+
+    private fun convertFloatToInteger(input: ByteBuffer): ByteBuffer {
+        // duplicate() resets the byte order to BIG_ENDIAN: restore the input's.
+        val floats = input.duplicate().order(input.order()).asFloatBuffer()
+        val n = floats.remaining()
+        val int32 = directOutputEncoding == C.ENCODING_PCM_32BIT
+        val needed = n * (if (int32) 4 else 3)
+        var out = convertBuffer
+        if (out == null || out.capacity() < needed) {
+            out = ByteBuffer.allocateDirect(needed).order(ByteOrder.nativeOrder())
+            convertBuffer = out
+        }
+        out!!.clear()
+        if (int32) {
+            for (i in 0 until n) out.putInt(floatToInt32(floats.get()))
+        } else {
+            for (i in 0 until n) {
+                val v = floatToInt24(floats.get())
+                out.put(v.toByte())
+                out.put((v shr 8).toByte())
+                out.put((v shr 16).toByte())
+            }
+        }
+        out.flip()
+        return out
+    }
+
+    private companion object {
+        const val TAG = "BitPerfectAudioSink"
+
+        /** Exact for float values that came from ≤24-bit integers (scaling by a
+         *  power of two in double precision), rounded to nearest otherwise. */
+        fun floatToInt32(f: Float): Int =
+            Math.round(f.toDouble() * 2147483648.0)
+                .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong()).toInt()
+
+        fun floatToInt24(f: Float): Int =
+            Math.round(f.toDouble() * 8388608.0).coerceIn(-8388608L, 8388607L).toInt()
     }
 }

@@ -24,8 +24,11 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 
 #define TAG "NativeAudioEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -234,8 +237,23 @@ struct NativeAudioEngine {
 
     // Decode thread
     pthread_t thread;
+    bool threadStarted;   // pthread_create succeeded and not yet joined
     std::atomic<bool> running;
     std::atomic<bool> paused;
+
+    // ── Gapless: next track prepared off the audio path ──
+    // nativeSetNextFd() opens and parses the next FLAC on a background
+    // "preparer" thread (metadata can be MBs of cover art — far longer than
+    // the 80 ms USB ring could cover). At end of stream the decode thread
+    // swaps the prepared parser in and keeps feeding the SAME USB ring, so
+    // there is no drain, no underrun and no gap between tracks.
+    pthread_mutex_t nextMu;
+    pthread_cond_t nextCv;
+    int nextGeneration;             // bumped by every set/clear; stale preparers discard
+    int preparersInFlight;          // detached preparer threads still running
+    AsyncBufferedDataSource *nextDataSource;  // prepared, owned (null if none)
+    FLACParser *nextParser;
+    std::atomic<int> trackSwitches; // gapless file switches performed so far
 
     // Position tracking
     std::atomic<int64_t> framesDecoded;
@@ -249,8 +267,157 @@ struct NativeAudioEngine {
     size_t convertBufferSize;
 };
 
+// ── Thread priority ─────────────────────────────────────────────────
+
+/** Android's ANDROID_PRIORITY_URGENT_AUDIO (nice -19), the level AudioFlinger's
+ *  own mixer threads use. Apps may raise their own threads this far: zygote
+ *  gives app processes an RLIMIT_NICE that allows it. SCHED_FIFO, which this
+ *  engine used to request, is NOT permitted for apps (no CAP_SYS_NICE and
+ *  RLIMIT_RTPRIO = 0), so that call always failed silently and left the
+ *  decode thread — the only thread feeding the USB ring — at normal priority. */
+static const int kUrgentAudioNice = -19;
+
+static void raiseToUrgentAudioPriority(const char *who) {
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    if (setpriority(PRIO_PROCESS, (id_t)tid, kUrgentAudioNice) == 0) {
+        LOGI("%s: thread %d raised to nice %d (urgent audio)", who, (int)tid, kUrgentAudioNice);
+    } else {
+        LOGW("%s: setpriority(%d) failed errno=%d (%s) — running at default priority",
+             who, kUrgentAudioNice, errno, strerror(errno));
+    }
+}
+
+// ── Gapless next-track handling ─────────────────────────────────────
+
+/** Caller holds nextMu. Frees any prepared-but-unused next track. */
+static void discardNextLocked(NativeAudioEngine *engine) {
+    delete engine->nextParser;        // parser references the data source: delete it first
+    delete engine->nextDataSource;
+    engine->nextParser = nullptr;
+    engine->nextDataSource = nullptr;
+}
+
+struct PrepareArgs {
+    NativeAudioEngine *engine;
+    int fd;          // owned (dup'd)
+    int generation;
+};
+
+/** Background thread: open + parse the next FLAC's metadata, then hand it to
+ *  the engine if nothing newer was queued meanwhile. Detached; the engine's
+ *  destroy waits for preparersInFlight to reach zero. */
+static void *prepareThreadFunc(void *arg) {
+    auto *a = static_cast<PrepareArgs *>(arg);
+    NativeAudioEngine *engine = a->engine;
+
+    auto *ds = new AsyncBufferedDataSource(a->fd, true);  // takes ownership of fd
+    auto *parser = new FLACParser(ds);
+    bool ok = parser->init() && parser->decodeMetadata();
+    if (!ok) LOGW("Gapless: preparing next track failed (FLAC init/metadata)");
+
+    pthread_mutex_lock(&engine->nextMu);
+    if (ok && a->generation == engine->nextGeneration) {
+        discardNextLocked(engine);
+        engine->nextParser = parser;
+        engine->nextDataSource = ds;
+        parser = nullptr;
+        ds = nullptr;
+        LOGI("Gapless: next track prepared (%u Hz, %u ch, %u-bit)",
+             engine->nextParser->getSampleRate(), engine->nextParser->getChannels(),
+             engine->nextParser->getBitsPerSample());
+    }
+    engine->preparersInFlight--;
+    pthread_cond_broadcast(&engine->nextCv);
+    pthread_mutex_unlock(&engine->nextMu);
+
+    delete parser;   // only non-null if not handed over (failed or superseded)
+    delete ds;
+    delete a;
+    return nullptr;
+}
+
+/** True if this engine can play [bits]-per-sample PCM into its USB format. */
+static bool isSupportedSourceDepth(const NativeAudioEngine *engine, int bits) {
+    return bits == engine->dacBitDepth ||
+           (engine->dacBitDepth == 32 && (bits == 16 || bits == 24));
+}
+
+/**
+ * Called by the decode thread at end of stream. Swaps in the prepared next
+ * track if one is (or, within a short bound, becomes) available and matches
+ * the running USB stream's sample rate and channel count. Returns true if
+ * decoding should simply continue with the new file.
+ */
+static bool takeNextTrack(NativeAudioEngine *engine) {
+    FLACParser *np = nullptr;
+    AsyncBufferedDataSource *nds = nullptr;
+
+    pthread_mutex_lock(&engine->nextMu);
+    // A preparer queued very late may still be parsing: wait briefly for it
+    // rather than giving up on gapless (the ring holds ~80 ms, so a long
+    // wait costs a gap either way — but not a skipped transition).
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    while (engine->nextParser == nullptr && engine->preparersInFlight > 0 &&
+           engine->running.load()) {
+        if (pthread_cond_timedwait(&engine->nextCv, &engine->nextMu, &deadline) != 0) break;
+    }
+    np = engine->nextParser;
+    nds = engine->nextDataSource;
+    engine->nextParser = nullptr;
+    engine->nextDataSource = nullptr;
+    pthread_mutex_unlock(&engine->nextMu);
+
+    if (np == nullptr) return false;
+
+    int rate = (int)np->getSampleRate();
+    int ch = (int)np->getChannels();
+    int bits = (int)np->getBitsPerSample();
+    if (rate != engine->sampleRate || ch != engine->channels ||
+        !isSupportedSourceDepth(engine, bits)) {
+        LOGI("Gapless: next track %d Hz/%d ch/%d-bit does not match stream %d Hz/%d ch "
+             "— ending normally (player reconfigures)",
+             rate, ch, bits, engine->sampleRate, engine->channels);
+        delete np;
+        delete nds;
+        return false;
+    }
+
+    // Grow decode buffers if the next file has a larger block size / depth.
+    size_t maxBlock = np->getMaxBlockSize();
+    size_t pcmNeed = maxBlock * (size_t)ch * (size_t)(bits / 8);
+    size_t convNeed = maxBlock * (size_t)ch * 4;
+    if (pcmNeed > engine->pcmBufferSize) {
+        auto *b = (uint8_t *)realloc(engine->pcmBuffer, pcmNeed);
+        if (!b) { delete np; delete nds; LOGE("Gapless: OOM growing pcm buffer"); return false; }
+        engine->pcmBuffer = b;
+        engine->pcmBufferSize = pcmNeed;
+    }
+    if (convNeed > engine->convertBufferSize) {
+        auto *b = (uint8_t *)realloc(engine->convertBuffer, convNeed);
+        if (!b) { delete np; delete nds; LOGE("Gapless: OOM growing convert buffer"); return false; }
+        engine->convertBuffer = b;
+        engine->convertBufferSize = convNeed;
+    }
+
+    // Only this thread uses parser/dataSource, so the swap needs no lock.
+    delete engine->parser;
+    delete engine->dataSource;
+    engine->parser = np;
+    engine->dataSource = nds;
+    engine->bitsPerSample = bits;
+    engine->seekPending.store(false);
+    engine->framesDecoded.store(0);
+    int n = engine->trackSwitches.fetch_add(1) + 1;
+    LOGI("Gapless: switched to next track #%d (%d Hz, %d ch, %d-bit) without draining USB",
+         n, rate, ch, bits);
+    return true;
+}
+
 static void *decodeThreadFunc(void *arg) {
     auto *engine = static_cast<NativeAudioEngine *>(arg);
+    raiseToUrgentAudioPriority("Decode thread");
     LOGI("Decode thread started: rate=%d ch=%d bits=%d dacBits=%d",
          engine->sampleRate, engine->channels,
          engine->bitsPerSample, engine->dacBitDepth);
@@ -302,6 +469,9 @@ static void *decodeThreadFunc(void *arg) {
             if (engine->parser->isDecoderAtEndOfStream()) {
                 LOGI("End of FLAC stream, %lld frames decoded",
                      (long long)engine->framesDecoded.load());
+                // Gapless: continue straight into the queued next track (same
+                // USB stream, residual bytes carried over) instead of exiting.
+                if (engine->running.load() && takeNextTrack(engine)) continue;
             } else {
                 LOGE("Decode error: %s",
                      engine->parser->getDecoderStateString());
@@ -415,6 +585,14 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeCreateFromFd(
     engine->framesDecoded.store(0);
     engine->seekTargetSampleIndex = -1;
     engine->seekPending.store(false);
+    engine->threadStarted = false;
+    pthread_mutex_init(&engine->nextMu, nullptr);
+    pthread_cond_init(&engine->nextCv, nullptr);
+    engine->nextGeneration = 0;
+    engine->preparersInFlight = 0;
+    engine->nextDataSource = nullptr;
+    engine->nextParser = nullptr;
+    engine->trackSwitches.store(0);
 
     // Allocate decode buffers
     size_t maxBlock = parser->getMaxBlockSize();
@@ -429,6 +607,8 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeCreateFromFd(
         free(engine->convertBuffer);
         delete parser;
         delete ds;
+        pthread_cond_destroy(&engine->nextCv);
+        pthread_mutex_destroy(&engine->nextMu);
         delete engine;
         return 0;
     }
@@ -446,6 +626,12 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeStart(
     auto *engine = reinterpret_cast<NativeAudioEngine *>(handle);
     if (!engine || engine->running.load()) return JNI_FALSE;
 
+    // A previous decode thread that ended on its own (EOF) is still joinable.
+    if (engine->threadStarted) {
+        pthread_join(engine->thread, nullptr);
+        engine->threadStarted = false;
+    }
+
     engine->running.store(true);
     engine->paused.store(false);
 
@@ -455,11 +641,8 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeStart(
         engine->running.store(false);
         return JNI_FALSE;
     }
-
-    // Set high priority for the decode thread
-    struct sched_param param;
-    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-    pthread_setschedparam(engine->thread, SCHED_FIFO, &param);
+    engine->threadStarted = true;
+    // Priority is raised by the decode thread itself (raiseToUrgentAudioPriority).
 
     LOGI("Engine started");
     return JNI_TRUE;
@@ -504,7 +687,14 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeStop(
 
     engine->running.store(false);
     engine->paused.store(false);
-    pthread_join(engine->thread, nullptr);
+    // Wake a decode thread waiting for a late-prepared next track.
+    pthread_mutex_lock(&engine->nextMu);
+    pthread_cond_broadcast(&engine->nextCv);
+    pthread_mutex_unlock(&engine->nextMu);
+    if (engine->threadStarted) {
+        pthread_join(engine->thread, nullptr);
+        engine->threadStarted = false;
+    }
     LOGI("Engine stopped");
 }
 
@@ -514,18 +704,93 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeDestroy(
     auto *engine = reinterpret_cast<NativeAudioEngine *>(handle);
     if (!engine) return;
 
-    if (engine->running.load()) {
-        engine->running.store(false);
+    engine->running.store(false);
+    pthread_mutex_lock(&engine->nextMu);
+    pthread_cond_broadcast(&engine->nextCv);
+    pthread_mutex_unlock(&engine->nextMu);
+    // Join even if the thread already ended by itself (EOF): an exited but
+    // unjoined pthread leaks its stack.
+    if (engine->threadStarted) {
         pthread_join(engine->thread, nullptr);
+        engine->threadStarted = false;
     }
+
+    // Invalidate any in-flight preparer and wait for it: it holds a pointer
+    // to this engine's mutex.
+    pthread_mutex_lock(&engine->nextMu);
+    engine->nextGeneration++;
+    discardNextLocked(engine);
+    while (engine->preparersInFlight > 0) {
+        pthread_cond_wait(&engine->nextCv, &engine->nextMu);
+    }
+    discardNextLocked(engine);  // a preparer can't hand over after the bump, but be safe
+    pthread_mutex_unlock(&engine->nextMu);
+    pthread_cond_destroy(&engine->nextCv);
+    pthread_mutex_destroy(&engine->nextMu);
 
     free(engine->pcmBuffer);
     free(engine->convertBuffer);
     delete engine->parser;
     delete engine->dataSource;
-    LOGI("Engine destroyed, %lld total frames",
-         (long long)engine->framesDecoded.load());
+    LOGI("Engine destroyed, %lld total frames, %d gapless switches",
+         (long long)engine->framesDecoded.load(), engine->trackSwitches.load());
     delete engine;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_decent_usbaudio_NativeAudioEngine_nativeSetNextFd(
+        JNIEnv *, jobject, jlong handle, jint fd) {
+    auto *engine = reinterpret_cast<NativeAudioEngine *>(handle);
+    if (!engine || fd < 0) return JNI_FALSE;
+
+    int owned = dup(fd);
+    if (owned < 0) {
+        LOGE("nativeSetNextFd: dup() failed errno=%d", errno);
+        return JNI_FALSE;
+    }
+
+    auto *args = new PrepareArgs();
+    args->engine = engine;
+    args->fd = owned;
+
+    pthread_mutex_lock(&engine->nextMu);
+    engine->nextGeneration++;
+    discardNextLocked(engine);
+    args->generation = engine->nextGeneration;
+    engine->preparersInFlight++;
+    pthread_mutex_unlock(&engine->nextMu);
+
+    pthread_t t;
+    if (pthread_create(&t, nullptr, prepareThreadFunc, args) != 0) {
+        LOGE("nativeSetNextFd: pthread_create failed");
+        pthread_mutex_lock(&engine->nextMu);
+        engine->preparersInFlight--;
+        pthread_cond_broadcast(&engine->nextCv);
+        pthread_mutex_unlock(&engine->nextMu);
+        close(owned);
+        delete args;
+        return JNI_FALSE;
+    }
+    pthread_detach(t);
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_decent_usbaudio_NativeAudioEngine_nativeClearNext(
+        JNIEnv *, jobject, jlong handle) {
+    auto *engine = reinterpret_cast<NativeAudioEngine *>(handle);
+    if (!engine) return;
+    pthread_mutex_lock(&engine->nextMu);
+    engine->nextGeneration++;   // any preparer still running will discard its result
+    discardNextLocked(engine);
+    pthread_mutex_unlock(&engine->nextMu);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_decent_usbaudio_NativeAudioEngine_nativeGetTrackSwitchCount(
+        JNIEnv *, jobject, jlong handle) {
+    auto *engine = reinterpret_cast<NativeAudioEngine *>(handle);
+    return engine ? (jint)engine->trackSwitches.load() : 0;
 }
 
 JNIEXPORT jlong JNICALL

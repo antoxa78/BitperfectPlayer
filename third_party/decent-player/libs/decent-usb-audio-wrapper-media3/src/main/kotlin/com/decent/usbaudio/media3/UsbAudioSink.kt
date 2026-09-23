@@ -6,6 +6,7 @@ import android.media.AudioManager
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import androidx.annotation.OptIn
@@ -13,6 +14,7 @@ import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.audio.AudioSink
@@ -61,7 +63,7 @@ class UsbAudioSink(
     /** File path of the current track. Set internally by [PlayerIntegrationListener]
      *  from the MediaItem URI. When non-null and pointing to a FLAC file, the native
      *  audio engine is used. For HTTP URIs, this is null (ExoPlayer pipeline fallback). */
-    private var currentTrackPath: String? = null
+    @Volatile private var currentTrackPath: String? = null
 
     /** Clean up a finished native engine and apply deferred USB config.
      *  @return true if an engine was cleaned up (caller should restart playback). */
@@ -189,7 +191,24 @@ class UsbAudioSink(
     private var engineNeedsInitialSeek: Boolean = false
 
     /** Path of the file the current native engine is decoding. Used to detect track changes. */
-    private var activeEnginePath: String? = null
+    @Volatile private var activeEnginePath: String? = null
+
+    // ── Gapless (native engine) ────────────────────────────────────
+    // The engine is given the next local FLAC in advance (NativeAudioEngine.setNextFd)
+    // and continues straight into it on the same USB stream. The player is then
+    // moved to that item with a seek purely for its timeline/UI; while that
+    // seek is in flight ExoPlayer stops (pause) and flushes this sink, which
+    // must NOT pause the engine or touch the USB stream.
+    private val mainHandler = Handler(Looper.getMainLooper())
+    /** Engine switch count already handled (see NativeAudioEngine.getTrackSwitchCount). */
+    @Volatile private var observedTrackSwitches = 0
+    /** True from the moment the engine switched files until the player's first
+     *  buffer of the new item has anchored the timeline. */
+    @Volatile private var gaplessAdvanceInFlight = false
+    @Volatile private var gaplessAdvanceStartedMs = 0L
+    /** Queue index / path handed to the engine as its next track. */
+    @Volatile private var queuedNextIndex = C.INDEX_UNSET
+    @Volatile private var queuedNextPath: String? = null
 
 
     /** Max queue entries before returning false for backpressure (paces ExoPlayer).
@@ -197,7 +216,7 @@ class UsbAudioSink(
     private val QUEUE_BACKPRESSURE_THRESHOLD = 16
 
     /** Tracks ExoPlayer's play/pause state so seek-while-paused doesn't auto-resume. */
-    private var isPlaying = false
+    @Volatile private var isPlaying = false
 
     /** Deferred USB reconfiguration — applied after engine finishes playing. */
     private var deferredRate: Int = 0
@@ -215,7 +234,14 @@ class UsbAudioSink(
         // before EOF. But if the track or rate changed, destroy and reconfigure.
         if (nativeEngine?.isRunning == true) {
             val trackChanged = currentTrackPath != activeEnginePath
-            if (!trackChanged) {
+            // During a gapless advance the player is being moved onto the track
+            // the engine is ALREADY playing; configure() can run before the
+            // main-thread onMediaItemTransition has updated currentTrackPath, so
+            // don't mistake that for a track change as long as the format fits.
+            val gaplessSameFormat = gaplessAdvanceInFlight &&
+                inputFormat.sampleRate == currentSampleRate &&
+                inputFormat.channelCount == currentChannelCount
+            if (!trackChanged || gaplessSameFormat) {
                 // Same track, ExoPlayer pre-buffering — defer reconfiguration
                 if (inputFormat.sampleRate != currentSampleRate || inputFormat.channelCount != currentChannelCount) {
                     deferredRate = inputFormat.sampleRate
@@ -310,7 +336,21 @@ class UsbAudioSink(
             }
 
             // Capture media timeline offset from first buffer (needed for position tracking)
-            if (usbStartMediaTimeNeedsInit) {
+            if (usbStartMediaTimeNeedsInit && gaplessAdvanceInFlight &&
+                nativeEngine?.isRunning == true) {
+                // First buffer of the item the engine already continued into
+                // (we sought the player to its position 0). Anchor the timeline
+                // to this item and leave the engine alone: no seek, no restart —
+                // it has been playing this file since the switch.
+                usbStartMediaTimeUs = maxOf(0L, presentationTimeUs)
+                usbStartMediaTimeNeedsInit = false
+                windowOffsetUs = presentationTimeUs
+                engineNeedsInitialSeek = false
+                gaplessAdvanceInFlight = false
+                isNativeEngineActive = true
+                Log.i(TAG, "Gapless: timeline anchored to next track (windowOffset=$windowOffsetUs, " +
+                        "engine already ${nativeEngine?.getPositionUs()?.div(1000)}ms in)")
+            } else if (usbStartMediaTimeNeedsInit) {
                 usbStartMediaTimeUs = maxOf(0L, presentationTimeUs)
                 usbStartMediaTimeNeedsInit = false
                 // Save window offset once per track (not reset by flush/seek).
@@ -378,7 +418,7 @@ class UsbAudioSink(
             if (currentEncoding == C.ENCODING_PCM_FLOAT) {
                 val totalSamples = snapshot.remaining() / 4
                 if (totalSamples > 0) {
-                    val floatBuf = FloatArray(totalSamples)
+                    val floatBuf = thread.obtainFloatArray(totalSamples)
                     snapshot.asFloatBuffer().get(floatBuf)
                     if (handleBufferCallCount <= 3) {
                         Log.i(TAG, "handleBuffer #$handleBufferCallCount: FLOAT samples=$totalSamples")
@@ -388,7 +428,7 @@ class UsbAudioSink(
             } else {
                 val remaining = snapshot.remaining()
                 if (remaining > 0) {
-                    val rawBytes = ByteArray(remaining)
+                    val rawBytes = thread.obtainByteArray(remaining)
                     snapshot.get(rawBytes)
                     if (handleBufferCallCount <= 3) {
                         val bps = PcmUtils.bytesPerSample(currentEncoding)
@@ -432,14 +472,28 @@ class UsbAudioSink(
                 Log.i(TAG, "Engine finished — advancing to next track")
                 val p = attachedPlayer
                 if (p != null) {
-                    Handler(Looper.getMainLooper()).post {
-                        if (p.hasNextMediaItem()) {
-                            p.seekToNextMediaItem()
-                        } else {
-                            p.pause()
-                        }
-                    }
+                    mainHandler.post { advanceAfterEngineEnd(p) }
                 }
+            }
+
+            // Gapless: the engine continued into the queued next file without a
+            // break. Move the player onto that item (timeline/UI only).
+            if (engine != null && engine.isRunning) {
+                val switches = engine.getTrackSwitchCount()
+                if (switches != observedTrackSwitches) {
+                    observedTrackSwitches = switches
+                    onGaplessSwitch()
+                }
+            }
+            if (gaplessAdvanceInFlight) {
+                if (SystemClock.elapsedRealtime() - gaplessAdvanceStartedMs < GAPLESS_ADVANCE_TIMEOUT_MS) {
+                    // Hold ExoPlayer's clock where it is (old item's end, then the
+                    // sought position 0 of the new item) until the new item's first
+                    // buffer anchors windowOffsetUs.
+                    return AudioSink.CURRENT_POSITION_NOT_SET
+                }
+                Log.w(TAG, "Gapless: player advance did not complete in time — resuming normal position reporting")
+                gaplessAdvanceInFlight = false
             }
 
             // Native engine: absolute FLAC position + window offset
@@ -497,6 +551,15 @@ class UsbAudioSink(
     }
 
     override fun pause() {
+        if (gaplessAdvanceInFlight && nativeEngine?.isRunning == true) {
+            // ExoPlayer stops its renderers while it seeks onto the item the
+            // engine is already playing — that is not a user pause, so keep the
+            // engine (and the USB stream) running. A real pause during the
+            // advance arrives via onPlayWhenReadyChanged(false) and is honoured there.
+            Log.i(TAG, "pause() during gapless advance — engine keeps playing")
+            super.pause()
+            return
+        }
         isPlaying = false
         if (!engineNeedsInitialSeek) nativeEngine?.pause()
         usbStreamingThread?.pauseStreaming()
@@ -517,14 +580,21 @@ class UsbAudioSink(
         // Native engine handles its own flush/seek internally
         // ExoPlayer pipeline: flush queue + native stream
         usbStreamingThread?.flush()
-        usbAudioStream?.flush()
+        // Never flush the native USB stream while the native engine is running:
+        // its decode thread writes into that stream concurrently (nativeFlush
+        // would race its residual/accumulator state), a seek is handled by the
+        // engine itself (engine.seek from handleBuffer), and during a gapless
+        // advance the stream must keep playing untouched.
+        if (nativeEngine?.isRunning != true) usbAudioStream?.flush()
         usbStartMediaTimeNeedsInit = true
         handledEndOfStream = false
         // Temporarily unblock LoadControl so ExoPlayer loads at least one chunk
         // after seek. handleBuffer will re-block once it captures presentationTimeUs.
         // Without this, the LoadControl blocks ALL post-seek loading and the engine
         // never knows where to seek to.
-        if (nativeEngine?.isRunning == true) {
+        // (Also when the engine has already finished: a dead engine must never
+        // keep ExoPlayer's loading blocked.)
+        if (nativeEngine != null) {
             isNativeEngineActive = false
         }
     }
@@ -718,6 +788,12 @@ class UsbAudioSink(
                         engineEndNotified = false
                         activeEnginePath = path
                         trackBitDepth = engine.getBitsPerSample()
+                        // Fresh engine: nothing queued yet, no switches seen.
+                        observedTrackSwitches = 0
+                        gaplessAdvanceInFlight = false
+                        queuedNextIndex = C.INDEX_UNSET
+                        queuedNextPath = null
+                        mainHandler.post { updateQueuedNext() }
                         Log.i(TAG, "Native FLAC engine started (paused, awaiting seek) for: ${File(path).name} ${trackBitDepth}-bit")
                         return
                     }
@@ -807,6 +883,9 @@ class UsbAudioSink(
         nativeEngine?.destroy()
         nativeEngine = null
         isNativeEngineActive = false
+        gaplessAdvanceInFlight = false
+        queuedNextIndex = C.INDEX_UNSET
+        queuedNextPath = null
 
         // Stop the streaming thread (drains queue, joins thread)
         usbStreamingThread?.stop()
@@ -929,6 +1008,122 @@ class UsbAudioSink(
             if (engineFinished) {
                 attachedPlayer?.seekTo(0)
             }
+
+            // 5. Gapless: hand the engine the item that follows this one.
+            updateQueuedNext()
+        }
+
+        // The item after the current one can change without a transition:
+        // re-queue so the engine never continues into a stale file.
+        override fun onTimelineChanged(timeline: Timeline, reason: Int) = updateQueuedNext()
+        override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) = updateQueuedNext()
+        override fun onRepeatModeChanged(repeatMode: Int) = updateQueuedNext()
+
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            // A user pause that lands while a gapless advance is in flight: the
+            // sink ignored ExoPlayer's seek-induced pause(), so honour this one.
+            if (!playWhenReady && gaplessAdvanceInFlight) {
+                gaplessAdvanceInFlight = false
+                isPlaying = false
+                nativeEngine?.pause()
+                Log.i(TAG, "Gapless: paused by user during advance")
+            }
+        }
+    }
+
+    /**
+     * Main thread. Queue the item that will play after the current one as the
+     * engine's gapless next track: the following index, or the same one with
+     * repeat-one. Only local FLAC files qualify (the engine decodes FLAC and
+     * checks rate/channels itself at the switch); anything else clears the queue
+     * so the engine ends normally and the player transitions as before.
+     */
+    private fun updateQueuedNext() {
+        val engine = nativeEngine ?: return
+        val p = attachedPlayer ?: return
+        if (!engine.isRunning) return
+        // A switch the playback thread hasn't processed yet: queuedNext* still
+        // describes the file the engine just took — leave it for onGaplessSwitch
+        // (which re-queues after moving the player).
+        if (engine.getTrackSwitchCount() != observedTrackSwitches) return
+        val index = if (p.repeatMode == Player.REPEAT_MODE_ONE) p.currentMediaItemIndex
+                    else p.nextMediaItemIndex
+        val path = if (index != C.INDEX_UNSET && index < p.mediaItemCount) {
+            resolveTrackPath(p.getMediaItemAt(index).localConfiguration?.uri)
+        } else null
+        if (path == null || !path.lowercase().endsWith(".flac")) {
+            if (queuedNextPath != null) {
+                engine.clearNext()
+                queuedNextPath = null
+                queuedNextIndex = C.INDEX_UNSET
+                Log.i(TAG, "Gapless: next item is not a local FLAC — queue cleared")
+            }
+            return
+        }
+        if (path == queuedNextPath && index == queuedNextIndex) return  // already queued
+        try {
+            android.os.ParcelFileDescriptor.open(
+                File(path), android.os.ParcelFileDescriptor.MODE_READ_ONLY
+            ).use { pfd ->
+                if (engine.setNextFd(pfd.fd)) {   // native dup()s the fd
+                    queuedNextPath = path
+                    queuedNextIndex = index
+                    Log.i(TAG, "Gapless: queued next track #$index ${File(path).name}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Gapless: could not queue ${File(path).name}: ${e.message}")
+            engine.clearNext()
+            queuedNextPath = null
+            queuedNextIndex = C.INDEX_UNSET
+        }
+    }
+
+    /** Playback thread (from getCurrentPositionUs). The engine has continued into
+     *  the queued file; move the player onto that item for its timeline and UI. */
+    private fun onGaplessSwitch() {
+        val path = queuedNextPath
+        val index = queuedNextIndex
+        queuedNextPath = null
+        queuedNextIndex = C.INDEX_UNSET
+        activeEnginePath = path
+        windowOffsetUs = -1L
+        trackBitDepth = nativeEngine?.getBitsPerSample() ?: trackBitDepth
+        gaplessAdvanceStartedMs = SystemClock.elapsedRealtime()
+        gaplessAdvanceInFlight = true
+        Log.i(TAG, "Gapless: engine continued into next track #$index ${path?.let { File(it).name }} — advancing player")
+        val p = attachedPlayer ?: run { gaplessAdvanceInFlight = false; return }
+        mainHandler.post {
+            val stillThere = index != C.INDEX_UNSET && index < p.mediaItemCount &&
+                resolveTrackPath(p.getMediaItemAt(index).localConfiguration?.uri) == path
+            if (stillThere) {
+                p.seekTo(index, 0L)
+                // Repeat-one re-seeks the same item, which fires no transition
+                // callback: queue the next repetition explicitly.
+                updateQueuedNext()
+            } else {
+                // The queue changed after the file was handed to the engine.
+                // Fall back to a normal advance; configure() sees the path
+                // mismatch and rebuilds the engine for the right item.
+                Log.w(TAG, "Gapless: queue changed under the engine — normal advance")
+                gaplessAdvanceInFlight = false
+                advanceAfterEngineEnd(p)
+            }
+        }
+    }
+
+    /** Main thread. Advance after the engine ended (non-gapless path). */
+    private fun advanceAfterEngineEnd(p: Player) {
+        when {
+            p.repeatMode == Player.REPEAT_MODE_ONE -> {
+                // Re-seeking the same item fires no onMediaItemTransition, so the
+                // finished engine would never be cleaned up and the load control
+                // would keep ExoPlayer blocked: clean up here first.
+                cleanupFinishedEngine()
+                p.seekTo(p.currentMediaItemIndex, 0L)
+            }
+            p.hasNextMediaItem() -> p.seekToNextMediaItem()
+            else -> p.pause()
         }
     }
 
@@ -978,6 +1173,10 @@ class UsbAudioSink(
 
     companion object {
         private const val TAG = "UsbAudioSink"
+
+        /** Upper bound for the player to reach the next item after a gapless
+         *  switch before position reporting falls back to normal. */
+        private const val GAPLESS_ADVANCE_TIMEOUT_MS = 5_000L
 
         /**
          * Wraps a [LoadControl] to suppress ExoPlayer loading when the native

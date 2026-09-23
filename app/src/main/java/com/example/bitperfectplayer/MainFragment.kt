@@ -296,6 +296,8 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("USB DAC", getUsbDacStatus()))
         settingsAdapter.add(createActionItem("Audio Output", getAudioOutputSubtitle()))
         settingsAdapter.add(createActionItem("LAN Player Control", getLanControlSubtitle()))
+        settingsAdapter.add(createActionItem("Stay Awake While Playing", getStayAwakeSubtitle()))
+        settingsAdapter.add(createActionItem("DSD Output", getDsdOutputSubtitle()))
         settingsAdapter.add(createActionItem("About", "Version and build info"))
         val settingsHeader = HeaderItem(4, "Settings")
         rowsAdapter.add(ListRow(settingsHeader, settingsAdapter))
@@ -1852,7 +1854,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso", ".dsf", ".dff")
         return extensions.any { filename.lowercase().endsWith(it) }
     }
 
@@ -2344,6 +2346,90 @@ class MainFragment : BrowseSupportFragment() {
             }
         }
         dialog.show()
+    }
+
+    private fun getDsdOutputSubtitle(): String {
+        val context = requireContext()
+        return when {
+            !PlaybackService.isDopSelected(context) -> "Convert to PCM (any DAC)"
+            PlaybackService.isDopOutputActive(context) -> "DoP — native DSD on the DAC"
+            else -> "DoP (inactive: needs USB driver mode + USB DAC)"
+        }
+    }
+
+    /**
+     * DSD (SACD ISO, DSF, DFF) can be converted to PCM in the app — works with
+     * every DAC — or sent as DoP, which a DoP-capable DAC decodes as native DSD.
+     * DoP is only used in "Bit-perfect (USB driver)" mode, the one output path
+     * that delivers the samples bit-exactly; elsewhere PCM conversion is used.
+     */
+    private fun showDsdOutputDialog() {
+        val context = requireContext()
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val options = arrayOf(
+            "Convert to PCM (176.4 kHz, works with any DAC)",
+            "DoP — DSD over PCM (DAC must support DoP)"
+        )
+        val current = if (PlaybackService.isDopSelected(context)) 1 else 0
+        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("DSD Output")
+            .setSingleChoiceItems(options, current) { dialog, which ->
+                prefs.edit().putString(
+                    PlaybackService.KEY_DSD_OUTPUT,
+                    if (which == 1) PlaybackService.DSD_OUTPUT_DOP else PlaybackService.DSD_OUTPUT_PCM
+                ).apply()
+                dialog.dismiss()
+                val note = if (which == 1 && !PlaybackService.isDopOutputActive(context)) {
+                    "DoP is used only in Bit-perfect (USB driver) mode with a USB DAC attached — until then DSD is converted to PCM."
+                } else {
+                    "Applies from the next DSD track."
+                }
+                Toast.makeText(context, note, Toast.LENGTH_LONG).show()
+                refreshWithCurrentFocus()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun getStayAwakeSubtitle(): String =
+        when (PlaybackService.attentiveSleepStatus(requireContext())) {
+            AttentiveSleepStatus.HANDLED_BY_APP -> "Enabled"
+            AttentiveSleepStatus.ALREADY_OFF    -> "Enabled (device sleep timer is off)"
+            AttentiveSleepStatus.NEEDS_GRANT    -> "Needs one-time adb setup"
+        }
+
+    /**
+     * Explains how the player keeps the TV box awake during playback and, when
+     * the Android TV inattentive-sleep timer is still active, how to let the app
+     * suspend it (a one-time adb grant — no app can block that timer otherwise).
+     */
+    private fun showStayAwakeDialog() {
+        val context = requireContext()
+        val grant = "adb shell pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS"
+        val status = when (PlaybackService.attentiveSleepStatus(context)) {
+            AttentiveSleepStatus.HANDLED_BY_APP ->
+                "Status: fully enabled. While music plays, the device's inactivity sleep timer " +
+                    "is paused, and your setting is put back when playback stops."
+            AttentiveSleepStatus.ALREADY_OFF ->
+                "Status: fully enabled. The device's inactivity sleep timer is already set to Never."
+            AttentiveSleepStatus.NEEDS_GRANT ->
+                "Status: needs setup. The device's inactivity sleep timer can still put it to " +
+                    "sleep during long listening sessions."
+        }
+        val message = "$status\n\n" +
+            "While music plays and the player is on screen, the device is kept awake. " +
+            "The player's own screensaver still blanks the screen.\n\n" +
+            "Android TV also has a separate inactivity sleep timer (Settings → Device " +
+            "Preferences → Energy saver / Power) that no app can block by itself. " +
+            "To let the player pause it during playback, run this once from a computer:\n\n" +
+            "$grant\n\n" +
+            "Or set that timer to Never in the device settings."
+
+        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Stay Awake While Playing")
+            .setMessage(message)
+            .setPositiveButton("OK") { _, _ -> refreshWithCurrentFocus() }
+            .show()
     }
 
     private fun getScreensaverLabel(): String {
@@ -3150,6 +3236,12 @@ class MainFragment : BrowseSupportFragment() {
             }
             actionId == "action:LAN Player Control" -> {
                 showLanControlDialog()
+            }
+            actionId == "action:Stay Awake While Playing" -> {
+                showStayAwakeDialog()
+            }
+            actionId == "action:DSD Output" -> {
+                showDsdOutputDialog()
             }
             actionId == "action:About" -> {
                 showAboutDialog()

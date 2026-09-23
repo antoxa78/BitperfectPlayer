@@ -32,11 +32,17 @@
 #define USB_AUDIO_NUM_URBS 80
 
 /**
- * Max bytes per URB data buffer.
- * Worst case: 384kHz * 4 bytes * 2 channels / 8000 microframes * 8 packets
- *           = 384 * 8 = 3072 bytes per URB. Round up generously.
+ * Max bytes per URB data buffer (also the size of the residual buffer).
+ * Bytes per URB = frames per microframe × bytes per frame × 8 packets, and
+ * the async feedback lets frames per microframe run up to ~1% above nominal.
+ * Worst case at 768 kHz, 32-bit stereo: ceil(96 × 1.01) = 97 frames × 8 bytes
+ *   × 8 packets = 6208 bytes. The old 4096 only covered 384 kHz (3072 bytes),
+ *   so 705.6/768 kHz overflowed every ring slot and dropped audio.
+ * 8192 covers stereo 32-bit up to ~1 MHz (and e.g. 8ch 32-bit at 192 kHz).
+ * Streams that would still exceed it are refused at creation — see
+ * maxUrbBytesFor() in usb-audio-output.cpp — instead of corrupting memory.
  */
-#define USB_AUDIO_URB_BUFFER_SIZE 4096
+#define USB_AUDIO_URB_BUFFER_SIZE 8192
 
 /**
  * One slot in the pre-allocated URB ring buffer.

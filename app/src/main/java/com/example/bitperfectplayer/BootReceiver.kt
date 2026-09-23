@@ -9,6 +9,9 @@ import android.util.Log
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        // If the app died while it had Android TV's inattentive-sleep timer
+        // suspended for playback, put the user's setting back now.
+        PlaybackService.restoreAttentiveSleep(context, "boot")
         val prefs = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
         val autostart = prefs.getBoolean("mpd_autostart", false)
         val enabled = prefs.getBoolean("mpd_enabled", true)

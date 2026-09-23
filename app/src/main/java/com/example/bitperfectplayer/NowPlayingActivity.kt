@@ -843,6 +843,9 @@ class NowPlayingActivity : BaseActivity() {
     @OptIn(UnstableApi::class)
     private fun formatInfoParts(f: Format): List<String> {
         val p = mutableListOf<String>()
+        // DSD sources label themselves ("DSD64 DoP" / "DSD64 → PCM"): the PCM
+        // rate/bits alone would misdescribe a DoP stream.
+        f.label?.takeIf { it.startsWith("DSD") }?.let { p.add(it) }
         if (f.bitrate != Format.NO_VALUE && f.bitrate > 0) p.add("${f.bitrate / 1000} kbps")
         val sr = displaySampleRate(f)
         if (sr > 0) p.add("$sr Hz")

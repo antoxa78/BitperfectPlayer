@@ -95,6 +95,8 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
             id.startsWith("action:External Drive")    -> R.drawable.ic_usb
             id.startsWith("action:Add SMB")           -> R.drawable.ic_network_music
             id.startsWith("action:Screensaver")       -> R.drawable.ic_screensaver
+            id.startsWith("action:Stay Awake")        -> R.drawable.ic_screensaver
+            id.startsWith("action:DSD Output")        -> R.drawable.ic_waveform
             id.startsWith("action:Resume")            -> R.drawable.ic_play
             id.startsWith("action:Recent")            -> R.drawable.ic_history
             id.startsWith("action:Network Settings")  -> R.drawable.ic_network

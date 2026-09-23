@@ -18,7 +18,8 @@ class MpdLibrary(private val context: Context) {
     companion object {
         private const val TAG = "MpdLibrary"
         private val AUDIO_EXT = listOf(
-            ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".ape", ".opus", ".iso"
+            ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".ape", ".opus", ".iso",
+            ".dsf", ".dff"
         )
         fun isAudioFile(name: String): Boolean = AUDIO_EXT.any { name.lowercase().endsWith(it) }
     }

@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -34,8 +35,33 @@ abstract class BaseActivity : FragmentActivity() {
     // screensaver is hidden or the activity is destroyed (BUG-15).
     private val bounceHandler = Handler(Looper.getMainLooper())
 
+    // Keep the TV box out of standby while music plays. On Android TV the
+    // playback service's PARTIAL_WAKE_LOCK does not stop the normal inactivity
+    // timeout (system screensaver → "Put device to sleep") — only a visible
+    // window with FLAG_KEEP_SCREEN_ON (or a screen-level wake lock) does. The
+    // flag is set only while PlaybackService reports active playback; the
+    // app's own screensaver overlay still blanks the panel against burn-in.
+    // (Android TV's separate inattentive-sleep timer ignores this flag — the
+    // service handles that one itself, see PlaybackService.suppressAttentiveSleep.)
+    private val keepAwakeListener: (Boolean) -> Unit = { awake -> applyKeepScreenOn(awake) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        PlaybackService.addKeepAwakeListener(keepAwakeListener)
+    }
+
+    override fun onStop() {
+        PlaybackService.removeKeepAwakeListener(keepAwakeListener)
+        super.onStop()
+    }
+
+    private fun applyKeepScreenOn(on: Boolean) {
+        if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun onDestroy() {

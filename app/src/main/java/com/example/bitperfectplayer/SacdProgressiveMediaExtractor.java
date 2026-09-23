@@ -33,16 +33,23 @@ public final class SacdProgressiveMediaExtractor implements ProgressiveMediaExtr
     private final int area;
     private final int track;
     private final int outHz;
+    private final boolean dop;
 
     private SacdMediaExtractor extractor;
     private ExtractorInput input;
     private long inputPosition;
 
     public SacdProgressiveMediaExtractor(SacdRandomAccess reader, int area, int track, int outHz) {
+        this(reader, area, track, outHz, false);
+    }
+
+    public SacdProgressiveMediaExtractor(
+            SacdRandomAccess reader, int area, int track, int outHz, boolean dop) {
         this.reader = reader;
         this.area = area;
         this.track = track;
         this.outHz = outHz;
+        this.dop = dop;
     }
 
     @Override
@@ -61,7 +68,7 @@ public final class SacdProgressiveMediaExtractor implements ProgressiveMediaExtr
         if (extractor != null) {
             extractor.release();
         }
-        SacdMediaExtractor e = new SacdMediaExtractor(reader, area, track, outHz);
+        SacdMediaExtractor e = new SacdMediaExtractor(reader, area, track, outHz, dop);
         e.init(output);
         extractor = e;
     }

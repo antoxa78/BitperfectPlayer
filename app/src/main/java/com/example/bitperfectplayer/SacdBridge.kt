@@ -49,4 +49,23 @@ object SacdBridge {
 
     /** Album metadata for a callback-backed ISO. Returns a JSON string. */
     external fun nativeAlbumInfoReader(reader: SacdRandomAccess, area: Int): String
+
+    // ── DoP (DSD over PCM) for SACD ISOs ────────────────────────────────────
+
+    /** Switches an open reader to DoP output (before the first read). Returns 0 on success. */
+    external fun nativeSacdSetDop(handle: Long, enable: Boolean): Int
+
+    /** DoP mode: up to maxFrames frames of packed 24-bit LE DoP samples.
+     *  Empty on EOF, null on decode error. */
+    external fun nativeSacdReadDop24(handle: Long, maxFrames: Int): ByteArray?
+
+    // ── DSD -> PCM converter for DSF / DFF files ────────────────────────────
+
+    /** outHz 0 = default (176.4 kHz, or 192 kHz for 48 kHz-family DSD). Returns 0 if unsupported. */
+    external fun nativeDsdConvCreate(channels: Int, dsdRate: Int, outHz: Int): Long
+    external fun nativeDsdConvOutHz(handle: Long): Int
+    /** src: channel-interleaved MSB-first DSD bytes. Returns interleaved float32 PCM bytes, null on error. */
+    external fun nativeDsdConvProcess(handle: Long, src: ByteArray, bytesPerChannel: Int): ByteArray?
+    external fun nativeDsdConvReset(handle: Long)
+    external fun nativeDsdConvClose(handle: Long)
 }

@@ -18,6 +18,7 @@
 #include <android/log.h>
 
 #include "sacd_pcm.h"
+#include "dsd_conv.h"
 
 #define LOG_TAG "SacdBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -546,4 +547,136 @@ Java_com_example_bitperfectplayer_SacdBridge_nativeAlbumInfoReader(
     jstring out = album_info_to_json(env, &info);
     sacd_album_info_free(&info);
     return out;
+}
+
+/* ── DoP (DSD over PCM) for SACD ISOs ─────────────────────────────────── */
+
+JNIEXPORT jint JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeSacdSetDop(JNIEnv *env, jobject thiz,
+                                                              jlong handle, jboolean enable)
+{
+    (void)env; (void)thiz;
+    jni_sacd_ctx_t *ctx = (jni_sacd_ctx_t *)(intptr_t)handle;
+    if (!ctx || !ctx->r) return -1;
+    return sacd_pcm_set_dop(ctx->r, enable ? 1 : 0);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeSacdReadDop24(JNIEnv *env, jobject thiz,
+                                                                 jlong handle, jint jMaxFrames)
+{
+    (void)thiz;
+    jni_sacd_ctx_t *ctx = (jni_sacd_ctx_t *)(intptr_t)handle;
+    if (!ctx || !ctx->r) return (*env)->NewByteArray(env, 0);
+    int ch = sacd_pcm_channels(ctx->r);
+    if (ch <= 0) return (*env)->NewByteArray(env, 0);
+    if (jMaxFrames <= 0) jMaxFrames = 4096;
+
+    size_t cap = (size_t)jMaxFrames * (size_t)ch * 3u;
+    uint8_t *tmp = malloc(cap);
+    if (!tmp) return NULL;
+    long frames = sacd_pcm_read_dop24(ctx->r, tmp, jMaxFrames);
+    /* Same contract as nativeSacdReadFloat: NULL = decode error (retryable),
+     * empty = clean end of track. */
+    if (frames < 0) { free(tmp); return NULL; }
+    size_t nbytes = (size_t)frames * (size_t)ch * 3u;
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)nbytes);
+    if (out && nbytes > 0)
+        (*env)->SetByteArrayRegion(env, out, 0, (jsize)nbytes, (const jbyte *)tmp);
+    free(tmp);
+    return out;
+}
+
+/* ── DSD -> PCM converter for DSF / DFF files ─────────────────────────── */
+
+typedef struct {
+    dsd_conv_t *conv;
+    int channels;
+    float *out;
+    size_t out_cap; /* floats */
+} jni_dsd_conv_t;
+
+JNIEXPORT jlong JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeDsdConvCreate(JNIEnv *env, jobject thiz,
+                                                                 jint channels, jint dsdRate,
+                                                                 jint outHz)
+{
+    (void)env; (void)thiz;
+    int hz = outHz > 0 ? outHz : dsd_conv_default_out_hz(dsdRate);
+    if (hz <= 0) return 0;
+    dsd_conv_t *c = dsd_conv_create(channels, dsdRate, hz);
+    if (!c) {
+        LOGE("nativeDsdConvCreate: unsupported ch=%d dsd=%d out=%d", channels, dsdRate, hz);
+        return 0;
+    }
+    jni_dsd_conv_t *j = calloc(1, sizeof(*j));
+    if (!j) { dsd_conv_destroy(c); return 0; }
+    j->conv = c;
+    j->channels = channels;
+    LOGI("nativeDsdConvCreate: ch=%d dsd=%d -> %d Hz (%d taps)",
+         channels, dsdRate, hz, dsd_conv_taps(c));
+    return (jlong)(intptr_t)j;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeDsdConvOutHz(JNIEnv *env, jobject thiz,
+                                                                jlong handle)
+{
+    (void)env; (void)thiz;
+    jni_dsd_conv_t *j = (jni_dsd_conv_t *)(intptr_t)handle;
+    return j ? dsd_conv_out_hz(j->conv) : 0;
+}
+
+/* src: channel-interleaved, MSB-first DSD bytes (bytesPerChannel per channel).
+ * Returns interleaved float32 PCM bytes (native order); NULL on error. */
+JNIEXPORT jbyteArray JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeDsdConvProcess(JNIEnv *env, jobject thiz,
+                                                                  jlong handle, jbyteArray src,
+                                                                  jint bytesPerChannel)
+{
+    (void)thiz;
+    jni_dsd_conv_t *j = (jni_dsd_conv_t *)(intptr_t)handle;
+    if (!j || !src || bytesPerChannel < 0) return NULL;
+    jsize len = (*env)->GetArrayLength(env, src);
+    if ((size_t)bytesPerChannel * (size_t)j->channels > (size_t)len) return NULL;
+
+    size_t need = dsd_conv_max_out_frames(j->conv, (size_t)bytesPerChannel) * (size_t)j->channels;
+    if (need > j->out_cap) {
+        float *nb = realloc(j->out, need * sizeof(float));
+        if (!nb) return NULL;
+        j->out = nb;
+        j->out_cap = need;
+    }
+    jbyte *in = (*env)->GetByteArrayElements(env, src, NULL);
+    if (!in) return NULL;
+    long frames = dsd_conv_process(j->conv, (const uint8_t *)in, (size_t)bytesPerChannel, j->out);
+    (*env)->ReleaseByteArrayElements(env, src, in, JNI_ABORT);
+    if (frames < 0) return NULL;
+
+    size_t nbytes = (size_t)frames * (size_t)j->channels * sizeof(float);
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)nbytes);
+    if (out && nbytes > 0)
+        (*env)->SetByteArrayRegion(env, out, 0, (jsize)nbytes, (const jbyte *)j->out);
+    return out;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeDsdConvReset(JNIEnv *env, jobject thiz,
+                                                                jlong handle)
+{
+    (void)env; (void)thiz;
+    jni_dsd_conv_t *j = (jni_dsd_conv_t *)(intptr_t)handle;
+    if (j) dsd_conv_reset(j->conv);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_bitperfectplayer_SacdBridge_nativeDsdConvClose(JNIEnv *env, jobject thiz,
+                                                                jlong handle)
+{
+    (void)env; (void)thiz;
+    jni_dsd_conv_t *j = (jni_dsd_conv_t *)(intptr_t)handle;
+    if (!j) return;
+    dsd_conv_destroy(j->conv);
+    free(j->out);
+    free(j);
 }

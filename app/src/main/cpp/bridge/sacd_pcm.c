@@ -128,6 +128,7 @@ struct sacd_pcm_reader {
     int dst;        /* 1 if DST-compressed */
     int out_hz;     /* requested output rate */
     int decim;      /* native_hz / out_hz (>=1) */
+    int dop;        /* 1 = emit DoP (DSD over PCM) instead of converting to PCM */
     int native_hz;  /* dsd2pcm output rate = dsd_rate >> 3 */
 
     uint32_t start_lsn;
@@ -485,6 +486,44 @@ int sacd_pcm_seek_output_frame(sacd_pcm_reader_t *r, unsigned long long target)
 }
 
 int sacd_pcm_out_rate(sacd_pcm_reader_t *r) { return r ? r->out_hz : 0; }
+
+int sacd_pcm_set_dop(sacd_pcm_reader_t *r, int enable)
+{
+    if (!r) return -1;
+    if (!enable) { r->dop = 0; return 0; }
+    /* DoP carries 16 DSD bits per sample: the output rate must be exactly
+     * dsd_rate / 16, i.e. native (dsd/8) decimated by 2 — 176.4 kHz for DSD64. */
+    if (r->channels != 2 || r->decim != 2) return -1;
+    if (r->emitted != 0 || r->obuf_wr != 0) return -1; /* only before the first read */
+    r->dop = 1;
+    return 0;
+}
+
+long sacd_pcm_read_dop24(sacd_pcm_reader_t *r, uint8_t *out, long frames)
+{
+    if (!r || !out || !r->dop) return -1;
+    int ch = r->channels;
+    /* Read through the normal FIFO (keeps seek/trim/EOF semantics identical),
+     * then convert the exactly-stored floats back to packed 24-bit LE. */
+    float tmp[1024 * 2];
+    long done = 0;
+    while (done < frames) {
+        long want = frames - done;
+        if (want > 1024) want = 1024;
+        long n = sacd_pcm_read(r, tmp, want);
+        if (n < 0) return done > 0 ? done : -1;
+        if (n == 0) break;
+        for (long i = 0; i < n * ch; i++) {
+            int32_t v = (int32_t)lrintf(tmp[i] * 8388608.0f); /* exact: v / 2^23 was stored */
+            uint8_t *o = out + ((size_t)done * (size_t)ch + (size_t)i) * 3u;
+            o[0] = (uint8_t)(v & 0xFF);
+            o[1] = (uint8_t)((v >> 8) & 0xFF);
+            o[2] = (uint8_t)((v >> 16) & 0xFF);
+        }
+        done += n;
+    }
+    return done;
+}
 int sacd_pcm_channels(sacd_pcm_reader_t *r) { return r ? r->channels : 0; }
 uint64_t sacd_pcm_output_frames(sacd_pcm_reader_t *r)
 {
@@ -505,6 +544,30 @@ uint64_t sacd_pcm_duration_ms(sacd_pcm_reader_t *r)
 static void channel_work(sacd_pcm_reader_t *r, int c, const uint8_t *fd,
                          size_t bytes_per_ch, size_t nout, size_t obase)
 {
+    if (r->dop) {
+        /* DoP: every output sample carries 16 raw DSD bits of this channel —
+         * two consecutive bytes, earlier byte in bits 15..8 — under an 8-bit
+         * marker that alternates 0x05 / 0xFA from one sample (frame) to the
+         * next. SACD frame bytes are already MSB-first (the order DoP wants),
+         * so they are copied untouched: no filtering, no conversion.
+         * Stored in the float FIFO as v / 2^23, which is exact for any 24-bit
+         * integer and is read back exactly by sacd_pcm_read_dop24(). The
+         * marker restarts at 0x05 each frame; frames hold an even number of
+         * DoP samples (2352 for DSD64), so the alternation is unbroken. */
+        const size_t ch = (size_t)r->channels;
+        const uint8_t *src = fd + c;
+        size_t base = obase + (size_t)c;
+        size_t n = bytes_per_ch / 2;
+        if (n > nout) n = nout;
+        for (size_t m = 0; m < n; m++) {
+            int32_t v = ((m & 1) ? 0xFA : 0x05) << 16
+                      | (int32_t)src[(2 * m) * ch] << 8
+                      | (int32_t)src[(2 * m + 1) * ch];
+            if (v & 0x800000) v -= 0x1000000; /* sign-extend the 24-bit word */
+            r->obuf[base + m * ch] = (float)v / 8388608.0f;
+        }
+        return;
+    }
     ff_dsd2pcm_translate(&r->dsdctx[c], bytes_per_ch, 0 /*lsbf; disc bytes are
                                  LSB-first, so the msbf tables (== REV+lsbf1)
                                  match what the DSF writer/ffmpeg produce */,

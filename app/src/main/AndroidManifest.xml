@@ -13,6 +13,13 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Optional, granted once over adb (never at install): lets PlaybackService
+         suspend Android TV's inattentive-sleep timer (attentive_timeout) during
+         playback — the one standby timer no wake lock can block.
+         adb shell pm grant <applicationId> android.permission.WRITE_SECURE_SETTINGS -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <uses-feature
         android:name="android.software.leanback"

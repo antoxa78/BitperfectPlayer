@@ -1,5 +1,6 @@
 package com.example.bitperfectplayer
 
+import android.content.Context
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.C
@@ -13,16 +14,26 @@ import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaExtractor
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.extractor.Extractor
+import androidx.media3.extractor.ExtractorsFactory
 
 /**
- * Routes SACD track items ("sacd:..." mediaIds) to a [ProgressiveMediaSource]
- * driven by [SacdMediaExtractor]; everything else is delegated to the wrapped
- * [MediaSource.Factory] unchanged.
+ * Routes DSD items to dedicated sources; everything else is delegated to the
+ * wrapped [MediaSource.Factory] unchanged:
+ *  - SACD track items ("sacd:..." mediaIds) -> [SacdMediaExtractor]
+ *  - .dsf / .dff files -> [DsdFileExtractor], read through [dataSourceFactory]
+ *    (local, content:// and SMB alike).
+ * Whether DSD is sent as DoP or converted to PCM is decided from
+ * [PlaybackService.isDopOutputActive] each time a track starts loading.
  */
 @OptIn(UnstableApi::class)
 class SacdMediaSourceFactory(
     private val delegate: MediaSource.Factory,
+    private val context: Context? = null,
+    private val dataSourceFactory: DataSource.Factory? = null,
 ) : MediaSource.Factory {
+
+    private var loadErrorHandlingPolicy: LoadErrorHandlingPolicy? = null
 
     override fun setDrmSessionManagerProvider(
         drmSessionManagerProvider: DrmSessionManagerProvider
@@ -35,6 +46,7 @@ class SacdMediaSourceFactory(
         loadErrorHandlingPolicy: LoadErrorHandlingPolicy
     ): MediaSource.Factory {
         delegate.setLoadErrorHandlingPolicy(loadErrorHandlingPolicy)
+        this.loadErrorHandlingPolicy = loadErrorHandlingPolicy
         return this
     }
 
@@ -46,10 +58,25 @@ class SacdMediaSourceFactory(
         // local configuration for sources created via the session, so gate on
         // the machine-readable mediaId alone.
         val info = SacdSupport.parseTrackInfo(mediaItem.mediaId)
-        if (info == null) {
-            return delegate.createMediaSource(mediaItem)
+        if (info != null) return createSacdSource(info, mediaItem)
+
+        val dsf = dataSourceFactory
+        val uri = mediaItem.localConfiguration?.uri?.toString() ?: mediaItem.mediaId
+        if (dsf != null && DsdFileExtractor.isDsdFileUri(uri)) {
+            return createDsdFileSource(mediaItem, dsf)
         }
-        return createSacdSource(info, mediaItem)
+        return delegate.createMediaSource(mediaItem)
+    }
+
+    private fun dopActive(): Boolean = context?.let { PlaybackService.isDopOutputActive(it) } == true
+
+    private fun createDsdFileSource(mediaItem: MediaItem, dsf: DataSource.Factory): MediaSource {
+        // Decided when the track starts loading (not when it was queued), so a
+        // change in Settings applies to every DSD track that hasn't loaded yet.
+        val extractors = ExtractorsFactory { arrayOf<Extractor>(DsdFileExtractor(dopActive())) }
+        val factory = ProgressiveMediaSource.Factory(dsf, extractors)
+        loadErrorHandlingPolicy?.let { factory.setLoadErrorHandlingPolicy(it) }
+        return factory.createMediaSource(mediaItem)
     }
 
     private fun createSacdSource(info: SacdSupport.TrackInfo, mediaItem: MediaItem): MediaSource {
@@ -60,7 +87,8 @@ class SacdMediaSourceFactory(
                 SacdSupport.buildRandomAccess(info.srcUri),
                 info.area,
                 info.track,
-                info.outHz
+                info.outHz,
+                dopActive()  // evaluated when the track starts loading
             )
         }
         val dataSourceFactory = DataSource.Factory { SacdPassthroughDataSource() }

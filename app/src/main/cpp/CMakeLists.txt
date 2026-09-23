@@ -55,6 +55,7 @@ set(SACD_LIBRARY_SOURCES
 add_library(bitperfectplayer SHARED
     ${SACD_LIBRARY_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/bridge/sacd_pcm.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bridge/dsd_conv.c
     ${CMAKE_CURRENT_SOURCE_DIR}/jni/sacd_jni.c
 )
 

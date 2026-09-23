@@ -181,6 +181,44 @@ class BitPerfectManager(private val context: Context) {
         return mixerMask == 0 || outputMask == 0 || mixerMask == outputMask
     }
 
+    /**
+     * The integer PCM encoding (AudioFormat.ENCODING_PCM_32BIT, else
+     * ENCODING_PCM_24BIT_PACKED) for which [device] offers a BIT_PERFECT mixer
+     * at [sampleRate]/[channelMask], or null if none (or below Android 14).
+     *
+     * Needed because decoders hand us float (so 24-bit sources are not
+     * truncated), but USB bit-perfect mixers only exist for the DAC's integer
+     * formats: a float AudioTrack never matches one and silently falls back to
+     * the resampling system mixer. Converting float→int32/int24 is exact for
+     * any ≤24-bit source, so the track can use the bit-perfect mixer instead.
+     */
+    fun findBitPerfectIntegerEncoding(
+        device: AudioDeviceInfo,
+        sampleRate: Int,
+        channelMask: Int
+    ): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
+        if (!isUsbOutputDevice(device)) return null
+        return try {
+            val attrs = audioManager.getSupportedMixerAttributes(device)
+            val preference = intArrayOf(AudioFormat.ENCODING_PCM_32BIT, AudioFormat.ENCODING_PCM_24BIT_PACKED)
+            preference.firstOrNull { encoding ->
+                val wanted = AudioFormat.Builder()
+                    .setEncoding(encoding)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelMask)
+                    .build()
+                attrs.any { attr ->
+                    attr.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
+                        isFormatMatch(attr.format, wanted)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "findBitPerfectIntegerEncoding failed: ${e.message}")
+            null
+        }
+    }
+
     fun findUsbOutputDevice(): AudioDeviceInfo? {
         return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
             isUsbOutputDevice(it)

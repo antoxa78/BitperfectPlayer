@@ -29,7 +29,12 @@ class SacdMediaExtractor(
     private val area: Int = 0,
     private val track: Int = 0,
     private val outHz: Int = 176400,
+    /** Emit DoP (DSD over PCM) instead of converting to PCM; see [DsdFileExtractor]. */
+    private val dopRequested: Boolean = false,
 ) : Extractor {
+
+    /** True once the native reader accepted DoP mode. */
+    private var dop = false
 
     private var output: ExtractorOutput? = null
     private var trackOutput: TrackOutput? = null
@@ -85,16 +90,28 @@ class SacdMediaExtractor(
             sampleRate = SacdBridge.nativeSacdOutRate(handle).takeIf { it > 0 } ?: outHz
             channelCount = SacdBridge.nativeSacdChannels(handle).takeIf { it > 0 } ?: 2
             totalFrames = SacdBridge.nativeSacdTotalFrames(handle)
+            // DoP: the DSD64 bitstream itself, 16 bits per 24-bit sample at
+            // 176.4 kHz (same rate/timeline as the PCM path), for DACs that
+            // decode DSD natively. Needs the reader's 2:1 grid (176.4 kHz).
+            dop = dopRequested && try {
+                SacdBridge.nativeSacdSetDop(handle, true) == 0
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "nativeSacdSetDop threw", e)
+                false
+            }
+            if (dopRequested && !dop) android.util.Log.w(TAG, "DoP not possible for this area/rate — converting to PCM")
             android.util.Log.d(TAG, "nativeOpenSacd track=$track rate=$sampleRate ch=$channelCount frames=$totalFrames")
 
             val format = Format.Builder()
                 .setSampleMimeType(MimeTypes.AUDIO_RAW)
-                // Float is the decoder's native format and the only high-res PCM
-                // encoding this device's AudioTrack accepts (24-bit int is rejected
-                // by AudioTrack.getMinBufferSize at every rate).
-                .setPcmEncoding(C.ENCODING_PCM_FLOAT)
+                // PCM: float is the decoder's native format and the only high-res
+                // PCM encoding the Shield's AudioTrack accepts (24-bit int is
+                // rejected by AudioTrack.getMinBufferSize at every rate).
+                // DoP: 24-bit integers carried bit-exactly (USB driver mode only).
+                .setPcmEncoding(if (dop) C.ENCODING_PCM_24BIT else C.ENCODING_PCM_FLOAT)
                 .setSampleRate(sampleRate)
                 .setChannelCount(channelCount)
+                .setLabel(if (dop) "DSD64 DoP" else "DSD64 → PCM")
                 .build()
             val audioTrack = currentOutput.track(0, C.TRACK_TYPE_AUDIO)
             audioTrack.format(format)
@@ -119,12 +136,14 @@ class SacdMediaExtractor(
 
         if (endOfStream) return Extractor.RESULT_END_OF_INPUT
 
-        val frameSize = channelCount * 4 // interleaved float32, one float per channel sample
+        // interleaved float32 (PCM) or packed 24-bit (DoP), per channel sample
+        val frameSize = channelCount * (if (dop) 3 else 4)
         val maxFrames = READ_BYTES / frameSize
         val data = try {
-            SacdBridge.nativeSacdReadFloat(handle, maxFrames)
+            if (dop) SacdBridge.nativeSacdReadDop24(handle, maxFrames)
+            else SacdBridge.nativeSacdReadFloat(handle, maxFrames)
         } catch (e: Exception) {
-            android.util.Log.w(TAG, "nativeSacdReadFloat threw", e)
+            android.util.Log.w(TAG, "SACD read threw", e)
             null
         }
         if (data == null) {
