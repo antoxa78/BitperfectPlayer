@@ -37,7 +37,13 @@ object SacdBridge {
     /** Decodes up to maxFrames PCM frames into interleaved float32 bytes. Empty on EOF, null on decode error. */
     external fun nativeSacdReadFloat(handle: Long, maxFrames: Int): ByteArray?
 
-    /** Seeks to an absolute output frame index. Returns 0 on success. */
+    /** Decodes interleaved float32 PCM into [out] (as many whole frames as fit).
+     *  Returns frames written, 0 at end of track, -1 on a retryable read/decode error. */
+    external fun nativeSacdReadFloatInto(handle: Long, out: ByteArray): Int
+
+    /** Seeks to an absolute output frame index (jumps to the sector; clears a
+     *  previous read error). Returns 0 on success, non-zero if the source could
+     *  not be read (retryable). */
     external fun nativeSacdSeek(handle: Long, frame: Long): Int
 
     external fun nativeSacdClose(handle: Long)
@@ -59,6 +65,9 @@ object SacdBridge {
      *  Empty on EOF, null on decode error. */
     external fun nativeSacdReadDop24(handle: Long, maxFrames: Int): ByteArray?
 
+    /** DoP into [out] (packed 24-bit LE). Returns frames, 0 at end of track, -1 on error. */
+    external fun nativeSacdReadDop24Into(handle: Long, out: ByteArray): Int
+
     // ── DSD -> PCM converter for DSF / DFF files ────────────────────────────
 
     /** outHz 0 = default (176.4 kHz, or 192 kHz for 48 kHz-family DSD). Returns 0 if unsupported. */
@@ -66,6 +75,10 @@ object SacdBridge {
     external fun nativeDsdConvOutHz(handle: Long): Int
     /** src: channel-interleaved MSB-first DSD bytes. Returns interleaved float32 PCM bytes, null on error. */
     external fun nativeDsdConvProcess(handle: Long, src: ByteArray, bytesPerChannel: Int): ByteArray?
+    /** Same, into the reusable [out] (see [nativeDsdConvMaxOutBytes]). Returns bytes written, -1 on error. */
+    external fun nativeDsdConvProcessInto(handle: Long, src: ByteArray, bytesPerChannel: Int, out: ByteArray): Int
+    /** Upper bound of the output size in bytes for [bytesPerChannel] input bytes per channel. */
+    external fun nativeDsdConvMaxOutBytes(handle: Long, bytesPerChannel: Int): Int
     external fun nativeDsdConvReset(handle: Long)
     external fun nativeDsdConvClose(handle: Long)
 }

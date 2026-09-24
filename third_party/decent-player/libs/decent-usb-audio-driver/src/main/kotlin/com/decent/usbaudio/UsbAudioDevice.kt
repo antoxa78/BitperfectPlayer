@@ -373,7 +373,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
      *
      * @return Pair(altSetting, bitDepth), or Pair(1, 16) as default.
      */
-    /** Parsed alt setting: (altNumber, bitResolution) */
+    /** Parsed alt setting: (altNumber, container bits = bSubslotSize * 8) */
     private var parsedAltSettings: List<Pair<Int, Int>> = emptyList()
 
     private fun parseBestAltSetting(conn: UsbDeviceConnection): Pair<Int, Int> {
@@ -385,6 +385,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
         var inAudioStreaming = false
         var bestAlt = 1
         var bestBits = 16
+        var bestResolution = 0
 
         while (i + 1 < raw.size) {
             val bLength = raw[i].toInt() and 0xFF
@@ -408,14 +409,26 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 if (bDescriptorSubtype == 0x02) {
                     val bSubslotSize = raw[i + 4].toInt() and 0xFF
                     val bBitResolution = raw[i + 5].toInt() and 0xFF
-                    Log.i(TAG, "parseBestAltSetting: alt=$currentAlt subslotSize=$bSubslotSize bitResolution=$bBitResolution")
-
-                    if (currentAlt > 0) {
-                        altSettings.add(Pair(currentAlt, bBitResolution))
+                    // The stream is packed in subslots: a DAC with 24-bit
+                    // resolution in 4-byte subslots (very common) expects 32-bit
+                    // containers, and feeding it 3-byte samples is noise. The
+                    // returned "bit depth" is therefore the container size;
+                    // lower bits than the resolution are simply ignored by the DAC.
+                    val containerBits = when {
+                        bSubslotSize in 1..4 -> bSubslotSize * 8
+                        else -> ((bBitResolution + 7) / 8) * 8
                     }
-                    if (bBitResolution > bestBits && currentAlt > 0) {
-                        bestBits = bBitResolution
-                        bestAlt = currentAlt
+                    Log.i(TAG, "parseBestAltSetting: alt=$currentAlt subslotSize=$bSubslotSize " +
+                            "bitResolution=$bBitResolution → container=${containerBits}bit")
+
+                    if (currentAlt > 0 && containerBits in 16..32) {
+                        altSettings.add(Pair(currentAlt, containerBits))
+                        if (bBitResolution > bestResolution ||
+                            (bBitResolution == bestResolution && containerBits > bestBits)) {
+                            bestResolution = bBitResolution
+                            bestBits = containerBits
+                            bestAlt = currentAlt
+                        }
                     }
                 }
             }
@@ -569,8 +582,10 @@ class UsbAudioDevice private constructor(private val context: Context) {
         // Capture the device while it is still known (closeDevice() below nulls
         // currentDevice). The audio interface ids are needed so USBDEVFS_CONNECT
         // can ask the kernel to re-bind snd-usb-audio (a force=true claim
-        // previously disconnected that driver everywhere).
+        // previously disconnected that driver everywhere); the product name is
+        // needed by the sysfs fallback to locate the device after the fd is gone.
         val device = currentDevice
+        val productNameForRebind = device?.productName
         val audioInterfaceIds = device?.let { d ->
             (0 until d.interfaceCount).asSequence()
                 .map { d.getInterface(it) }
@@ -613,6 +628,13 @@ class UsbAudioDevice private constructor(private val context: Context) {
 
         // Finally close the connection fully (releases any remaining claims).
         closeDevice()
+
+        // Fallback: on some SoCs USBDEVFS_RESET + USBDEVFS_CONNECT only
+        // re-enumerate the device at the bus level and the kernel audio driver
+        // never binds again, so the system/Android output modes stay silent
+        // until a physical replug. Force a genuine kernel re-probe via sysfs
+        // unbind/bind (best-effort; needs root and degrades silently without).
+        forceKernelRebind(productNameForRebind)
     }
 
     /**

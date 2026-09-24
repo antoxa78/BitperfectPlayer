@@ -127,6 +127,11 @@ struct UsbAudioContext {
     uint8_t residualBuffer[USB_AUDIO_URB_BUFFER_SIZE];
     int residualBytes;
 
+    /** Residual + new data joined for one submit. Grown on demand and kept, so
+     *  the steady-state audio path does no malloc/free. */
+    uint8_t *mergeBuffer;
+    int mergeCapacity;
+
     // ── Continuous feedback ─────────────────────────────────────
     /**
      * Dedicated URB for the async feedback endpoint. Submitted at start
@@ -139,7 +144,14 @@ struct UsbAudioContext {
     struct usbdevfs_urb *feedbackUrb;
     uint8_t feedbackBuffer[4];
     bool feedbackInFlight;
+
+    /** Power-of-two scale that turns the DAC's raw feedback value into Q16.16
+     *  frames per microframe (0 for spec-conforming DACs); detected from the
+     *  first plausible reading. FEEDBACK_SHIFT_UNKNOWN until then. */
+    int feedbackShift;
 };
+
+#define FEEDBACK_SHIFT_UNKNOWN (-1000)
 
 // ── Functions accessible from native-audio-engine ──────────────────
 
@@ -155,5 +167,6 @@ void padInt16ToInt32(const uint8_t *src, uint8_t *dst, int numSamples);
 /** 24-bit packed (3 bytes/sample) → 32-bit: sign-extend + shift left 8. */
 void padInt24ToInt32(const uint8_t *src, uint8_t *dst, int numSamples);
 
-/** int32 (24-bit sign-extended from libFLAC) → 32-bit: shift left 8. */
+/** int32 holding a sign-extended 24-bit value → 32-bit: shift left 8.
+ *  (Not used by the write paths: 32-bit input is treated as full-scale int32.) */
 void shiftInt32From24(const uint8_t *src, uint8_t *dst, int numSamples);

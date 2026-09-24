@@ -296,7 +296,6 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("USB DAC", getUsbDacStatus()))
         settingsAdapter.add(createActionItem("Audio Output", getAudioOutputSubtitle()))
         settingsAdapter.add(createActionItem("LAN Player Control", getLanControlSubtitle()))
-        settingsAdapter.add(createActionItem("Stay Awake While Playing", getStayAwakeSubtitle()))
         settingsAdapter.add(createActionItem("DSD Output", getDsdOutputSubtitle()))
         settingsAdapter.add(createActionItem("About", "Version and build info"))
         val settingsHeader = HeaderItem(4, "Settings")
@@ -373,7 +372,7 @@ class MainFragment : BrowseSupportFragment() {
 
         val dialog = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Add SMB Share")
-            .setIcon(R.drawable.ic_network)
+            .setIcon(R.drawable.ic_add_network)
             .setView(view)
             .create()
 
@@ -461,7 +460,7 @@ class MainFragment : BrowseSupportFragment() {
                     .toTypedArray()
 
                 val shareItems = shareNames.map { name ->
-                    BrowseItem(name, "", R.drawable.ic_network, true)
+                    BrowseItem(name, "", R.drawable.ic_network_music, true)
                 }
 
                 activity.runOnUiThread {
@@ -1094,7 +1093,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val items = listOf(
             DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-            DialogOptionItem("Replace current playlist", R.drawable.ic_repeat)
+            DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
         )
         val adapter = DialogOptionAdapter(context, items)
         
@@ -1276,7 +1275,7 @@ class MainFragment : BrowseSupportFragment() {
 
                     val items = listOf(
                         DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-                        DialogOptionItem("Replace current playlist", R.drawable.ic_repeat)
+                        DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
                     )
                     val adapter = DialogOptionAdapter(context, items)
 
@@ -1691,13 +1690,13 @@ class MainFragment : BrowseSupportFragment() {
         val items = if (isDir) {
             listOf(
                 DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-                DialogOptionItem("Replace current playlist", R.drawable.ic_repeat),
+                DialogOptionItem("Replace current playlist", R.drawable.ic_playlist),
                 DialogOptionItem("Add to Music Library", R.drawable.ic_folder_music)
             )
         } else {
             listOf(
                 DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-                DialogOptionItem("Replace current playlist", R.drawable.ic_repeat)
+                DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
             )
         }
         val adapter = DialogOptionAdapter(context, items)
@@ -1719,7 +1718,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val items = listOf(
             DialogOptionItem("Add To Current Playlist", R.drawable.ic_queue_music),
-            DialogOptionItem("Replace Current Playlist", R.drawable.ic_repeat)
+            DialogOptionItem("Replace Current Playlist", R.drawable.ic_playlist)
         )
         val adapter = DialogOptionAdapter(context, items)
 
@@ -2229,7 +2228,7 @@ class MainFragment : BrowseSupportFragment() {
 
         val dialog = AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("LAN Player Control")
-            .setIcon(R.drawable.ic_network)
+            .setIcon(R.drawable.ic_lan_control)
             .setView(dialogView)
             .setPositiveButton("OK", null)
             .setNegativeButton("Cancel", null)
@@ -2367,7 +2366,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = requireContext()
         val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val options = arrayOf(
-            "Convert to PCM (176.4 kHz, works with any DAC)",
+            "Convert to PCM (176.4 / 192 kHz, works with any DAC)",
             "DoP — DSD over PCM (DAC must support DoP)"
         )
         val current = if (PlaybackService.isDopSelected(context)) 1 else 0
@@ -2378,6 +2377,8 @@ class MainFragment : BrowseSupportFragment() {
                     PlaybackService.KEY_DSD_OUTPUT,
                     if (which == 1) PlaybackService.DSD_OUTPUT_DOP else PlaybackService.DSD_OUTPUT_PCM
                 ).apply()
+                // A new choice gets a fresh chance at DoP after an earlier fallback to PCM.
+                PlaybackService.clearDopSuppression()
                 dialog.dismiss()
                 val note = if (which == 1 && !PlaybackService.isDopOutputActive(context)) {
                     "DoP is used only in Bit-perfect (USB driver) mode with a USB DAC attached — until then DSD is converted to PCM."
@@ -2388,47 +2389,6 @@ class MainFragment : BrowseSupportFragment() {
                 refreshWithCurrentFocus()
             }
             .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun getStayAwakeSubtitle(): String =
-        when (PlaybackService.attentiveSleepStatus(requireContext())) {
-            AttentiveSleepStatus.HANDLED_BY_APP -> "Enabled"
-            AttentiveSleepStatus.ALREADY_OFF    -> "Enabled (device sleep timer is off)"
-            AttentiveSleepStatus.NEEDS_GRANT    -> "Needs one-time adb setup"
-        }
-
-    /**
-     * Explains how the player keeps the TV box awake during playback and, when
-     * the Android TV inattentive-sleep timer is still active, how to let the app
-     * suspend it (a one-time adb grant — no app can block that timer otherwise).
-     */
-    private fun showStayAwakeDialog() {
-        val context = requireContext()
-        val grant = "adb shell pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS"
-        val status = when (PlaybackService.attentiveSleepStatus(context)) {
-            AttentiveSleepStatus.HANDLED_BY_APP ->
-                "Status: fully enabled. While music plays, the device's inactivity sleep timer " +
-                    "is paused, and your setting is put back when playback stops."
-            AttentiveSleepStatus.ALREADY_OFF ->
-                "Status: fully enabled. The device's inactivity sleep timer is already set to Never."
-            AttentiveSleepStatus.NEEDS_GRANT ->
-                "Status: needs setup. The device's inactivity sleep timer can still put it to " +
-                    "sleep during long listening sessions."
-        }
-        val message = "$status\n\n" +
-            "While music plays and the player is on screen, the device is kept awake. " +
-            "The player's own screensaver still blanks the screen.\n\n" +
-            "Android TV also has a separate inactivity sleep timer (Settings → Device " +
-            "Preferences → Energy saver / Power) that no app can block by itself. " +
-            "To let the player pause it during playback, run this once from a computer:\n\n" +
-            "$grant\n\n" +
-            "Or set that timer to Never in the device settings."
-
-        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Stay Awake While Playing")
-            .setMessage(message)
-            .setPositiveButton("OK") { _, _ -> refreshWithCurrentFocus() }
             .show()
     }
 
@@ -2553,7 +2513,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun showAudioOutputDialog() {
-        val items = audioOutputNames.map { DialogOptionItem(it, R.drawable.ic_audio) }
+        val items = audioOutputNames.map { DialogOptionItem(it, R.drawable.ic_speaker) }
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Audio Output")
@@ -2590,8 +2550,8 @@ class MainFragment : BrowseSupportFragment() {
     private fun showScreensaverSettings() {
         val items = listOf(
             DialogOptionItem("Screensaver On", R.drawable.ic_screensaver),
-            DialogOptionItem("Turn The Screen Off", R.drawable.ic_screensaver),
-            DialogOptionItem("Never", R.drawable.ic_screensaver)
+            DialogOptionItem("Turn The Screen Off", R.drawable.ic_screen_off),
+            DialogOptionItem("Never", R.drawable.ic_block)
         )
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
@@ -2917,7 +2877,7 @@ class MainFragment : BrowseSupportFragment() {
                     put("index", i)
                 }
                 folderObjects.add(folderObj)
-                browseItems.add(BrowseItem("[SMB] $share on $ip", folderObj.getString("uri"), R.drawable.ic_network, true))
+                browseItems.add(BrowseItem("[SMB] $share on $ip", folderObj.getString("uri"), R.drawable.ic_network_music, true))
             }
         } catch (e: Exception) {}
 
@@ -3046,7 +3006,7 @@ class MainFragment : BrowseSupportFragment() {
                 if (isEnabled) "Remember Recent Files: Enabled" else "Remember Recent Files: Disabled",
                 R.drawable.ic_history
             ),
-            DialogOptionItem("Clear Recent List", R.drawable.ic_history)
+            DialogOptionItem("Clear Recent List", R.drawable.ic_clear_history)
         )
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
@@ -3068,10 +3028,10 @@ class MainFragment : BrowseSupportFragment() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val autoScan = prefs.getBoolean(KEY_AUTO_SCAN, false)
         val items = listOf(
-            DialogOptionItem("Perform Library Scan Now", R.drawable.ic_sync),
+            DialogOptionItem("Perform Library Scan Now", R.drawable.ic_scan_library),
             DialogOptionItem(
                 if (autoScan) "Automatic Library Scan: Enabled" else "Automatic Library Scan: Disabled",
-                R.drawable.ic_history
+                R.drawable.ic_auto_scan
             )
         )
         val adapter = DialogOptionAdapter(requireContext(), items)
@@ -3093,7 +3053,7 @@ class MainFragment : BrowseSupportFragment() {
     private fun showScanConfirmationDialog() {
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Perform Scan")
-            .setIcon(R.drawable.ic_sync)
+            .setIcon(R.drawable.ic_scan_library)
             .setMessage("Scan all configured folders for new or deleted files?")
             .setPositiveButton("Yes") { _, _ -> performLibraryScan() }
             .setNegativeButton("No", null)
@@ -3114,7 +3074,7 @@ class MainFragment : BrowseSupportFragment() {
         val items = listOf(
             DialogOptionItem(
                 if (isEnabled) "Enhanced Network Buffer: Enabled" else "Enhanced Network Buffer: Disabled",
-                R.drawable.ic_network
+                R.drawable.ic_network_buffer
             ),
             DialogOptionItem(
                 if (isReconnectEnabled) "Auto Reconnect (Radio): Enabled" else "Auto Reconnect (Radio): Disabled",
@@ -3166,7 +3126,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = requireContext()
         val logoSize = (96 * context.resources.displayMetrics.density).toInt()
         val logo = android.widget.ImageView(context).apply {
-            setImageResource(R.drawable.ic_launcher_foreground)
+            setImageResource(R.mipmap.ic_launcher)
             layoutParams = android.widget.LinearLayout.LayoutParams(logoSize, logoSize)
         }
         val textView = android.widget.TextView(context).apply {
@@ -3236,9 +3196,6 @@ class MainFragment : BrowseSupportFragment() {
             }
             actionId == "action:LAN Player Control" -> {
                 showLanControlDialog()
-            }
-            actionId == "action:Stay Awake While Playing" -> {
-                showStayAwakeDialog()
             }
             actionId == "action:DSD Output" -> {
                 showDsdOutputDialog()

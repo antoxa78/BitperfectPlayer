@@ -60,8 +60,12 @@ typedef struct sacd_pcm_reader sacd_pcm_reader_t;
  *   area         0 = two-channel area, 1 = multi-channel area
  *   track        0-based track index within the area
  *   out_hz       requested PCM output rate (e.g. 176400).
- *                Accepts rates <= the decoder's native rate (DSD64 -> 352800).
- *                0 selects SACD_DEFAULT_OUT_HZ.
+ *                Must divide the decoder's native rate (DSD64 -> 352800) so
+ *                that one SACD frame (4704 DSD bytes per channel) maps to a
+ *                whole number of output frames: 352800, 176400, 117600,
+ *                88200, 58800, 50400, 44100, ... 0 selects SACD_DEFAULT_OUT_HZ.
+ *                176400 uses the built-in 255-tap decimator; other rates use
+ *                the dsd_conv anti-alias filter designed for the ratio.
  *
  * Decoded output is float32, L/R interleaved, in the range roughly [-1, 1].
  * Returns NULL on error.
@@ -99,15 +103,20 @@ long sacd_pcm_read_dop24(sacd_pcm_reader_t *r, uint8_t *out, long frames);
  * float samples) into `out`.
  *
  * Returns the number of frames written (>=0); 0 means end of track;
- * -1 on error.  Streaming: state (position, DSD filter state, DST decoder)
- * is kept across calls.
+ * -1 on error.  A read error from the source is not sticky: frames already
+ * decoded are returned first, and the next call retries the same sectors.
+ * Streaming: state (position, DSD filter state, DST decoder) is kept across
+ * calls.
  */
 long sacd_pcm_read(sacd_pcm_reader_t *r, float *out, long frames);
 
 /*
- * Seeks to the given output frame index (0-based).  Backwards seeks restart
- * the decoder from the start of the track and fast-forward; forwards seeks
- * decode-and-discard.  Returns 0 on success, -1 on error.
+ * Seeks to the given output frame index (0-based).  Short forward hops
+ * (<= 2 s) drop output lazily; anything else jumps straight to the sector
+ * holding the target frame (estimated from the track's LSN range and
+ * verified by frame timecode), with one frame of pre-roll so the filters
+ * settle.  Also clears a previous read error.  Returns 0 on success, -1 on
+ * error (e.g. the source could not be read; the seek may be retried).
  */
 int sacd_pcm_seek_output_frame(sacd_pcm_reader_t *r, unsigned long long output_frame);
 

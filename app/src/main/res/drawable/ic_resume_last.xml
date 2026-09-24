@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "play-circle" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M10,16.5 L10,7.5 L16,12 M12,2 C6.477,2,2,6.477,2,12 C2,17.523,6.477,22,12,22 C17.523,22,22,17.523,22,12 C22,6.477,17.523,2,12,2" />
+</vector>

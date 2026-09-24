@@ -7,11 +7,16 @@ import java.io.RandomAccessFile
 
 /**
  * Backs the native SACD ISO reader with random block access. The native side
- * calls [read] for 2048-byte LSN reads and [length] for the total image size.
+ * calls [read] for 2048-byte LSN reads (up to 1 MB at a time) into one
+ * reusable buffer per reader, and [length] for the total image size.
  */
 interface SacdRandomAccess {
-    /** Reads up to [length] bytes starting at [offset]. Returns fewer bytes at EOF. */
-    fun read(offset: Long, length: Int): ByteArray
+    /**
+     * Reads up to [length] bytes starting at [offset] into [buffer] (from
+     * index 0). Returns the number of bytes read — fewer at end of file, 0
+     * past it. Throws on I/O errors (reported to the decoder as retryable).
+     */
+    fun read(offset: Long, buffer: ByteArray, length: Int): Int
 
     /** Total image size in bytes. */
     fun length(): Long
@@ -42,39 +47,41 @@ class SmbSacdRandomAccess(private val smbFile: SmbFile) : SacdRandomAccess {
     }
 
     @Synchronized
-    override fun read(offset: Long, length: Int): ByteArray {
-        // jcifs silently re-connects its transport on a fresh call after a
-        // dropped TCP session, so a single retry survives transient resets.
+    override fun read(offset: Long, buffer: ByteArray, length: Int): Int {
         return try {
-            readOnce(offset, length)
-        } catch (t: Throwable) {
+            readOnce(offset, buffer, length)
+        } catch (e: Exception) {
+            // A dropped TCP session can leave this file handle unusable even
+            // though jcifs reconnects the transport (jcifs-ng also throws
+            // unchecked RuntimeCIFSException): reopen it and retry once. A
+            // second failure propagates; the decoder reports it as a
+            // retryable read error and media3 retries the load later.
+            closeHandle()
             try {
-                readOnce(offset, length)
-            } catch (_: Throwable) {
-                throw t
+                readOnce(offset, buffer, length)
+            } catch (_: Exception) {
+                throw e
             }
         }
     }
 
-    private fun readOnce(offset: Long, length: Int): ByteArray {
-        val out = ByteArray(length)
+    private fun readOnce(offset: Long, buffer: ByteArray, length: Int): Int {
+        val want = minOf(length, buffer.size)
         var done = 0
         val handle = open()
         handle.seek(offset)
-        while (done < length) {
-            val n = handle.read(out, done, length - done)
-            if (n < 0) break
-            if (n == 0) break
+        while (done < want) {
+            val n = handle.read(buffer, done, want - done)
+            if (n <= 0) break
             done += n
         }
-        return if (done == length) out else out.copyOf(done)
+        return done
     }
 
     @Synchronized
     override fun length(): Long = smbFile.length()
 
-    @Synchronized
-    override fun close() {
+    private fun closeHandle() {
         raf?.let {
             try {
                 it.close()
@@ -83,6 +90,9 @@ class SmbSacdRandomAccess(private val smbFile: SmbFile) : SacdRandomAccess {
         }
         raf = null
     }
+
+    @Synchronized
+    override fun close() = closeHandle()
 }
 
 /** [SacdRandomAccess] backed by a local file. */
@@ -90,17 +100,16 @@ class LocalSacdRandomAccess(private val file: java.io.File) : SacdRandomAccess {
     private val raf = RandomAccessFile(file, "r")
 
     @Synchronized
-    override fun read(offset: Long, length: Int): ByteArray {
-        val out = ByteArray(length)
+    override fun read(offset: Long, buffer: ByteArray, length: Int): Int {
+        val want = minOf(length, buffer.size)
         var done = 0
         raf.seek(offset)
-        while (done < length) {
-            val n = raf.read(out, done, length - done)
-            if (n < 0) break
-            if (n == 0) break
+        while (done < want) {
+            val n = raf.read(buffer, done, want - done)
+            if (n <= 0) break
             done += n
         }
-        return if (done == length) out else out.copyOf(done)
+        return done
     }
 
     @Synchronized

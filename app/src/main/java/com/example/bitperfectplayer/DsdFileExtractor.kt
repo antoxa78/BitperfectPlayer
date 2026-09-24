@@ -58,6 +58,7 @@ class DsdFileExtractor(private val dopRequested: Boolean) : Extractor {
     private var readBuf = ByteArray(0)
     private var interBuf = ByteArray(0)
     private var dopBuf = ByteArray(0)
+    private var pcmBuf = ByteArray(0)
 
     override fun sniff(input: ExtractorInput): Boolean {
         val head = ByteArray(16)
@@ -118,16 +119,21 @@ class DsdFileExtractor(private val dopRequested: Boolean) : Extractor {
             track.sampleData(ParsableByteArray(dopBuf, size), size)
             track.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, size, 0, null)
         } else {
-            // Native side reads only the first validPerChannel * channels bytes.
-            val pcm = SacdBridge.nativeDsdConvProcess(converter, interBuf, validPerChannel)
-                ?: throw ParserException.createForMalformedContainer("DSD to PCM conversion failed", null)
-            if (pcm.isEmpty()) return Extractor.RESULT_CONTINUE
-            val frames = pcm.size / (4 * channels)
+            // Native side reads only the first validPerChannel * channels bytes and
+            // writes into the reused pcmBuf (no per-block allocation).
+            val maxOut = SacdBridge.nativeDsdConvMaxOutBytes(converter, validPerChannel)
+            if (pcmBuf.size < maxOut) pcmBuf = ByteArray(maxOut)
+            val pcmBytes = SacdBridge.nativeDsdConvProcessInto(converter, interBuf, validPerChannel, pcmBuf)
+            if (pcmBytes < 0) {
+                throw ParserException.createForMalformedContainer("DSD to PCM conversion failed", null)
+            }
+            if (pcmBytes == 0) return Extractor.RESULT_CONTINUE
+            val frames = pcmBytes / (4 * channels)
             val timeUs = baseTimeUs + framesSinceBase * 1_000_000L / outHz
             framesSinceBase += frames
-            track.sampleData(ParsableByteArray(pcm), pcm.size)
+            track.sampleData(ParsableByteArray(pcmBuf, pcmBytes), pcmBytes)
             // PCM is all-sync: without KEY_FRAME the sample queue drops everything.
-            track.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, pcm.size, 0, null)
+            track.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, pcmBytes, 0, null)
         }
         return Extractor.RESULT_CONTINUE
     }
@@ -170,7 +176,7 @@ class DsdFileExtractor(private val dopRequested: Boolean) : Extractor {
             }
             outHz = SacdBridge.nativeDsdConvOutHz(converter)
         }
-        Log.i(TAG, "${si.container} ${si.channels}ch DSD${si.dsdRate / 44100} " +
+        Log.i(TAG, "${si.container} ${si.channels}ch ${DsdPacking.dsdName(si.dsdRate)} " +
             "${si.durationUs / 1000} ms -> ${if (dop) "DoP ${DsdPacking.dopRate(si.dsdRate)} Hz" else "PCM $outHz Hz"}")
         return si
     }

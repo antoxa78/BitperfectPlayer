@@ -21,6 +21,9 @@
 #include <new>
 #include <unistd.h>
 #include <time.h>
+#include <atomic>
+#include <climits>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
 #include <linux/usbdevice_fs.h>
@@ -143,7 +146,8 @@ static int maxUrbBytesFor(int sampleRate, int bytesPerFrame) {
     return maxFramesPerPacket * bytesPerFrame * USB_AUDIO_PACKETS_PER_URB;
 }
 
-static double readFeedback(int fd, int ep) {
+/** One-shot read of the raw 4-byte feedback value (0 on failure). */
+static uint32_t readFeedbackRaw(int fd, int ep) {
     uint8_t fb[4] = {};
     size_t sz = sizeof(struct usbdevfs_urb) + sizeof(struct usbdevfs_iso_packet_desc);
     auto *u = (struct usbdevfs_urb *)calloc(1, sz);
@@ -163,13 +167,38 @@ static double readFeedback(int fd, int ep) {
         ioctl(fd, USBDEVFS_REAPURBNDELAY, &c);
         free(u); return 0;
     }
-    double r = 0;
-    if (u->iso_frame_desc[0].actual_length >= 4) {
-        uint32_t raw = fb[0] | (fb[1]<<8) | (fb[2]<<16) | (fb[3]<<24);
-        r = raw / 65536.0;
+    uint32_t raw = 0;
+    if (u->iso_frame_desc[0].actual_length >= 3) {
+        raw = (uint32_t)fb[0] | ((uint32_t)fb[1] << 8) | ((uint32_t)fb[2] << 16) |
+              (u->iso_frame_desc[0].actual_length >= 4 ? ((uint32_t)fb[3] << 24) : 0u);
     }
     free(u);
-    return r;
+    return raw;
+}
+
+/**
+ * Converts a raw feedback value to frames per microframe. UAC2 high-speed
+ * feedback is Q16.16, but some DACs report another scale (10.14 in 3 bytes,
+ * or per 1 ms frame); like Linux snd-usb-audio, the power-of-two scale that
+ * lands near the nominal rate is detected once from the first plausible
+ * reading. Returns 0 if the value is unusable.
+ */
+static double feedbackToFpmf(UsbAudioContext *ctx, uint32_t raw) {
+    if (raw == 0) return 0;
+    double nominal = ctx->sampleRate / 8000.0;
+    double f = raw / 65536.0;
+    if (ctx->feedbackShift == FEEDBACK_SHIFT_UNKNOWN) {
+        int shift = 0;
+        double g = f;
+        while (g < nominal * 0.75 && shift < 8) { g *= 2; shift++; }
+        while (g > nominal * 1.5 && shift > -8) { g /= 2; shift--; }
+        if (!(g > nominal * 0.75 && g < nominal * 1.5)) return 0;
+        ctx->feedbackShift = shift;
+        if (shift != 0) {
+            LOGI("Feedback: non-Q16.16 format detected, scaling by 2^%d", shift);
+        }
+    }
+    return ldexp(f, ctx->feedbackShift);
 }
 
 // ── Continuous feedback ─────────────────────────────────────────────
@@ -218,25 +247,27 @@ static bool submitFeedbackUrb(UsbAudioContext *ctx) {
  * Process a completed feedback URB: parse the DAC's clock rate and
  * update calibratedFpmf for real-time clock tracking.
  */
-static int64_t g_feedbackCount = 0;
+static std::atomic<int64_t> g_feedbackCount{0};
 
 static void handleFeedbackCompletion(UsbAudioContext *ctx) {
     ctx->feedbackInFlight = false;
-    g_feedbackCount++;
+    int64_t count = ++g_feedbackCount;
 
-    if (ctx->feedbackUrb->iso_frame_desc[0].actual_length >= 4) {
+    unsigned len = ctx->feedbackUrb->iso_frame_desc[0].actual_length;
+    if (len >= 3) {
         uint8_t *fb = ctx->feedbackBuffer;
-        uint32_t raw = fb[0] | (fb[1] << 8) | (fb[2] << 16) | (fb[3] << 24);
-        double newFpmf = raw / 65536.0;
+        uint32_t raw = (uint32_t)fb[0] | ((uint32_t)fb[1] << 8) | ((uint32_t)fb[2] << 16) |
+                       (len >= 4 ? ((uint32_t)fb[3] << 24) : 0u);
+        double newFpmf = feedbackToFpmf(ctx, raw);
 
         // Sanity check: feedback should be within ±1% of nominal
         double nominal = ctx->sampleRate / 8000.0;
         if (newFpmf > nominal * 0.99 && newFpmf < nominal * 1.01) {
             ctx->calibratedFpmf = newFpmf;
             // Log only every 10000th feedback — logging in the audio path is expensive
-            if (g_feedbackCount % 10000 == 0) {
+            if (count % 10000 == 0) {
                 LOGI("Feedback #%lld: fpmf=%.4f (%.1f Hz)",
-                     (long long)g_feedbackCount, newFpmf, newFpmf * 8000.0);
+                     (long long)count, newFpmf, newFpmf * 8000.0);
             }
         }
     }
@@ -284,6 +315,19 @@ static int submitRingUrb(UsbAudioContext *ctx, const int *pktSizes, int numPacke
     return 0;
 }
 
+/** True if [u] is one of this context's audio ring URBs. */
+static bool isRingUrb(const UsbAudioContext *ctx, const struct usbdevfs_urb *u) {
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++)
+        if (ctx->ring[i].urb == u) return true;
+    return false;
+}
+
+static long elapsedMsSince(const struct timespec *start) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - start->tv_sec) * 1000L + (now.tv_nsec - start->tv_nsec) / 1000000L;
+}
+
 /**
  * Reap the oldest submitted URB (at ring[reapIdx]).
  * ISO URBs with ISO_ASAP complete in FIFO order, so we always reap
@@ -295,21 +339,31 @@ static int submitRingUrb(UsbAudioContext *ctx, const int *pktSizes, int numPacke
  * same thread as audio URB recycling — no second thread, no extra
  * synchronization.
  *
- * @param timeoutMs  Maximum wait in milliseconds
+ * Waiting: usbfs signals POLLOUT on the device fd as soon as an async URB has
+ * completed, so the thread sleeps in poll() until there is something to reap
+ * (it used to poll REAPURBNDELAY every 125 µs: ~8000 wake-ups/s at nice -19
+ * in the steady state, where the ring is always full).
+ *
+ * @param timeoutMs  Maximum wait in milliseconds (wall clock)
  * @return 0 = success (audio URB reaped), -1 = error, -2 = timeout
  */
 static int reapOldestUrb(UsbAudioContext *ctx, int timeoutMs) {
-    struct usbdevfs_urb *c = nullptr;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
-    // Poll with 125µs interval matching USB high-speed microframe timing.
-    int iterations = timeoutMs * 8;  // 8 iterations per ms (125µs each)
-    for (int i = 0; i < iterations; i++) {
+    for (;;) {
+        struct usbdevfs_urb *c = nullptr;
         int ret = ioctl(ctx->fd, USBDEVFS_REAPURBNDELAY, &c);
         if (ret == 0 && c != nullptr) {
             // Check if this is a feedback URB (not an audio URB)
             if (c == ctx->feedbackUrb) {
                 handleFeedbackCompletion(ctx);
-                c = nullptr;  // retry — we need an audio URB
+                continue;  // retry — we need an audio URB
+            }
+            if (!isRingUrb(ctx, c)) {
+                // Leftover from an earlier session (e.g. a leaked one-shot
+                // feedback URB): counting it would desync the ring.
+                LOGW("reapOldestUrb: ignoring foreign completion %p", c);
                 continue;
             }
             // Audio URB reaped successfully
@@ -318,12 +372,27 @@ static int reapOldestUrb(UsbAudioContext *ctx, int timeoutMs) {
             return 0;
         }
         if (ret < 0 && errno != EAGAIN) {
+            if (errno == EINTR) continue;
             LOGE("reapOldestUrb: error errno=%d (%s)", errno, strerror(errno));
             return -1;
         }
-        usleep(125);  // 125µs = 1 USB microframe
+        long waited = elapsedMsSince(&start);
+        if (waited >= timeoutMs) return -2;  // timeout
+
+        struct pollfd pfd;
+        pfd.fd = ctx->fd;
+        pfd.events = POLLOUT | POLLWRNORM;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, (int)(timeoutMs - waited));
+        if (pr < 0 && errno != EINTR) {
+            usleep(125);  // poll not usable here: fall back to the old cadence
+        } else if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) &&
+                   !(pfd.revents & POLLOUT)) {
+            // Device gone: the next REAPURBNDELAY reports the error (ENODEV);
+            // avoid spinning on an fd that polls ready forever.
+            usleep(1000);
+        }
     }
-    return -2;  // timeout
 }
 
 /**
@@ -466,6 +535,9 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioCreate(
     ctx->feedbackUrb = nullptr;
     ctx->feedbackInFlight = false;
     memset(ctx->feedbackBuffer, 0, sizeof(ctx->feedbackBuffer));
+    ctx->feedbackShift = FEEDBACK_SHIFT_UNKNOWN;
+    ctx->mergeBuffer = nullptr;
+    ctx->mergeCapacity = 0;
 
     if (!allocRing(ctx)) {
         delete ctx;
@@ -520,9 +592,10 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioStart(
     // Pipeline is empty here, so REAPURBNDELAY can only return the feedback URB.
     double nominalFpmf = ctx->sampleRate / 8000.0;
     ctx->calibratedFpmf = nominalFpmf;
+    ctx->feedbackShift = FEEDBACK_SHIFT_UNKNOWN;
 
     if (ctx->endpointFeedback > 0) {
-        double fb = readFeedback(ctx->fd, ctx->endpointFeedback);
+        double fb = feedbackToFpmf(ctx, readFeedbackRaw(ctx->fd, ctx->endpointFeedback));
         // Same ±1% sanity window as handleFeedbackCompletion(): a misparsed
         // or bogus first reading must not size packets (it could otherwise
         // blow URBs past USB_AUDIO_URB_BUFFER_SIZE).
@@ -571,7 +644,8 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWrite(
     if (!ctx->transferBuffer || ctx->transferBufferCapacity < totalBytes) {
         free(ctx->transferBuffer);
         ctx->transferBuffer = (uint8_t *)malloc(totalBytes);
-        ctx->transferBufferCapacity = totalBytes;
+        ctx->transferBufferCapacity = ctx->transferBuffer ? totalBytes : 0;
+        if (!ctx->transferBuffer) { LOGE("Write: OOM"); return; }
     }
 
     struct timespec writeStart, writeEnd;
@@ -657,6 +731,7 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioDestroy(
     free(ctx->feedbackUrb);
     ctx->feedbackUrb = nullptr;
     free(ctx->transferBuffer);
+    free(ctx->mergeBuffer);
     LOGI("Destroy: %lld frames total", (long long)ctx->framesWritten);
     delete ctx;
 }
@@ -761,15 +836,23 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
     // micro-discontinuities (pops) at buffer boundaries.
     const uint8_t *data = pcmData;
     int dataLen = totalBytes;
-    uint8_t *mergedBuf = nullptr;
 
     if (ctx->residualBytes > 0 && totalBytes > 0) {
-        dataLen = ctx->residualBytes + totalBytes;
-        mergedBuf = (uint8_t *)malloc(dataLen);
-        if (mergedBuf) {
-            memcpy(mergedBuf, ctx->residualBuffer, ctx->residualBytes);
-            memcpy(mergedBuf + ctx->residualBytes, pcmData, totalBytes);
-            data = mergedBuf;
+        int need = ctx->residualBytes + totalBytes;
+        if (need > ctx->mergeCapacity) {
+            // Grows only for the first buffers / a larger buffer size, then is
+            // reused: no allocation on the audio thread in the steady state.
+            uint8_t *nb = (uint8_t *)realloc(ctx->mergeBuffer, need);
+            if (nb) { ctx->mergeBuffer = nb; ctx->mergeCapacity = need; }
+        }
+        if (ctx->mergeBuffer && ctx->mergeCapacity >= need) {
+            memcpy(ctx->mergeBuffer, ctx->residualBuffer, ctx->residualBytes);
+            memcpy(ctx->mergeBuffer + ctx->residualBytes, pcmData, totalBytes);
+            data = ctx->mergeBuffer;
+            dataLen = need;
+        } else {
+            // OOM: the residual (whole frames) is lost; never read past pcmData.
+            LOGE("submitPcmToUrbs: OOM merging %d residual bytes", ctx->residualBytes);
         }
         ctx->residualBytes = 0;
     }
@@ -825,11 +908,9 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
                 LOGE("submitPcmToUrbs: reap timeout, inflight=%d", ctx->urbsInFlight);
                 drainAllUrbs(ctx);
                 ctx->running.store(false);
-                free(mergedBuf);
                 return;
             } else if (result < 0) {
                 ctx->running.store(false);
-                free(mergedBuf);
                 return;
             }
         }
@@ -841,7 +922,6 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
             LOGE("submitPcmToUrbs: URB of %d bytes exceeds slot buffer %d — stopping stream",
                  urbBytes, USB_AUDIO_URB_BUFFER_SIZE);
             ctx->running.store(false);
-            free(mergedBuf);
             return;
         }
 
@@ -851,7 +931,6 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
         if (submitRingUrb(ctx, pktSizes, numPackets, urbBytes) < 0) {
             LOGE("submitPcmToUrbs: submit failed, stopping stream");
             ctx->running.store(false);
-            free(mergedBuf);
             return;
         }
         offset += urbBytes;
@@ -864,8 +943,6 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
         memcpy(ctx->residualBuffer, data + offset, leftover);
         ctx->residualBytes = leftover;
     }
-
-    free(mergedBuf);
 }
 
 // ── Raw bytes write (no float, for libFLAC integer path) ────────────
@@ -882,6 +959,7 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWriteRaw(
     if (inputBytes <= 0) return;
 
     int inputBps = inputBitDepth / 8;
+    if (inputBps <= 0) return;
     int totalSamples = inputBytes / inputBps;
     int totalFrames = totalSamples / ctx->channelCount;
     int outputBytes = totalSamples * ctx->bytesPerSample;
@@ -890,24 +968,25 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWriteRaw(
     if (!ctx->transferBuffer || ctx->transferBufferCapacity < outputBytes) {
         free(ctx->transferBuffer);
         ctx->transferBuffer = (uint8_t *)malloc(outputBytes);
-        ctx->transferBufferCapacity = outputBytes;
+        ctx->transferBufferCapacity = ctx->transferBuffer ? outputBytes : 0;
+        if (!ctx->transferBuffer) { LOGE("WriteRaw: OOM"); return; }
     }
 
     jbyte *rawData = env->GetByteArrayElements(pcm, nullptr);
     if (!rawData) return;
 
-    // Bit-depth matching: pad input to DAC's bit depth (lossless integer ops)
+    // Bit-depth matching: pad input to DAC's bit depth (lossless integer ops).
+    // 32-bit input (C.ENCODING_PCM_32BIT) is full-scale int32 and is sent
+    // as-is; there is no "24-bit in 32" input on this path (the old branch for
+    // it sat after the equal-depth case and could never run).
     if (inputBitDepth == ctx->bitDepth) {
-        // Same bit depth: zero-copy
-        memcpy(ctx->transferBuffer, rawData, inputBytes);
+        // Same bit depth: straight copy
+        memcpy(ctx->transferBuffer, rawData, (size_t)totalSamples * (size_t)inputBps);
     } else if (inputBitDepth == 16 && ctx->bitDepth == 32) {
         padInt16ToInt32((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
     } else if (inputBitDepth == 24 && ctx->bitDepth == 32) {
         // 24-bit packed (3 bytes/sample) → 32-bit: sign-extend + shift left 8
         padInt24ToInt32((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
-    } else if (inputBitDepth == 32 && ctx->bitDepth == 32) {
-        // libFLAC 24-bit → PCM_32BIT (sign-extended): shift left 8 to fill 32-bit range
-        shiftInt32From24((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
     } else {
         LOGE("WriteRaw: unsupported bit-depth conversion %d → %d", inputBitDepth, ctx->bitDepth);
         env->ReleaseByteArrayElements(pcm, rawData, JNI_ABORT);
@@ -923,7 +1002,7 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWriteRaw(
     if (ctx->framesWritten % ctx->sampleRate < (int64_t)totalFrames) {
         LOGI("WriteRaw: %lld frames (~%.0f sec) inflight=%d inputBits=%d fpmf=%.4f fb#%lld",
              (long long)ctx->framesWritten, (double)ctx->framesWritten/ctx->sampleRate,
-             ctx->urbsInFlight, inputBitDepth, ctx->calibratedFpmf, (long long)g_feedbackCount);
+             ctx->urbsInFlight, inputBitDepth, ctx->calibratedFpmf, (long long)g_feedbackCount.load());
     }
 }
 

@@ -2,6 +2,7 @@ package com.example.bitperfectplayer
 
 import android.content.Context
 import android.graphics.drawable.Animatable
+import android.graphics.drawable.Drawable
 import android.view.ViewGroup
 import android.widget.ImageView
 import androidx.appcompat.content.res.AppCompatResources
@@ -26,6 +27,9 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
         )
 
         private val EXIT_TINT = 0xFFFF5252.toInt()
+
+        /** Draw card icons on a soft circle in the tint colour (false = bare glyph). */
+        private const val ICON_BACKDROP = true
 
         fun themeColorFor(context: Context): Int {
             val index = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
@@ -58,7 +62,14 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
         }
 
         val iconRes = resolveIconRes(mediaItem)
-        val drawable = AppCompatResources.getDrawable(context, iconRes)?.mutate()
+        // Path-drawn icons stay sharp when Leanback zooms the focused card; fall back to the
+        // plain resource if a drawable can't be parsed as a single-colour vector.
+        val drawable: Drawable? = if (mediaItem.mediaId.startsWith("action:NOW_")) {
+            EqualizerDrawable(ICON_BACKDROP)
+        } else {
+            MenuIcons.glyph(context, iconRes)?.let { MenuIconDrawable(it, ICON_BACKDROP) }
+                ?: AppCompatResources.getDrawable(context, iconRes)?.mutate()
+        }
 
         // Exit button is always red; everything else uses the current theme colour
         drawable?.setTint(if (iconRes == R.drawable.ic_exit) EXIT_TINT else themeColor)
@@ -90,24 +101,25 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
         val lower = id.lowercase()
         return when {
             id.startsWith("action:USB DAC")              -> R.drawable.ic_dac
-            id.startsWith("action:Audio Output")       -> R.drawable.ic_audio
-            id.startsWith("action:Add Local")         -> R.drawable.ic_add
-            id.startsWith("action:External Drive")    -> R.drawable.ic_usb
-            id.startsWith("action:Add SMB")           -> R.drawable.ic_network_music
-            id.startsWith("action:Screensaver")       -> R.drawable.ic_screensaver
-            id.startsWith("action:Stay Awake")        -> R.drawable.ic_screensaver
-            id.startsWith("action:DSD Output")        -> R.drawable.ic_waveform
-            id.startsWith("action:Resume")            -> R.drawable.ic_play
-            id.startsWith("action:Recent")            -> R.drawable.ic_history
-            id.startsWith("action:Network Settings")  -> R.drawable.ic_network
-            id.startsWith("action:Scan Library")      -> R.drawable.ic_sync
-            id.startsWith("action:About")             -> R.drawable.ic_info
-            id.startsWith("action:Music Folders")     -> R.drawable.ic_audio
-            id.startsWith("action:Internal Storage")  -> R.drawable.ic_storage
-            id.startsWith("action:NOW_")              -> R.drawable.anim_playing
-            id.startsWith("action:Exit")              -> R.drawable.ic_exit
-            id.startsWith("action:Player Color Scheme") -> R.drawable.ic_palette
-            id.startsWith("action:Waveform Type")     -> R.drawable.anim_playing
+            id.startsWith("action:Audio Output")         -> R.drawable.ic_speaker
+            id.startsWith("action:Add Local")            -> R.drawable.ic_add
+            id.startsWith("action:External Drive")       -> R.drawable.ic_usb
+            id.startsWith("action:Add SMB")              -> R.drawable.ic_add_network
+            id.startsWith("action:Screensaver")          -> R.drawable.ic_screensaver
+            id.startsWith("action:DSD Output")           -> R.drawable.ic_dsd
+            id.startsWith("action:Resume Last")          -> R.drawable.ic_resume_last
+            id.startsWith("action:Resume")               -> R.drawable.ic_resume_playback
+            id.startsWith("action:Recent")               -> R.drawable.ic_history
+            id.startsWith("action:Network Settings")     -> R.drawable.ic_network_settings
+            id.startsWith("action:Scan Library")         -> R.drawable.ic_scan_library
+            id.startsWith("action:About")                -> R.drawable.ic_info
+            id.startsWith("action:Music Folders")        -> R.drawable.ic_folder_music
+            id.startsWith("action:Internal Storage")     -> R.drawable.ic_storage
+            id.startsWith("action:NOW_")                 -> R.drawable.anim_playing
+            id.startsWith("action:Exit")                 -> R.drawable.ic_exit
+            id.startsWith("action:Player Color Scheme")  -> R.drawable.ic_palette
+            id.startsWith("action:Waveform Type")        -> R.drawable.ic_waveform
+            id.startsWith("action:LAN Player Control")   -> R.drawable.ic_lan_control
             id.startsWith("smb://")                   -> R.drawable.ic_network_music
             lower.endsWith(".m3u") || lower.endsWith(".m3u8") || lower.endsWith(".pls") || lower.endsWith(".cue") -> {
                 if (id.startsWith("content://")) R.drawable.ic_playlist_local else R.drawable.ic_playlist

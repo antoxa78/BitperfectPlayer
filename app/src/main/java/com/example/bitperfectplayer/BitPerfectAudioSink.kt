@@ -64,6 +64,25 @@ class BitPerfectAudioSink(
     private var pendingConverted: ByteBuffer? = null
 
     /**
+     * A format change that arrived while the direct AudioTrack still holds
+     * audio of the previous item. Like DefaultAudioSink's pending
+     * configuration, it is applied only once that audio has played out —
+     * releasing the track straight away cut off the end of every track.
+     */
+    private class PendingConfig(val format: Format, val specifiedBufferSize: Int, val outputChannels: IntArray?)
+    private var pendingConfig: PendingConfig? = null
+    /** stop() was issued on the direct track (end of stream / draining for a switch). */
+    private var directStopIssued = false
+    private var drainStartedMs = 0L
+
+    /** The configured stream is DoP (DSD over PCM): only valid bit-exact through
+     *  the USB driver; played as PCM anywhere else it is just noise. */
+    private var currentIsDop = false
+    /** Last format passed to configure() (carried by errors so the service can
+     *  recognise a DoP stream). */
+    private var configuredFormat: Format? = null
+
+    /**
      * When true, the userspace USB driver owns the DAC and this sink must not
      * create its own direct AudioTrack on the USB output (that would fight the
      * usbdevfs driver over the interface). Set by PlaybackService when the
@@ -109,6 +128,41 @@ class BitPerfectAudioSink(
     }
 
     override fun configure(format: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        if (isDopFormat(format) && !driverOwnsUsbDevice) {
+            // Refuse instead of letting the system mixer / resampler (or a
+            // plain direct track) turn the DoP bitstream into audible noise.
+            // PlaybackService catches this and retries the track as PCM.
+            throw AudioSink.ConfigurationException(
+                "DoP stream needs the bit-perfect USB driver", format
+            )
+        }
+        currentIsDop = isDopFormat(format)
+        configuredFormat = format
+        if (directMode && directTrack != null) {
+            if (outputChannels == null && isDirectCandidate(format) && isSameDirectFormat(format)) {
+                // Next item in the same PCM format (gapless album): keep feeding
+                // the same AudioTrack — no drain, no gap, no mixer re-negotiation.
+                directFormat = format
+                pendingConfig = null
+                return
+            }
+            // Different format: let the current track play out first (see handleBuffer).
+            pendingConfig = PendingConfig(format, specifiedBufferSize, outputChannels)
+            return
+        }
+        pendingConfig = null
+        applyConfiguration(format, specifiedBufferSize, outputChannels)
+    }
+
+    private fun isSameDirectFormat(format: Format): Boolean {
+        val cur = directFormat ?: return false
+        return format.sampleRate == cur.sampleRate &&
+            format.channelCount == cur.channelCount &&
+            format.pcmEncoding == cur.pcmEncoding
+    }
+
+    private fun applyConfiguration(format: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        directStopIssued = false
         if (directMode) {
             releaseDirectTrack()
             delegate.reset()
@@ -156,11 +210,45 @@ class BitPerfectAudioSink(
         if (directMode) directTrack?.play() else delegate.play()
     }
 
+    /**
+     * Plays out the direct track before a pending format switch. Returns true
+     * once everything written has been rendered (or the track is unusable).
+     */
+    private fun drainDirectTrack(): Boolean {
+        val track = directTrack ?: return true
+        if (!playing) return false  // paused: finish the drain after play()
+        if (!directStopIssued) {
+            try { track.stop() } catch (_: Exception) { return true }
+            directStopIssued = true
+            drainStartedMs = android.os.SystemClock.elapsedRealtime()
+        }
+        val head = (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) - directBasePlaybackHead
+        if (head >= directWrittenFrames) return true
+        // Never wedge the renderer on a track whose position stops moving.
+        return android.os.SystemClock.elapsedRealtime() - drainStartedMs > DRAIN_TIMEOUT_MS
+    }
+
     override fun handleDiscontinuity() {
+        // Re-anchored from the next buffer (see handleBuffer), accounting for
+        // everything already written, so the position stays continuous.
         if (directMode) directStartMediaTimeUs = C.TIME_UNSET else delegate.handleDiscontinuity()
     }
 
     override fun handleBuffer(buffer: ByteBuffer, presentationTimeUs: Long, encodedAccessUnitCount: Int): Boolean {
+        pendingConfig?.let { pc ->
+            if (!drainDirectTrack()) return false
+            pendingConfig = null
+            applyConfiguration(pc.format, pc.specifiedBufferSize, pc.outputChannels)
+        }
+        if (currentIsDop && !driverOwnsUsbDevice) {
+            // The USB driver let go of the DAC mid-stream (unplug, release):
+            // never let the DoP bitstream reach a speaker as PCM noise.
+            throw AudioSink.WriteException(
+                AudioTrack.ERROR_INVALID_OPERATION,
+                configuredFormat ?: directFormat ?: Format.Builder().build(),
+                false
+            )
+        }
         if (!directMode) return delegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
 
         val track = directTrack ?: try {
@@ -171,7 +259,11 @@ class BitPerfectAudioSink(
         }
 
         if (!buffer.hasRemaining()) return true
-        if (directStartMediaTimeUs == C.TIME_UNSET) directStartMediaTimeUs = presentationTimeUs
+        if (directStartMediaTimeUs == C.TIME_UNSET) {
+            // This buffer starts after everything already written to the track
+            // (non-zero after a discontinuity, e.g. a gapless item change).
+            directStartMediaTimeUs = presentationTimeUs - framesToDurationUs(directWrittenFrames)
+        }
 
         if (directConvertFloat) {
             // Convert the whole input buffer once; keep the result until the
@@ -202,10 +294,23 @@ class BitPerfectAudioSink(
     }
 
     override fun playToEndOfStream() {
-        if (directMode) directEnded = true else delegate.playToEndOfStream()
+        if (directMode) {
+            directEnded = true
+            // A streaming AudioTrack only guarantees to play out its last,
+            // partially filled buffer after stop(); without it a DIRECT output
+            // can hold those frames back and isEnded() never becomes true.
+            val track = directTrack
+            if (track != null && !directStopIssued && pendingConverted == null) {
+                try { track.stop() } catch (_: Exception) {}
+                directStopIssued = true
+            }
+        } else {
+            delegate.playToEndOfStream()
+        }
     }
 
-    override fun isEnded(): Boolean = if (directMode) directEnded && !hasPendingData() else delegate.isEnded()
+    override fun isEnded(): Boolean =
+        if (directMode) pendingConfig == null && directEnded && !hasPendingData() else delegate.isEnded()
 
     override fun hasPendingData(): Boolean {
         if (!directMode) return delegate.hasPendingData()
@@ -299,19 +404,35 @@ class BitPerfectAudioSink(
     }
 
     override fun flush() {
+        val pc = pendingConfig
+        if (pc != null) {
+            // The audio waiting to drain is being discarded anyway: switch now.
+            pendingConfig = null
+            applyConfiguration(pc.format, pc.specifiedBufferSize, pc.outputChannels)
+        }
         if (directMode) {
-            directTrack?.flush()
+            directTrack?.let { t ->
+                // flush() only works on a paused/stopped track.
+                try { if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.pause() } catch (_: Exception) {}
+                t.flush()
+                if (playing) try { t.play() } catch (_: Exception) {}
+            }
             pendingConverted = null
             directWrittenFrames = 0L
             directBasePlaybackHead = directTrack?.playbackHeadPosition?.toLong()?.and(0xFFFFFFFFL) ?: 0L
             directStartMediaTimeUs = C.TIME_UNSET
             directEnded = false
+            directStopIssued = false
         } else {
             delegate.flush()
         }
     }
 
     override fun reset() {
+        pendingConfig = null
+        directStopIssued = false
+        currentIsDop = false
+        configuredFormat = null
         releaseDirectTrack()
         directMode = false
         directFormat = null
@@ -421,12 +542,18 @@ class BitPerfectAudioSink(
 
     private fun playedFrames(): Long {
         val track = directTrack ?: return 0L
-        val timestampFrames = if (track.getTimestamp(audioTimestamp)) {
-            audioTimestamp.framePosition
+        val rate = directFormat?.sampleRate ?: 0
+        val frames = if (playing && rate > 0 && track.getTimestamp(audioTimestamp)) {
+            // The timestamp describes the frame presented at nanoTime, which
+            // can be tens of ms old: advance it to "now" so the position moves
+            // smoothly instead of in steps.
+            val ageNs = System.nanoTime() - audioTimestamp.nanoTime
+            audioTimestamp.framePosition + if (ageNs > 0) ageNs * rate / 1_000_000_000L else 0L
         } else {
             track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
         }
-        return (timestampFrames - directBasePlaybackHead).coerceAtLeast(0L)
+        // Never report more than was actually written.
+        return (frames - directBasePlaybackHead).coerceIn(0L, directWrittenFrames)
     }
 
     private fun framesToDurationUs(frames: Long): Long {
@@ -527,6 +654,12 @@ class BitPerfectAudioSink(
 
     private companion object {
         const val TAG = "BitPerfectAudioSink"
+
+        /** Upper bound for playing out the old track before a format switch. */
+        const val DRAIN_TIMEOUT_MS = 2_000L
+
+        /** DSD sources label their DoP formats ("DSD64 DoP"); see SacdMediaExtractor / DsdFileExtractor. */
+        fun isDopFormat(format: Format): Boolean = format.label?.contains("DoP") == true
 
         /** Exact for float values that came from ≤24-bit integers (scaling by a
          *  power of two in double precision), rounded to nearest otherwise. */

@@ -46,6 +46,7 @@ class UsbAudioStream(
 
     /** Native UsbAudioContext pointer. Exposed for NativeAudioEngine which
      *  shares the same USB context for direct submitPcmToUrbs calls. */
+    @Volatile
     var nativeHandle: Long = 0L
         private set
 

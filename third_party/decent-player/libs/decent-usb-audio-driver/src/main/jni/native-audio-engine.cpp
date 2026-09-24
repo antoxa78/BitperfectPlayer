@@ -52,12 +52,25 @@ class AsyncBufferedDataSource : public DataSource {
     // Protected by mutex (shared between I/O thread and decode thread)
     pthread_mutex_t mu_;
     pthread_cond_t cond_;   // signal decode thread when data available
+    pthread_cond_t ioCond_; // wake the I/O thread: space freed, seek, shutdown
     off64_t bufStart_;
     size_t bufFilled_;
     off64_t ioPos_;         // next read position for I/O thread
     bool seekPending_;
     off64_t seekTarget_;
     bool alive_;
+
+    bool eof_;
+
+    /** Caller holds mu_. Timed wait on ioCond_ (spurious wake-ups are fine). */
+    static void ioWaitLocked(AsyncBufferedDataSource *ds, int ms) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)ms * 1000000L;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&ds->ioCond_, &ds->mu_, &ts);
+    }
 
     static void *ioLoop(void *arg) {
         auto *ds = static_cast<AsyncBufferedDataSource *>(arg);
@@ -72,11 +85,15 @@ class AsyncBufferedDataSource : public DataSource {
                 ds->bufFilled_ = 0;
                 ds->ioPos_ = ds->seekTarget_;
                 ds->seekPending_ = false;
+                ds->eof_ = false;
             }
 
-            if (ds->bufFilled_ >= BUF_CAP) {
+            if (ds->bufFilled_ >= BUF_CAP || ds->eof_) {
+                // Buffer full (or file fully read): sleep until the reader
+                // frees space, a seek arrives or we shut down, instead of
+                // waking every 5 ms for the whole track.
+                ioWaitLocked(ds, 200);
                 pthread_mutex_unlock(&ds->mu_);
-                usleep(5000);
                 continue;
             }
 
@@ -102,7 +119,13 @@ class AsyncBufferedDataSource : public DataSource {
                 }
                 pthread_mutex_unlock(&ds->mu_);
             } else {
-                usleep(5000);
+                pthread_mutex_lock(&ds->mu_);
+                if (n == 0 && ds->ioPos_ == readPos && !ds->seekPending_) {
+                    ds->eof_ = true;   // idle until a seek rewinds us
+                } else {
+                    ioWaitLocked(ds, 5); // read error: brief back-off, then retry
+                }
+                pthread_mutex_unlock(&ds->mu_);
             }
         }
         free(tempBuf);
@@ -113,12 +136,13 @@ class AsyncBufferedDataSource : public DataSource {
 public:
     AsyncBufferedDataSource(int fd, bool ownsFd) : fd_(fd), ownsFd_(ownsFd),
             fileLength_(0), buf_(nullptr), bufStart_(0), bufFilled_(0),
-            ioPos_(0), seekPending_(false), seekTarget_(0), alive_(true) {
+            ioPos_(0), seekPending_(false), seekTarget_(0), alive_(true), eof_(false) {
         struct stat st;
         if (fstat(fd, &st) == 0) fileLength_ = st.st_size;
         buf_ = (uint8_t *)malloc(BUF_CAP);
         pthread_mutex_init(&mu_, nullptr);
         pthread_cond_init(&cond_, nullptr);
+        pthread_cond_init(&ioCond_, nullptr);
         posix_fadvise(fd, 0, fileLength_, POSIX_FADV_SEQUENTIAL);
         // Only readahead first 2MB — enough for FLAC metadata + initial frames.
         // Reading the entire file monopolizes the FUSE daemon on SD cards,
@@ -133,10 +157,12 @@ public:
     ~AsyncBufferedDataSource() override {
         pthread_mutex_lock(&mu_);
         alive_ = false;
+        pthread_cond_broadcast(&ioCond_);
         pthread_mutex_unlock(&mu_);
         pthread_join(ioThread_, nullptr);
         pthread_mutex_destroy(&mu_);
         pthread_cond_destroy(&cond_);
+        pthread_cond_destroy(&ioCond_);
         free(buf_);
         if (ownsFd_ && fd_ >= 0) close(fd_);
     }
@@ -150,13 +176,17 @@ public:
         if (offset >= bufStart_ && (size_t)(offset - bufStart_) + size <= bufFilled_) {
             memcpy(data, buf_ + (offset - bufStart_), size);
 
-            // Compact when consumed past half
+            // Compact when consumed past half. ">=": a reader that has caught
+            // up exactly with the I/O thread must compact too, or a full buffer
+            // is never freed and every later read bypasses it (direct pread on
+            // the audio thread).
             size_t consumed = (size_t)(offset + size - bufStart_);
-            if (consumed > BUF_CAP / 2 && bufFilled_ > consumed) {
+            if (consumed > BUF_CAP / 2 && bufFilled_ >= consumed) {
                 size_t remaining = bufFilled_ - consumed;
                 memmove(buf_, buf_ + consumed, remaining);
                 bufStart_ = offset + size;
                 bufFilled_ = remaining;
+                pthread_cond_signal(&ioCond_);  // space for the I/O thread again
             }
             pthread_mutex_unlock(&mu_);
             return (ssize_t)size;
@@ -166,6 +196,12 @@ public:
         if (offset >= bufStart_ && offset < bufStart_ + (off64_t)bufFilled_) {
             size_t avail = (size_t)(bufStart_ + bufFilled_ - offset);
             memcpy(data, buf_ + (offset - bufStart_), avail);
+            // Everything buffered is consumed: release it once past half.
+            if ((size_t)(offset - bufStart_) + avail > BUF_CAP / 2) {
+                bufStart_ = offset + (off64_t)avail;
+                bufFilled_ = 0;
+                pthread_cond_signal(&ioCond_);
+            }
             pthread_mutex_unlock(&mu_);
             return (ssize_t)avail;
         }
@@ -182,6 +218,7 @@ public:
         // Large miss: redirect I/O thread and wait
         seekTarget_ = offset;
         seekPending_ = true;
+        pthread_cond_signal(&ioCond_);
 
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
@@ -205,11 +242,12 @@ public:
         memcpy(data, buf_ + (offset - bufStart_), size);
 
         size_t consumed = (size_t)(offset + size - bufStart_);
-        if (consumed > BUF_CAP / 2 && bufFilled_ > consumed) {
+        if (consumed > BUF_CAP / 2 && bufFilled_ >= consumed) {
             size_t remaining = bufFilled_ - consumed;
             memmove(buf_, buf_ + consumed, remaining);
             bufStart_ = offset + size;
             bufFilled_ = remaining;
+            pthread_cond_signal(&ioCond_);
         }
 
         pthread_mutex_unlock(&mu_);
@@ -257,8 +295,11 @@ struct NativeAudioEngine {
 
     // Position tracking
     std::atomic<int64_t> framesDecoded;
-    int64_t seekTargetSampleIndex;  // -1 = no seek pending
-    std::atomic<bool> seekPending;
+    /** Pending seek target sample, -1 = none. Taken by the decode thread with
+     *  exchange(-1), so a seek requested while another one is being carried
+     *  out is never lost (the old target + flag pair could drop it, and the
+     *  target itself was read and written unsynchronized). */
+    std::atomic<int64_t> seekTarget;
 
     // Buffers
     uint8_t *pcmBuffer;       // raw decoded PCM from FLACParser
@@ -309,6 +350,21 @@ struct PrepareArgs {
 static void *prepareThreadFunc(void *arg) {
     auto *a = static_cast<PrepareArgs *>(arg);
     NativeAudioEngine *engine = a->engine;
+
+    // Superseded before we even started (rapid queue edits): don't allocate an
+    // 8 MB buffer + I/O thread and parse a file nobody will play.
+    pthread_mutex_lock(&engine->nextMu);
+    bool stale = a->generation != engine->nextGeneration;
+    if (stale) {
+        engine->preparersInFlight--;
+        pthread_cond_broadcast(&engine->nextCv);
+    }
+    pthread_mutex_unlock(&engine->nextMu);
+    if (stale) {
+        close(a->fd);
+        delete a;
+        return nullptr;
+    }
 
     auto *ds = new AsyncBufferedDataSource(a->fd, true);  // takes ownership of fd
     auto *parser = new FLACParser(ds);
@@ -407,7 +463,8 @@ static bool takeNextTrack(NativeAudioEngine *engine) {
     engine->parser = np;
     engine->dataSource = nds;
     engine->bitsPerSample = bits;
-    engine->seekPending.store(false);
+    // A seek still pending here was aimed at the file that just ended.
+    engine->seekTarget.store(-1);
     engine->framesDecoded.store(0);
     int n = engine->trackSwitches.fetch_add(1) + 1;
     LOGI("Gapless: switched to next track #%d (%d Hz, %d ch, %d-bit) without draining USB",
@@ -430,8 +487,8 @@ static void *decodeThreadFunc(void *arg) {
         }
 
         // Handle seek
-        if (engine->seekPending.load()) {
-            int64_t targetSample = engine->seekTargetSampleIndex;
+        int64_t targetSample = engine->seekTarget.exchange(-1);
+        if (targetSample >= 0) {
             FLAC__uint64 totalSamples = engine->parser->getTotalSamples();
             LOGI("Seek: target=%lld total=%llu state=%s",
                  (long long)targetSample, (unsigned long long)totalSamples,
@@ -458,7 +515,6 @@ static void *decodeThreadFunc(void *arg) {
                 engine->parser->decodeMetadata();
                 engine->framesDecoded.store(0);
             }
-            engine->seekPending.store(false);
         }
 
         // Decode one FLAC frame
@@ -583,8 +639,7 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeCreateFromFd(
     engine->running.store(false);
     engine->paused.store(false);
     engine->framesDecoded.store(0);
-    engine->seekTargetSampleIndex = -1;
-    engine->seekPending.store(false);
+    engine->seekTarget.store(-1);
     engine->threadStarted = false;
     pthread_mutex_init(&engine->nextMu, nullptr);
     pthread_cond_init(&engine->nextCv, nullptr);
@@ -632,8 +687,11 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeStart(
         engine->threadStarted = false;
     }
 
+    // The paused state is kept: the caller pauses a fresh engine BEFORE
+    // starting it, so no audio from the start of the file reaches the DAC
+    // before the first seek to the real position (it used to start playing
+    // immediately and was paused a moment later — an audible blip on resume).
     engine->running.store(true);
-    engine->paused.store(false);
 
     int ret = pthread_create(&engine->thread, nullptr, decodeThreadFunc, engine);
     if (ret != 0) {
@@ -668,14 +726,14 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeSeek(
     auto *engine = reinterpret_cast<NativeAudioEngine *>(handle);
     if (!engine) return JNI_FALSE;
 
-    engine->seekTargetSampleIndex = positionUs * engine->sampleRate / 1000000LL;
+    int64_t target = positionUs * engine->sampleRate / 1000000LL;
+    if (target < 0) target = 0;
     // Update framesDecoded immediately so getCurrentPositionUs returns the
     // seek target right away, before the decode thread processes the seek.
     // Prevents ExoPlayer from seeing a stale backwards position jump.
-    engine->framesDecoded.store(engine->seekTargetSampleIndex);
-    engine->seekPending.store(true);
-    LOGI("Seek requested: %lld us → sample %lld",
-         (long long)positionUs, (long long)engine->seekTargetSampleIndex);
+    engine->framesDecoded.store(target);
+    engine->seekTarget.store(target);
+    LOGI("Seek requested: %lld us → sample %lld", (long long)positionUs, (long long)target);
     return JNI_TRUE;
 }
 

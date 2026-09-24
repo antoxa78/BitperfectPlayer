@@ -84,6 +84,14 @@ class UsbStreamingThread(private val usbStream: UsbAudioStream) {
     private var thread: Thread? = null
     private var dropCount = 0
 
+    /**
+     * Held for every native write and for [flushStream]. The native stream
+     * context (residual bytes, packet accumulator, frame counter) has no
+     * locking of its own, so a flush from ExoPlayer's playback thread must
+     * never run while this thread is inside write()/writeRaw().
+     */
+    private val writeLock = Any()
+
     fun start() {
         running = true
         thread = Thread({
@@ -103,12 +111,16 @@ class UsbStreamingThread(private val usbStream: UsbAudioStream) {
                 val qBefore = audioQueue.size
                 when (val buf = audioQueue.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                     is AudioBuffer.FloatBuffer -> {
-                        usbStream.write(buf.data)   // native side copies the samples
+                        synchronized(writeLock) {
+                            if (running) usbStream.write(buf.data)   // native side copies the samples
+                        }
                         recycle(buf.data)
                         if (qBefore <= 1) Log.w(TAG, "Queue nearly empty: $qBefore before write")
                     }
                     is AudioBuffer.RawBuffer -> {
-                        usbStream.writeRaw(buf.data, buf.encoding)
+                        synchronized(writeLock) {
+                            if (running) usbStream.writeRaw(buf.data, buf.encoding)
+                        }
                         recycle(buf.data)
                         if (qBefore <= 1) Log.w(TAG, "Queue nearly empty: $qBefore before writeRaw")
                     }
@@ -163,10 +175,26 @@ class UsbStreamingThread(private val usbStream: UsbAudioStream) {
         audioQueue.clear()
     }
 
+    /**
+     * Seek/flush: drops the queued buffers AND resets the native stream's
+     * residual/accumulator/frame counter, serialized with the writer so the
+     * reset can't interleave with a write of a pre-flush buffer.
+     */
+    fun flushStream() {
+        synchronized(writeLock) {
+            audioQueue.clear()
+            usbStream.flush()
+        }
+    }
+
     fun stop() {
         running = false
         audioQueue.clear()
         thread?.join(2000)
+        // If the join timed out the thread may still be inside a native write:
+        // wait for it (it sees running == false afterwards) so the caller can
+        // safely drain and release the native stream.
+        synchronized(writeLock) {}
         thread = null
     }
 }

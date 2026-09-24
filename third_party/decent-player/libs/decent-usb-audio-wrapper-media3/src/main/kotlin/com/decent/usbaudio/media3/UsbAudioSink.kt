@@ -218,6 +218,15 @@ class UsbAudioSink(
     /** Tracks ExoPlayer's play/pause state so seek-while-paused doesn't auto-resume. */
     @Volatile private var isPlaying = false
 
+    /**
+     * Set by an idle release (pause / stop / screen-off hand-back). The next
+     * buffer while playing re-claims the DAC for the current format; without
+     * this the rest of the track (until the next item's configure) silently
+     * went through the Android audio path — and a DoP stream would have
+     * reached it as noise.
+     */
+    @Volatile private var reclaimAfterIdleRelease = false
+
     /** Deferred USB reconfiguration — applied after engine finishes playing. */
     private var deferredRate: Int = 0
     private var deferredChannels: Int = 0
@@ -226,6 +235,7 @@ class UsbAudioSink(
 
 
     override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        reclaimAfterIdleRelease = false   // configure() (re)opens the USB stream itself
         val enc = inputFormat.pcmEncoding
         if (enc != Format.NO_VALUE) currentEncoding = enc
 
@@ -323,6 +333,13 @@ class UsbAudioSink(
         presentationTimeUs: Long,
         encodedAccessUnitCount: Int
     ): Boolean {
+        if (config.bitPerfectEnabled && reclaimAfterIdleRelease && usbAudioStream == null) {
+            // Keep the DAC released while paused, and wait for an in-flight
+            // hand-back (USB reset) to finish before claiming it again.
+            if (!isPlaying || idleReleaseInFlight) return false
+            reclaimAfterIdleRelease = false
+            reclaimUsbStream()
+        }
         val stream = usbAudioStream
         if (config.bitPerfectEnabled && stream?.isAlive == true) {
             muteDelegateIfNeeded()
@@ -578,14 +595,19 @@ class UsbAudioSink(
     override fun flush() {
         super.flush()
         // Native engine handles its own flush/seek internally
-        // ExoPlayer pipeline: flush queue + native stream
-        usbStreamingThread?.flush()
-        // Never flush the native USB stream while the native engine is running:
-        // its decode thread writes into that stream concurrently (nativeFlush
-        // would race its residual/accumulator state), a seek is handled by the
-        // engine itself (engine.seek from handleBuffer), and during a gapless
-        // advance the stream must keep playing untouched.
-        if (nativeEngine?.isRunning != true) usbAudioStream?.flush()
+        // ExoPlayer pipeline: flush queue + native stream, serialized with the
+        // streaming thread's writes (nativeFlush and a concurrent write used to
+        // race on the stream's residual/accumulator state).
+        val streamingThread = usbStreamingThread
+        if (streamingThread != null) {
+            streamingThread.flushStream()
+        } else if (nativeEngine?.isRunning != true) {
+            // Never flush the native USB stream while the native engine is running:
+            // its decode thread writes into that stream concurrently, a seek is
+            // handled by the engine itself (engine.seek from handleBuffer), and
+            // during a gapless advance the stream must keep playing untouched.
+            usbAudioStream?.flush()
+        }
         usbStartMediaTimeNeedsInit = true
         handledEndOfStream = false
         // Temporarily unblock LoadControl so ExoPlayer loads at least one chunk
@@ -751,6 +773,27 @@ class UsbAudioSink(
                 "bits=$bitDepth device=${deviceInfo.deviceName}")
     }
 
+    /** Playback thread. Re-opens the USB stream for the current format after an
+     *  idle release (see [reclaimAfterIdleRelease]). */
+    private fun reclaimUsbStream() {
+        val sr = currentSampleRate
+        val ch = currentChannelCount
+        if (sr <= 0 || ch <= 0) return
+        val device = usbAudioDevice.findUsbAudioDevice() ?: return
+        if (!usbAudioDevice.hasPermission(device)) return
+        configureUsbBitPerfect(sr, ch, currentEncoding)
+        val alive = usbAudioStream?.isAlive == true
+        onDriverOwnsUsbDeviceChanged?.invoke(alive)
+        if (alive) {
+            // Anchor the position to the next buffer; windowOffsetUs (the item's
+            // start) is unchanged, so a new native engine seeks to the right spot.
+            usbStartMediaTimeNeedsInit = true
+            if (config.forceRouteToSpeaker) forceMediaToSpeaker()
+            muteDelegateIfNeeded()
+            Log.i(TAG, "USB driver re-claimed the DAC after an idle release (rate=$sr ch=$ch)")
+        }
+    }
+
     /** Try to start a native FLAC engine. Falls back to ExoPlayer streaming thread. */
     @Synchronized
     private fun startNativeEngineIfFlac(stream: UsbAudioStream) {
@@ -769,6 +812,10 @@ class UsbAudioSink(
                 )
                 val created = engine.createFromFd(fd.fd, stream.nativeHandle)
                 fd.close()
+                // Pause BEFORE starting: the decode thread must not push the
+                // file's first frames to the DAC before the first seek (on a
+                // resume at 2:38 that was an audible blip of the track start).
+                if (created) engine.pause()
                 if (created && engine.start()) {
                     // Verify FLAC sample rate matches USB stream — prevents distortion
                     // when ExoPlayer's queue and onMediaItemTransition disagree about
@@ -779,9 +826,8 @@ class UsbAudioSink(
                         engine.stop()
                         engine.destroy()
                     } else {
-                        // Start paused — will resume in handleBuffer after capturing
+                        // Started paused — resumes in handleBuffer after capturing
                         // the correct seek position from ExoPlayer's presentationTimeUs.
-                        engine.pause()
                         nativeEngine = engine
                         isNativeEngineActive = true
                         engineNeedsInitialSeek = true
@@ -836,6 +882,9 @@ class UsbAudioSink(
             }
             idleReleaseInFlight = true
         }
+        // Re-claim on the next buffer after play() if the player keeps this
+        // configuration (a stop()/new item goes through configure() instead).
+        if (usbAudioStream != null && currentSampleRate > 0) reclaimAfterIdleRelease = true
         val th = Thread({
             try {
                 releaseUsbStream()

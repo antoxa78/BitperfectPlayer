@@ -4,7 +4,6 @@ import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
-import androidx.media3.common.ParserException
 import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.extractor.Extractor
@@ -14,6 +13,7 @@ import androidx.media3.extractor.PositionHolder
 import androidx.media3.extractor.SeekMap
 import androidx.media3.extractor.SeekPoint
 import androidx.media3.extractor.TrackOutput
+import java.io.IOException
 
 /**
  * Extracts raw float PCM for one SACD track of an ISO (played over SMB or locally).
@@ -21,7 +21,12 @@ import androidx.media3.extractor.TrackOutput
  * The native decoder reads the ISO through [reader] via JNI callbacks. Samples are
  * produced as interleaved little-endian float32 (C.ENCODING_PCM_FLOAT), which the
  * app's [BitPerfectAudioSink] passes through to AudioTrack. [seek] maps ExoPlayer
- * time to an absolute PCM frame so scrubbing is exact.
+ * time to an absolute PCM frame so scrubbing is exact; the native reader jumps
+ * straight to the sector holding it.
+ *
+ * Read and seek failures are raised as [IOException]s (not ParserException,
+ * which media3 never retries): a transient SMB error is retried by the loader
+ * and the native reader re-reads the same sectors.
  */
 @OptIn(UnstableApi::class)
 class SacdMediaExtractor(
@@ -45,6 +50,11 @@ class SacdMediaExtractor(
     private var seekMapQueued = false
     private var endOfStream = false
     private var lastReadFrame = 0L
+    /** Seek not yet applied to the native reader (requested before it was open,
+     *  or a native seek that failed and must be retried): target time, or -1. */
+    private var pendingSeekTimeUs = -1L
+    /** Reused for every read (the native side copies into it). */
+    private var readBuf = ByteArray(0)
     @Volatile private var released = false
     @Volatile private var lastReadBytes = 0
 
@@ -55,19 +65,33 @@ class SacdMediaExtractor(
     }
 
     override fun seek(position: Long, timeUs: Long) {
-        if (!seekMapQueued || handle == 0L) return
-        val frame = (timeUs * sampleRate / 1_000_000L).coerceAtLeast(0L)
+        // Always remembered and applied from read(): the loader calls seek()
+        // right after init() on a fresh load, before the native reader is
+        // open, and a seek that fails on I/O must be retried, which only
+        // read() can signal (by throwing).
+        pendingSeekTimeUs = timeUs.coerceAtLeast(0L)
+        endOfStream = false
+    }
+
+    /** Applies [pendingSeekTimeUs] to the open native reader. */
+    private fun applyPendingSeek() {
+        val timeUs = pendingSeekTimeUs
+        if (timeUs < 0 || handle == 0L) return
+        val frame = (timeUs * sampleRate / 1_000_000L).coerceIn(0L, maxOf(0L, totalFrames))
         if (frame != lastReadFrame) {
             val ok = try {
                 SacdBridge.nativeSacdSeek(handle, frame) == 0
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "nativeSacdSeek threw", e)
                 false
             }
-            // Only advance the timestamp counter when the native seek succeeded;
-            // otherwise the decoder keeps its position but samples would be
-            // mislabelled with the target time.
-            if (ok) lastReadFrame = frame
+            // Keep the request pending and let media3 retry the load: the
+            // decoder's position is unknown now, so samples must not be
+            // labelled with the target time.
+            if (!ok) throw IOException("SACD seek to frame $frame failed (source not readable)")
+            lastReadFrame = frame
         }
+        pendingSeekTimeUs = -1L
     }
 
     override fun read(input: ExtractorInput, positionHolder: PositionHolder): Int {
@@ -83,9 +107,10 @@ class SacdMediaExtractor(
                 0L
             }
             if (handle == 0L) {
-                throw ParserException.createForUnsupportedContainerFeature(
-                    "SACD decode failed while opening the ISO"
-                )
+                // Can be a transient SMB failure as well as a bad image: an
+                // IOException is retried by media3 (a few times) before it
+                // surfaces as a playback error.
+                throw IOException("SACD decode failed while opening the ISO")
             }
             sampleRate = SacdBridge.nativeSacdOutRate(handle).takeIf { it > 0 } ?: outHz
             channelCount = SacdBridge.nativeSacdChannels(handle).takeIf { it > 0 } ?: 2
@@ -134,27 +159,28 @@ class SacdMediaExtractor(
             seekMapQueued = true
         }
 
+        applyPendingSeek()
         if (endOfStream) return Extractor.RESULT_END_OF_INPUT
 
         // interleaved float32 (PCM) or packed 24-bit (DoP), per channel sample
         val frameSize = channelCount * (if (dop) 3 else 4)
-        val maxFrames = READ_BYTES / frameSize
-        val data = try {
-            if (dop) SacdBridge.nativeSacdReadDop24(handle, maxFrames)
-            else SacdBridge.nativeSacdReadFloat(handle, maxFrames)
+        val bufBytes = (READ_BYTES / frameSize) * frameSize
+        if (readBuf.size != bufBytes) readBuf = ByteArray(bufBytes)
+        val frames = try {
+            if (dop) SacdBridge.nativeSacdReadDop24Into(handle, readBuf)
+            else SacdBridge.nativeSacdReadFloatInto(handle, readBuf)
         } catch (e: Exception) {
             android.util.Log.w(TAG, "SACD read threw", e)
-            null
+            -1
         }
-        if (data == null) {
-            // A decode failure (e.g. a transient SMB error) must NOT be treated as
+        if (frames < 0) {
+            // A read failure (e.g. a transient SMB error) must NOT be treated as
             // end-of-stream — that would truncate the track and skip to the next
-            // item. Surface it as a load error so media3's retry policy recovers.
-            throw ParserException.createForUnsupportedContainerFeature(
-                "SACD decode failed while reading the ISO"
-            )
+            // item. An IOException is retried by media3's load error policy, and
+            // the native reader retries the same sectors on the next read.
+            throw IOException("SACD decode failed while reading the ISO")
         }
-        if (data.isEmpty()) {
+        if (frames == 0) {
             endOfStream = true
             trackOutput?.sampleMetadata(
                 totalFrames * 1_000_000L / sampleRate,
@@ -166,15 +192,15 @@ class SacdMediaExtractor(
             return Extractor.RESULT_END_OF_INPUT
         }
 
-        val frames = data.size / frameSize
+        val size = frames * frameSize
         val timeUs = lastReadFrame * 1_000_000L / sampleRate
-        trackOutput?.sampleData(ParsableByteArray(data), data.size)
+        trackOutput?.sampleData(ParsableByteArray(readBuf, size), size)
         // PCM is all-sync-sample: SampleQueue starts with upstreamKeyframeRequired=true and
         // silently drops any sample without the KEY_FRAME flag (never clearing the requirement),
         // so every sample must be flagged as a keyframe or nothing ever reaches the renderer.
-        trackOutput?.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, data.size, 0, null)
+        trackOutput?.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, size, 0, null)
         lastReadFrame += frames
-        lastReadBytes = data.size
+        lastReadBytes = size
         return Extractor.RESULT_CONTINUE
     }
 

@@ -62,15 +62,17 @@ public final class SacdProgressiveMediaExtractor implements ProgressiveMediaExtr
             ExtractorOutput output) {
         input = new DefaultExtractorInput(dataReader, position, length);
         inputPosition = position;
-        // init() runs again whenever the loader restarts (seek that missed the
-        // buffer, period reset): the previous extractor's native decoder context
-        // would otherwise leak.
-        if (extractor != null) {
-            extractor.release();
+        // init() runs at the start of EVERY load — also after a seek that
+        // missed the buffer and on a load retry — and media3 calls seek()
+        // right after it. The extractor (and its open native reader) must be
+        // kept, like BundledExtractorsAdapter does: re-creating it here made
+        // every seek hit a fresh, unopened extractor, so the seek was dropped
+        // and the track was decoded again from its start up to the target.
+        if (extractor == null) {
+            SacdMediaExtractor e = new SacdMediaExtractor(reader, area, track, outHz, dop);
+            e.init(output);
+            extractor = e;
         }
-        SacdMediaExtractor e = new SacdMediaExtractor(reader, area, track, outHz, dop);
-        e.init(output);
-        extractor = e;
     }
 
     @Override
@@ -104,7 +106,7 @@ public final class SacdProgressiveMediaExtractor implements ProgressiveMediaExtr
     }
 
     @Override
-    public int read(PositionHolder positionHolder) {
+    public int read(PositionHolder positionHolder) throws IOException {
         if (extractor == null) {
             return Extractor.RESULT_END_OF_INPUT;
         }

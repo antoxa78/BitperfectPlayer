@@ -9,7 +9,7 @@
 
 #include "dsd.h"
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -45,7 +45,7 @@ int dsd_conv_default_out_hz(int dsd_rate_hz)
     return 0;
 }
 
-static void design_lowpass(float *coeff, int taps, int taps_vec, double fc, double fs)
+static int design_lowpass(float *coeff, int taps, int taps_vec, double fc, double fs)
 {
     /* Blackman-Harris windowed sinc, unity DC gain. */
     const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
@@ -53,6 +53,7 @@ static void design_lowpass(float *coeff, int taps, int taps_vec, double fc, doub
     const double wc = 2.0 * fc / fs; /* normalized cut-off (cycles/sample * 2) */
     double sum = 0.0;
     double *h = (double *)malloc(sizeof(double) * (size_t)taps);
+    if (!h) return -1;
     for (int i = 0; i < taps; i++) {
         double x = i - m;
         double sinc = (x == 0.0) ? 1.0 : sin(M_PI * wc * x) / (M_PI * wc * x);
@@ -65,6 +66,7 @@ static void design_lowpass(float *coeff, int taps, int taps_vec, double fc, doub
     for (int i = 0; i < taps; i++) coeff[i] = (float)(h[i] / sum);
     for (int i = taps; i < taps_vec; i++) coeff[i] = 0.0f;
     free(h);
+    return 0;
 }
 
 static inline float fir_dot(const float *coeff, const float *win, int n_vec)
@@ -79,6 +81,20 @@ static inline float fir_dot(const float *coeff, const float *win, int n_vec)
     for (; i < n_vec; i += 4)
         acc0 = vfmaq_f32(acc0, vld1q_f32(coeff + i), vld1q_f32(win + i));
     return vaddvq_f32(vaddq_f32(acc0, acc1));
+#elif defined(__ARM_NEON)
+    /* armeabi-v7a: ARMv7 NEON (multiply-accumulate, no vaddvq / FMA). */
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 8 <= n_vec; i += 8) {
+        acc0 = vmlaq_f32(acc0, vld1q_f32(coeff + i), vld1q_f32(win + i));
+        acc1 = vmlaq_f32(acc1, vld1q_f32(coeff + i + 4), vld1q_f32(win + i + 4));
+    }
+    for (; i < n_vec; i += 4)
+        acc0 = vmlaq_f32(acc0, vld1q_f32(coeff + i), vld1q_f32(win + i));
+    float32x4_t acc = vaddq_f32(acc0, acc1);
+    float32x2_t s = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+    s = vpadd_f32(s, s);
+    return vget_lane_f32(s, 0);
 #else
     float r = 0.0f;
     for (int i = 0; i < n_vec; i++) r += coeff[i] * win[i];
@@ -108,7 +124,11 @@ dsd_conv_t *dsd_conv_create(int channels, int dsd_rate_hz, int out_hz)
     c->taps_vec = (c->taps + 3) & ~3;
     c->coeff = (float *)calloc((size_t)c->taps_vec, sizeof(float));
     if (!c->coeff) { free(c); return NULL; }
-    design_lowpass(c->coeff, c->taps, c->taps_vec, 0.4422 * out_hz, (double)native);
+    if (design_lowpass(c->coeff, c->taps, c->taps_vec, 0.4422 * out_hz, (double)native) != 0) {
+        free(c->coeff);
+        free(c);
+        return NULL;
+    }
 
     ff_init_dsd_data();
     dsd_conv_reset(c);

@@ -144,6 +144,8 @@ class PlaybackService : MediaSessionService() {
         private const val LAN_FG_WATCHDOG_MS   = 60_000L
 
         private const val TAG_BITPERFECT       = "BitPerfectAudio"
+        /** A second DoP failure within this window falls back to PCM. */
+        private const val DOP_RETRY_WINDOW_MS  = 30_000L
 
         // ── DSD output (Settings → DSD Output) ────────────────────────────────
         /** "pcm" (default): SACD/DSF/DFF are converted to PCM in the app — works
@@ -173,11 +175,25 @@ class PlaybackService : MediaSessionService() {
 
         /** True when DSD sources should be emitted as DoP right now: selected,
          *  USB-driver mode, and a USB DAC actually attached (without one the
-         *  sink falls back to system audio, where DoP would play as noise). */
+         *  sink falls back to system audio, where DoP would play as noise).
+         *  Also false after a DoP stream could not be delivered bit-exactly
+         *  (see [recoverFromDopError]) until the DAC is re-attached or the DSD
+         *  setting is changed. */
         fun isDopOutputActive(context: Context): Boolean =
-            isDopSelected(context) &&
+            !dopSuppressed &&
+                isDopSelected(context) &&
                 effectiveAudioOutputMode(context) == AUDIO_OUTPUT_USBDEVFS &&
                 findUsbAudioDevice(context) != null
+
+        /** Set when the USB driver refused / lost a DoP stream: DSD is converted
+         *  to PCM instead, so the track keeps playing (instead of failing, or
+         *  reaching a speaker as noise). */
+        @Volatile private var dopSuppressed = false
+
+        /** Allow DoP again (DAC re-attached, or the DSD Output setting changed). */
+        fun clearDopSuppression() {
+            dopSuppressed = false
+        }
 
         // ── Keep-awake state for the UI ───────────────────────────────────────
         // True while playback is active (same condition as the playback wake
@@ -476,6 +492,8 @@ class PlaybackService : MediaSessionService() {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     Log.i(TAG, "USB device attached — will check for DAC in ${USB_SETTLE_MS}ms")
+                    // A (re)attached DAC gets a fresh chance at DoP.
+                    clearDopSuppression()
                     // No attach-time claim: the usbdevfs driver must only take the
                     // DAC while actively streaming. Claiming at attach steals the
                     // device from the system audio HAL and silent-blocks every
@@ -673,21 +691,48 @@ class PlaybackService : MediaSessionService() {
      * the new mode (queue/position/play-state restored) rather than merely restarted.
      */
     fun applyOutputModeAudioReset() {
-        val sink = usbAudioSink
-        if (sink == null) {
-            usbAudioSink = null
-            rebuildPlayerForOutputMode()
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { applyOutputModeAudioReset() }
             return
         }
+        val old = mediaSession?.player as? ExoPlayer
+        // Snapshot queue/position/play-intent BEFORE stopping the old player:
+        // after stop() the timeline can turn into a placeholder whose duration is
+        // TIME_UNSET, which rebuildPlayerForOutputMode would read as a live stream
+        // and restore at position 0.
+        val snapshot = old?.let { snapshotPlayerState(it) }
+
+        val sink = usbAudioSink
+        // Ownership and the in-flight flag must be read before stop(): stop()
+        // fires STATE_IDLE, whose listener already calls releaseUsbDriverDac(),
+        // so afterwards usbDriverOwnsDac is already false even though the
+        // USBDEVFS_RESET hand-back is still running (same race as
+        // prepareForProcessExit). Missing it meant the new system AudioTrack was
+        // opened into a DAC that was still claimed / half re-enumerated → silence.
+        val wasOwned = sink != null && usbDriverOwnsDac
+        val releaseInFlight = sink?.isIdleReleaseInFlight() == true
         // Snapshot the system sound cards before the soft-replug so we can watch
         // the USB card unbind/rebind (below) while the reset re-enumerates the DAC.
         val cardsBefore = sndCards()
-        if (!releaseUsbDriverDac()) {
+
+        // Stop the old player first (as prepareForProcessExit and resetAudioSink
+        // do). Previously it kept playing through the whole hand-back wait (up to
+        // USB_REBIND_MAX_WAIT_MS + settle): its UsbAudioSink could re-claim the
+        // DAC on the next buffer, or its BitPerfectAudioSink delegate — no longer
+        // blocked once driver ownership flipped to false — could open a direct
+        // track / set BIT_PERFECT mixer attributes on the DAC. Either way the
+        // rebuilt player's AudioTrack in "Bit-perfect via Android" or "Standard
+        // Android Output" mode ended up silent.
+        runCatching { old?.stop() }
+        bitPerfectManager.clear()
+        releaseUsbDriverDac()
+
+        if (sink == null || (!wasOwned && !releaseInFlight)) {
             // The driver did not own the DAC — no USB reset was triggered, so there
             // is no re-enumeration to wait out. Rebuild immediately instead of
             // waiting for a card change that will never happen (BUG-21).
-            usbAudioSink = null
-            rebuildPlayerForOutputMode()
+            if (usbAudioSink === sink) usbAudioSink = null
+            rebuildPlayerForOutputMode(snapshot)
             return
         }
         val main = mainHandler
@@ -695,13 +740,36 @@ class PlaybackService : MediaSessionService() {
             if (!waitForUsbRebind(sink, cardsBefore)) {
                 Log.w(TAG, "USB sound card did not re-register after soft-replug — " +
                     "system-audio modes may stay silent until the DAC is physically replugged")
+            } else {
+                // The card is back, but the audio HAL/policy reports it before it
+                // is actually stable; rebuilding immediately can open a fresh
+                // system AudioTrack on a half-ready device and be silent. Give it
+                // the same settle the USB attach / exit paths use.
+                sleepQuietly(USB_SETTLE_MS)
             }
             main.post {
                 if (usbAudioSink === sink) usbAudioSink = null
-                rebuildPlayerForOutputMode()
+                rebuildPlayerForOutputMode(snapshot)
             }
         }, "usbModeSwitch").start()
     }
+
+    /** Queue, position and play-intent of a player, captured for a rebuild. */
+    private class PlayerStateSnapshot(
+        val items: List<MediaItem>,
+        val index: Int,
+        val position: Long,
+        val playWhenReady: Boolean
+    )
+
+    private fun snapshotPlayerState(p: ExoPlayer) = PlayerStateSnapshot(
+        items = (0 until p.mediaItemCount).map { p.getMediaItemAt(it) },
+        index = p.currentMediaItemIndex,
+        // Live streams (duration == TIME_UNSET) report an unbounded position;
+        // restoring it would seek past the end of a seekable station (BUG-19).
+        position = if (p.duration == C.TIME_UNSET) 0L else p.currentPosition,
+        playWhenReady = p.playWhenReady
+    )
 
     /**
      * Rebuilds ExoPlayer so the new audio-output mode's sink is really in use.
@@ -712,19 +780,22 @@ class PlaybackService : MediaSessionService() {
      * and the queue, position and play-intent are restored on the new player.
      * Must be called on the main thread.
      */
-    private fun rebuildPlayerForOutputMode() {
+    private fun rebuildPlayerForOutputMode(snapshot: PlayerStateSnapshot?) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            mainHandler.post { rebuildPlayerForOutputMode() }
+            mainHandler.post { rebuildPlayerForOutputMode(snapshot) }
             return
         }
         val session = mediaSession ?: return
         val old = session.player as? ExoPlayer ?: return
-        val items = (0 until old.mediaItemCount).map { old.getMediaItemAt(it) }
-        val index = old.currentMediaItemIndex
+        // Prefer the snapshot captured before the old player was stopped (stop()
+        // can turn the timeline into a live-stream placeholder and reset the play
+        // intent); fall back to the live player state when no snapshot was taken.
+        val items = snapshot?.items ?: (0 until old.mediaItemCount).map { old.getMediaItemAt(it) }
+        val index = snapshot?.index ?: old.currentMediaItemIndex
         // Live streams (duration == TIME_UNSET) report an unbounded position;
         // restoring it would seek past the end of a seekable station (BUG-19).
-        val position = if (old.duration == C.TIME_UNSET) 0L else old.currentPosition
-        val playWhenReady = old.playWhenReady
+        val position = snapshot?.position ?: if (old.duration == C.TIME_UNSET) 0L else old.currentPosition
+        val playWhenReady = snapshot?.playWhenReady ?: old.playWhenReady
         val mode = getAudioOutputMode()
         Log.i(TAG, "Rebuilding player for audio output mode $mode " +
             "[items=${items.size} idx=$index pos=$position playWhenReady=$playWhenReady]")
@@ -1075,7 +1146,7 @@ class PlaybackService : MediaSessionService() {
             try { mgr.cancel(MEDIA3_NOTIF_ID) } catch (_: Exception) {}
             val port = prefs.getInt("mpd_port", 6600).coerceIn(1024, 65535)
             val n = NotificationCompat.Builder(this, CHANNEL_LAN_CONTROL)
-                .setSmallIcon(R.drawable.ic_network)
+                .setSmallIcon(R.drawable.ic_lan_control)
                 .setContentTitle("LAN control active")
                 .setContentText("MPD :$port — control from phone app")
                 .setOngoing(true)
@@ -1630,6 +1701,40 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /** When the last DoP recovery was attempted (see [recoverFromDopError]). */
+    private var lastDopRecoveryMs = 0L
+
+    /**
+     * A DoP stream was refused (the USB driver could not open the DAC at
+     * dsd_rate/16) or lost (the driver let go of the DAC mid-stream): the
+     * sinks never let DoP reach a mixer or speaker, they fail instead. Retry
+     * the same item at the same position: once as DoP (the driver re-claims
+     * the DAC), and as PCM if it fails again soon or was refused outright.
+     */
+    private fun recoverFromDopError(error: androidx.media3.common.PlaybackException, player: Player): Boolean {
+        val exo = error as? androidx.media3.exoplayer.ExoPlaybackException ?: return false
+        if (exo.type != androidx.media3.exoplayer.ExoPlaybackException.TYPE_RENDERER) return false
+        if (exo.rendererFormat?.label?.contains("DoP") != true) return false
+        val now = SystemClock.elapsedRealtime()
+        val refused = exo.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED
+        if (refused || now - lastDopRecoveryMs < DOP_RETRY_WINDOW_MS) {
+            dopSuppressed = true
+            Log.w(TAG, "DoP could not be delivered bit-exactly — continuing this track as PCM")
+        } else {
+            Log.w(TAG, "DoP stream interrupted — re-preparing")
+        }
+        lastDopRecoveryMs = now
+        // Re-preparing creates the media periods again, so the DoP/PCM choice
+        // (SacdMediaSourceFactory.dopActive) is re-evaluated.
+        mainHandler.post {
+            if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+                player.prepare()
+                player.play()
+            }
+        }
+        return true
+    }
+
     private val playerListener = object : Player.Listener {
         private var retryCount = 0
 
@@ -1651,6 +1756,7 @@ class PlaybackService : MediaSessionService() {
             // mixer attributes active while reconnecting or moving to another item.
             bitPerfectManager.clear()
             val player = mediaSession?.player ?: return
+            if (recoverFromDopError(error, player)) return
             val autoReconnect = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
                 .getBoolean(KEY_AUTO_RECONNECT, true)
             val isStream = player.currentMediaItem?.mediaId

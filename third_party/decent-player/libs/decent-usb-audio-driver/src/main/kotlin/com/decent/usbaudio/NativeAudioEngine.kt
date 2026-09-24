@@ -23,13 +23,22 @@ import android.util.Log
  */
 class NativeAudioEngine {
 
+    /**
+     * Native engine pointer. Every entry point is @Synchronized with [destroy]:
+     * the engine is driven from ExoPlayer's playback thread (seek, position),
+     * the main thread (gapless queue, cleanup on item transitions) and the USB
+     * release thread (stop/destroy). Unsynchronized, a position read or a
+     * setNextFd racing destroy() dereferenced freed native memory.
+     */
+    @Volatile
     private var handle: Long = 0L
 
     /** True when the engine has been created and not yet destroyed. */
     val isCreated: Boolean get() = handle != 0L
 
     /** True when the decode thread is actively running. */
-    val isRunning: Boolean get() = handle != 0L && nativeIsRunning(handle)
+    val isRunning: Boolean
+        @Synchronized get() = handle != 0L && nativeIsRunning(handle)
 
     /**
      * Create the engine from a file descriptor pointing to a FLAC file.
@@ -38,6 +47,7 @@ class NativeAudioEngine {
      * @param usbHandle   Native handle from [UsbAudioStream] (the USB output context).
      * @return true if creation succeeded (FLAC metadata parsed, buffers allocated).
      */
+    @Synchronized
     fun createFromFd(flacFd: Int, usbHandle: Long): Boolean {
         if (handle != 0L) {
             Log.w(TAG, "Engine already created, destroying first")
@@ -52,18 +62,23 @@ class NativeAudioEngine {
         return true
     }
 
-    /** Start the decode thread. Audio flows immediately to USB. */
+    /** Start the decode thread. Audio flows to USB unless [pause] was called
+     *  first — the paused state is kept, so a fresh engine can be started
+     *  silently and resumed after the first seek. */
+    @Synchronized
     fun start(): Boolean {
         if (handle == 0L) return false
         return nativeStart(handle)
     }
 
     /** Pause the decode loop (thread stays alive, USB pipeline drains). */
+    @Synchronized
     fun pause() {
         if (handle != 0L) nativePause(handle)
     }
 
     /** Resume the decode loop after pause. */
+    @Synchronized
     fun resume() {
         if (handle != 0L) nativeResume(handle)
     }
@@ -75,6 +90,7 @@ class NativeAudioEngine {
      * @param positionUs Target position in microseconds.
      * @return true if seek was accepted (async — actual seek happens in decode thread).
      */
+    @Synchronized
     fun seek(positionUs: Long): Boolean {
         if (handle == 0L) return false
         return nativeSeek(handle, positionUs)
@@ -96,18 +112,22 @@ class NativeAudioEngine {
     }
 
     /** Current playback position in microseconds (from decoded frames). */
+    @Synchronized
     fun getPositionUs(): Long =
         if (handle != 0L) nativeGetPositionUs(handle) else 0L
 
     /** FLAC file sample rate (e.g., 96000). */
+    @Synchronized
     fun getSampleRate(): Int =
         if (handle != 0L) nativeGetSampleRate(handle) else 0
 
     /** FLAC file channel count (e.g., 2). */
+    @Synchronized
     fun getChannels(): Int =
         if (handle != 0L) nativeGetChannels(handle) else 0
 
     /** FLAC file bits per sample (e.g., 24). Updates after a gapless switch. */
+    @Synchronized
     fun getBitsPerSample(): Int =
         if (handle != 0L) nativeGetBitsPerSample(handle) else 0
 
@@ -122,16 +142,19 @@ class NativeAudioEngine {
      * engine ends normally and the player reconfigures as before.
      * Replaces any previously queued track.
      */
+    @Synchronized
     fun setNextFd(fd: Int): Boolean =
         handle != 0L && nativeSetNextFd(handle, fd)
 
     /** Drop the queued next track (e.g. the play queue changed). */
+    @Synchronized
     fun clearNext() {
         if (handle != 0L) nativeClearNext(handle)
     }
 
     /** Number of gapless file switches performed so far (monotonic). After a
      *  switch, [getPositionUs] counts from the start of the new file. */
+    @Synchronized
     fun getTrackSwitchCount(): Int =
         if (handle != 0L) nativeGetTrackSwitchCount(handle) else 0
 

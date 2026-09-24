@@ -1,5 +1,38 @@
 # Changelog
 
+## 3.1.0-beta4 - 2026-09-24
+
+### Fixed
+
+- **No sound after switching Settings → Audio Output to "Bit-perfect via Android" or "Standard Android Output":** switching out of "Bit-perfect (USB driver)" while playing left the new system `AudioTrack` opening into a DAC that was still claimed. Two causes are fixed:
+  - The old player kept playing through the whole hand-back wait; its `UsbAudioSink` could re-claim the DAC on the next buffer (after an idle release), or its `BitPerfectAudioSink` delegate — no longer blocked once driver ownership flipped to false — could open its own direct track / set `BIT_PERFECT` mixer attributes. The switch now stops the old player *first*, snapshots the queue/position/play-intent beforehand, and reads ownership *before* `stop()` so the soft-replug is always waited out. The rebuilt player resumes from the snapshot instead of from a post-stop timeline placeholder.
+  - On SoCs where the `USBDEVFS_RESET` soft-replug re-enumerates the device but never re-binds the kernel `snd-usb-audio` driver, the system modes stayed silent until a physical replug. The sysfs unbind/bind fallback (`forceKernelRebind`, needs root; best-effort via `su`) is wired back into `resetUsbDevice()`, and the switch waits a settle beat after the rebind before rebuilding (matching the exit path).
+
+- **Seeking a SACD ISO re-decoded the track from the start:** `SacdProgressiveMediaExtractor.init()` re-created the extractor on every load (seek that missed the buffer, period reset, retry), so each seek hit a fresh, unopened native reader and the seek was dropped. The extractor is now kept across loads, like `BundledExtractorsAdapter`, and seeks apply to the already-open reader.
+
+- **Transient SMB read errors truncated SACD/DSD tracks:** read/decode failures were raised as `ParserException`, which media3 never retries, so a dropped TCP session skipped the rest of the track. They are now `IOException`s, which media3's load-error policy retries; the native reader re-reads the same sectors, a failed native seek is re-applied from the next read, and the SMB file handle is reopened once on a dropped connection.
+
+- **content:// DSF/DFF files without a file name in the URI were not detected:** the extension check missed MediaStore ids and some document providers, sending DSD files to the default extractors. The provider's `DISPLAY_NAME` is now consulted for `content://` URIs.
+
+- **Native FLAC engine races (USB driver mode):** the pending-seek target and flag pair could drop a seek requested while another was being carried, and the target was read/written unsynchronized; it is now a single atomic exchanged value. `NativeAudioEngine` is `@Synchronized`, so position reads or `setNextFd` racing `destroy()` can no longer dereference freed native memory. A fresh engine is started silently and resumed after the first seek, removing an audible blip at the start of a track on resume.
+
+- **24-bit-in-32-bit USB DACs received the wrong container size:** the alt-setting parser reported the declared *resolution* instead of the *container* size (`bSubslotSize`), so a DAC expecting 32-bit containers was fed 3-byte samples (noise). It now derives the container width from `bSubslotSize`.
+
+- **USB feedback misparsed for non-Q16.16 formats:** some DACs report feedback in another scale (10.14 in 3 bytes, or per-ms frames); the raw value was always divided by 65536. The power-of-two scale is now detected once from the first plausible reading, like Linux `snd-usb-audio`.
+
+- **Audio thread busy-polling / per-URB allocations:** the USB reap loop polled every 125 µs (~8000 wake-ups/s at nice -19); it now sleeps in `poll()` until a URB completes. The residual-merge buffer is reused instead of `malloc`/`free` per submit, and `AsyncBufferedDataSource`'s I/O thread sleeps on a condition variable instead of waking every 5 ms when the buffer is full or at EOF.
+
+- **DoP stream failure left DSD silent or reaching a speaker as noise:** a DoP stream the USB driver cannot open at `dsd_rate/16` (or that it drops mid-stream) now falls back to PCM for that track instead of failing outright, and re-evaluates on the next track. A new DAC or a changed DSD Output setting clears the fallback.
+
+### Changed
+
+- **Menu/icon refresh:** new vector icons for every settings card and dialog option (including DSD, LAN control, network buffer, screensaver, scan), a new launcher icon and banner, and a smaller `app_banner.png`.
+- **DSD Output label:** "Convert to PCM" now reads "176.4 / 192 kHz" to reflect the output rate family.
+
+### Removed
+
+- **Settings → Stay Awake While Playing:** the keep-awake behaviour itself is unchanged (still handled automatically during playback), but the explanatory settings card was removed.
+
 ## 3.1.0-beta3 - 2026-09-23
 
 ### Fixed

@@ -2,6 +2,7 @@ package com.example.bitperfectplayer
 
 import android.content.Context
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -62,10 +63,33 @@ class SacdMediaSourceFactory(
 
         val dsf = dataSourceFactory
         val uri = mediaItem.localConfiguration?.uri?.toString() ?: mediaItem.mediaId
-        if (dsf != null && DsdFileExtractor.isDsdFileUri(uri)) {
+        if (dsf != null && (DsdFileExtractor.isDsdFileUri(uri) || isDsdContentUri(uri))) {
             return createDsdFileSource(mediaItem, dsf)
         }
         return delegate.createMediaSource(mediaItem)
+    }
+
+    /**
+     * content:// URIs often carry no file name (MediaStore ids, some document
+     * providers), so the extension check alone would send a DSF/DFF to the
+     * default extractors, which cannot play it: ask the provider for the
+     * display name instead.
+     */
+    private fun isDsdContentUri(uri: String): Boolean {
+        val ctx = context ?: return false
+        if (!uri.startsWith("content://")) return false
+        return try {
+            ctx.contentResolver.query(
+                Uri.parse(uri), arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val name = c.getString(0) ?: return@use false
+                    DsdFileExtractor.isDsdFileUri(name)
+                } else false
+            } ?: false
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun dopActive(): Boolean = context?.let { PlaybackService.isDopOutputActive(it) } == true
@@ -92,8 +116,10 @@ class SacdMediaSourceFactory(
             )
         }
         val dataSourceFactory = DataSource.Factory { SacdPassthroughDataSource() }
-        return ProgressiveMediaSource.Factory(dataSourceFactory, progressiveExtractorFactory)
-            .createMediaSource(mediaItem)
+        val factory = ProgressiveMediaSource.Factory(dataSourceFactory, progressiveExtractorFactory)
+        // Same retry policy as every other source (SMB read errors are IOExceptions).
+        loadErrorHandlingPolicy?.let { factory.setLoadErrorHandlingPolicy(it) }
+        return factory.createMediaSource(mediaItem)
     }
 }
 
