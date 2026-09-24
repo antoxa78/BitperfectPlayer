@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.0-beta5 - 2026-09-24
+
+### Fixed
+
+- **No sound after switching to another app that plays audio:** on Android TV, media3's own foreground notification is dropped during buffer/end-of-stream transitions and on audio-focus loss, so the service ended up in the cached state and the system killed the process. If that kill landed while the usbdevfs driver still held the DAC (or before the async `USBDEVFS_RESET` hand-back finished), the DAC's kernel driver was left detached and nothing had sound until a physical replug. The service now keeps its own foreground notification whenever the USB driver owns the DAC or a hand-back is in flight, so the process can no longer be killed mid-stream/mid-reset.
+
 ## 3.1.0-beta4 - 2026-09-24
 
 ### Fixed
