@@ -1119,49 +1119,57 @@ class PlaybackService : MediaSessionService() {
         val player = mediaSession?.player
         val media3OwnsFg = player != null && player.playWhenReady &&
             (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_BUFFERING)
-
-        if (lanFgOwned) {
-            if (media3OwnsFg) {
-                // Media3 took over the foreground state — hand over silently.
-                lanFgOwned = false
-            } else if (!mpdEnabled) {
-                try { stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-                lanFgOwned = false
-                Log.i(TAG, "LAN keep-foreground released")
-            }
-        }
-        if (!mpdEnabled || media3OwnsFg || lanFgOwned) return
+        // Keep the process alive while the usbdevfs driver holds the DAC or is
+        // mid-hand-back. On Android TV Media3's own foreground notification can
+        // be dropped during buffer/ENDED transitions or on audio-focus loss, so
+        // this service ends up cached and the system kills it — if that happens
+        // while the DAC is claimed (or before the async USBDEVFS_RESET finishes),
+        // the DAC's kernel driver is left detached and nothing has sound until a
+        // physical replug. So when the DAC is held we own the foreground service
+        // ourselves, even while Media3 thinks it is playing.
+        val dacHeld = usbDevfsDriverEnabled() &&
+            (usbDriverOwnsDac || usbAudioSink?.isIdleReleaseInFlight() == true)
+        val lanKeep = mpdEnabled && !media3OwnsFg
+        val keepFg = lanKeep || dacHeld
 
         try {
-            val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            if (mgr.getNotificationChannel(CHANNEL_LAN_CONTROL) == null) {
-                mgr.createNotificationChannel(
-                    NotificationChannel(CHANNEL_LAN_CONTROL, "LAN control",
-                        NotificationManager.IMPORTANCE_MIN)
-                )
+            if (keepFg) {
+                val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                if (mgr.getNotificationChannel(CHANNEL_LAN_CONTROL) == null) {
+                    mgr.createNotificationChannel(
+                        NotificationChannel(CHANNEL_LAN_CONTROL, "LAN control",
+                            NotificationManager.IMPORTANCE_MIN)
+                    )
+                }
+                // While paused, Media3 keeps its (non-foreground) media notification
+                // with id 1001; remove it so we don't end up with two notifications
+                // alongside our keep-foreground one.
+                try { mgr.cancel(MEDIA3_NOTIF_ID) } catch (_: Exception) {}
+                val port = prefs.getInt("mpd_port", 6600).coerceIn(1024, 65535)
+                val n = NotificationCompat.Builder(this, CHANNEL_LAN_CONTROL)
+                    .setSmallIcon(R.drawable.ic_lan_control)
+                    .setContentTitle(if (lanKeep) "LAN control active" else "Bitperfect Player")
+                    .setContentText(if (lanKeep) "MPD :$port — control from phone app" else "USB DAC active")
+                    .setOngoing(true)
+                    .setShowWhen(false)
+                    .setPriority(NotificationCompat.PRIORITY_MIN)
+                    .build()
+                if (Build.VERSION.SDK_INT >= 29) {
+                    startForeground(LAN_FG_NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                } else {
+                    startForeground(LAN_FG_NOTIF_ID, n)
+                }
+                if (!lanFgOwned) {
+                    lanFgOwned = true
+                    Log.i(TAG, "Keep-foreground started (${if (lanKeep) "LAN" else "DAC held"})")
+                }
+            } else if (lanFgOwned) {
+                try { stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+                lanFgOwned = false
+                Log.i(TAG, "Keep-foreground released")
             }
-            // While paused, Media3 keeps its (non-foreground) media notification
-            // with id 1001; remove it so we don't end up with two notifications
-            // alongside our LAN keep-foreground one.
-            try { mgr.cancel(MEDIA3_NOTIF_ID) } catch (_: Exception) {}
-            val port = prefs.getInt("mpd_port", 6600).coerceIn(1024, 65535)
-            val n = NotificationCompat.Builder(this, CHANNEL_LAN_CONTROL)
-                .setSmallIcon(R.drawable.ic_lan_control)
-                .setContentTitle("LAN control active")
-                .setContentText("MPD :$port — control from phone app")
-                .setOngoing(true)
-                .setShowWhen(false)
-                .setPriority(NotificationCompat.PRIORITY_MIN)
-                .build()
-            if (Build.VERSION.SDK_INT >= 29) {
-                startForeground(LAN_FG_NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-            } else {
-                startForeground(LAN_FG_NOTIF_ID, n)
-            }
-            lanFgOwned = true
-            Log.i(TAG, "LAN keep-foreground started")
         } catch (e: Exception) {
-            Log.w(TAG, "LAN keep-foreground failed: ${e.message}")
+            Log.w(TAG, "Keep-foreground failed: ${e.message}")
         }
     }
 
