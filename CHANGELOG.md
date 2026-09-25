@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.0-beta6 - 2026-09-25
+
+### Fixed
+
+- **No sound in other apps after Bitperfect Player gives the USB DAC back (on Exit, on pause, or when another app takes audio focus):** in "Bit-perfect (USB driver)" the driver takes the DAC's USB audio interfaces with `force=true`, which detaches the kernel's `snd-usb-audio` — and every other app is silent for exactly as long as that claim lasts. Three separate holes let the claims outlive the moment they should have been dropped:
+  - The claims are taken in `configureUsbBitPerfect()`, which the deferred cross-rate reconfiguration calls directly on its own thread, bypassing `configure()`. The service only learned about them through a `configure()` callback, so after a sample-rate switch it believed the driver no longer held the DAC for the rest of the track: it kept no foreground service (so the system could kill the process mid-stream), and the pause/idle/Exit hand-backs all skipped. Ownership is now also read from the sink itself (`UsbAudioSink.ownsUsbDevice`), and the sink reports it from the one place the claims are taken.
+  - Another app taking *transient* audio focus leaves `playWhenReady` true, so `onPlayWhenReadyChanged` never fires and the driver kept its exclusive claims — the app that had just taken focus was silent. `onPlaybackSuppressionReasonChanged` now hands the DAC back (without stopping, so this player can regain focus and resume), and the sink re-claims the DAC on the next buffer.
+  - Exit killed the process while a hand-back was still running. Ownership is reported as gone at the very *start* of a hand-back, but the claims are only dropped at the end, so `System.exit(0)` took the release thread down with it, the claims were never dropped, and the DAC's kernel driver stayed detached until a physical replug. Exit now waits for an in-flight hand-back (bounded, so a stuck release cannot hang it) and leaves the rebind itself alone in that state. A sink torn down without a hand-back first (`release()`) no longer leaks the claims either.
+
+  The hand-back sequence itself is unchanged (release → `USBDEVFS_RESET` → close, plus the root-only sysfs unbind/bind fallback). On-device investigation showed the alternatives are not better: on a locked SHIELD TV (kernel 4.9) `USBDEVFS_CONNECT` returns `EBUSY` in either ordering, and releasing without the reset leaves the streaming interface deterministically unbound — no `pcmC0D0p`, so the audio HAL's `proxy_open()` fails and other apps are left on a stale route (bad enough to take `audioserver` down with it). The bus reset is the only rebind available without root and is kept.
+
+### Added
+
+- **Other-app audio routing in the debug log:** on the way out of a DAC hand-back, the debug log now records whether other apps can be expected to make sound on the returned DAC — Android TV's "USB Match content audio resolution" switch (`Settings.System usb_audio_mcar`, read only, never written) together with the DAC's advertised encodings. A DAC that advertises no 16-bit profile plus that switch on is the combination that makes 16-bit apps fail `createTrack()` with `-38`, so it is called out with the switch name and the fix. The exit-path log also carries the `USBDEVFS_CONNECT` errno, which is the actual reason a re-bind did or did not take.
+
 ## 3.1.0-beta5 - 2026-09-24
 
 ### Fixed
