@@ -787,12 +787,16 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbConnect(
     cmd.ioctl_code = USBDEVFS_CONNECT;
     int ret = ioctl(fd, USBDEVFS_IOCTL, &cmd);
     if (ret < 0) {
-        LOGI("USBDEVFS_CONNECT iface=%d errno=%d (%s) — kernel may have no default driver or already rebound",
+        // Return the POSIX errno (positive) so the Kotlin caller can log the real
+        // failure reason into its debug log instead of an unhelpful -1. EBUSY(16)
+        // here has been observed to mean the interface is no longer claimed by us
+        // (the caller already released it), so the connect has nothing to re-bind.
+        LOGW("USBDEVFS_CONNECT iface=%d errno=%d (%s) — kernel may have no default driver or already rebound",
              ifaceId, errno, strerror(errno));
-    } else {
-        LOGI("USBDEVFS_CONNECT iface=%d OK — kernel driver re-bound", ifaceId);
+        return errno;
     }
-    return ret;
+    LOGI("USBDEVFS_CONNECT iface=%d OK — kernel driver re-bound", ifaceId);
+    return 0;
 }
 
 } // extern "C" — pause for non-JNI functions used by native-audio-engine

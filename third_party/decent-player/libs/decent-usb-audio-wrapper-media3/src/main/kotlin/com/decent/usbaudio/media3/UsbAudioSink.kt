@@ -164,6 +164,20 @@ class UsbAudioSink(
      *  (USB reset + device close) before reopening the DAC through another path. */
     fun isIdleReleaseInFlight(): Boolean = idleReleaseInFlight
 
+    /**
+     * True while this driver's exclusive usbfs claims on the DAC are in place (the
+     * device is open and the kernel's snd-usb-audio is detached for as long as that
+     * is the case, which is what silences every other app).
+     *
+     * The authoritative counterpart to [onDriverOwnsUsbDeviceChanged]: the claims
+     * are taken in [configureUsbBitPerfect], which the deferred cross-rate
+     * reconfiguration calls straight from its own thread without passing through
+     * [configure] — so a callback-only "does the driver own the DAC" answer from the
+     * host can be false while the device is very much claimed.
+     */
+    val ownsUsbDevice: Boolean
+        get() = usbAudioStream != null || usbAudioDevice.isDeviceOpen
+
     // Cross-thread access (ExoPlayer renderer thread writes these in configure();
     // renderer + main threads read them in getCurrentPositionUs/play/pause).
     @Volatile private var currentEncoding: Int = C.ENCODING_PCM_16BIT
@@ -629,7 +643,20 @@ class UsbAudioSink(
     }
 
     override fun release() {
-        releaseUsbStream()
+        // A released sink never comes back, so — unlike the between-tracks path —
+        // the DAC has to be handed back completely: releaseUsbStream() on its own
+        // deliberately keeps the device open (and with it the force=true usbfs
+        // interface claims, which keep the kernel's snd-usb-audio detached and every
+        // other app silent). Anything that tears the sink down without asking for a
+        // hand-back first — a service teardown that skipped it, a player rebuild —
+        // used to leak those claims here. No claims, no USB reset: the caller
+        // already handed the DAC back and there is nothing left to return.
+        if (ownsUsbDevice) {
+            Log.i(TAG, "release() with the DAC still claimed — handing it back before the sink goes away")
+            releaseUsbForIdle()
+        } else {
+            releaseUsbStream()
+        }
         super.release()
     }
 
@@ -763,6 +790,14 @@ class UsbAudioSink(
         currentSampleRate = sampleRate
         currentChannelCount = channelCount
         muteDelegateIfNeeded()
+        // Ownership is reported from here — the one place the force=true usbfs
+        // claims are taken. configure() reports it too, but the deferred cross-rate
+        // reconfiguration calls this method directly on its own thread, and without
+        // this the host's "driver owns the DAC" state stayed false for the whole
+        // remainder of that track: nothing kept the process alive, and the release
+        // paths (pause/idle/Exit) all skipped the hand-back, leaving the kernel
+        // driver detached and every other app silent until a physical replug.
+        onDriverOwnsUsbDeviceChanged?.invoke(true)
 
         // Try to create engine now (works for first track where onMediaItemTransition
         // fired before configure). For subsequent tracks, createEngineIfNeeded() in

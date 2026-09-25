@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -237,6 +238,29 @@ class PlaybackService : MediaSessionService() {
         // once playback has been stopped for ATTENTIVE_RESTORE_GRACE_MS, on
         // service teardown / Exit, on the next service start, and on boot.
         private const val SETTING_ATTENTIVE_TIMEOUT  = "attentive_timeout" // Settings.Secure.ATTENTIVE_TIMEOUT is @hide
+
+        // ── USB "match content audio resolution" (NVIDIA / Android TV) ──────────
+        // Settings.System "usb_audio_mcar" — the user-facing switch "USB Match
+        // content audio resolution" in Android Settings → Sound. There is no public
+        // constant for it and the whole feature is vendor-specific.
+        //
+        // Read-only here on purpose: reading a Settings.System key needs no
+        // permission, while writing one needs WRITE_SETTINGS, which this app does
+        // not request. When it is ON, AudioPolicyManager forces DIRECT (no SRC)
+        // output for any USB media stream whose rate the DAC supports, and DIRECT
+        // requires an exact format match. A DAC that advertises no PCM_16_BIT
+        // profile (common: UAC2 DACs whose alt settings all use 4-byte subslots)
+        // then has no usable direct profile for 16-bit content, and since most
+        // other apps ask for 16-bit PCM, AudioPolicyManager finds no output at all
+        // and createTrack() fails with -38 (ENOSYS) — total silence, not even an
+        // HDMI fallback. Measured on a SHIELD Android TV + Audalytic DR70:
+        // usb_audio_mcar=1 → repeated "could not find output" + createTrack -38;
+        // usb_audio_mcar=0 → the same 16-bit stream opens on a MIXER thread that
+        // writes to AUDIO_DEVICE_OUT_USB_HEADSET, and sound is back. The DAC's
+        // advertised profile list is identical in both cases, so this is purely
+        // the policy's routing decision — nothing to do with who holds the DAC.
+        private const val SETTING_USB_MATCH_CONTENT_RESOLUTION = "usb_audio_mcar"
+
         private const val ATTENTIVE_NEVER            = -1
         private const val KEY_ATTENTIVE_OVERRIDDEN   = "attentive_timeout_overridden"
         private const val KEY_ATTENTIVE_SAVED        = "attentive_timeout_saved"
@@ -446,16 +470,81 @@ class PlaybackService : MediaSessionService() {
         }
 
         /**
+         * Android TV's "USB Match content audio resolution" switch
+         * (Settings → Sound), or null when this device/vendor has no such setting.
+         * See [SETTING_USB_MATCH_CONTENT_RESOLUTION] for what it does to other apps.
+         */
+        fun usbMatchContentResolution(context: Context): Boolean? = try {
+            android.provider.Settings.System
+                .getString(context.contentResolver, SETTING_USB_MATCH_CONTENT_RESOLUTION)
+                ?.trim()?.toIntOrNull()?.let { it != 0 }
+        } catch (_: Exception) { null }
+
+        private fun isUsbOutput(type: Int): Boolean =
+            type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                type == AudioDeviceInfo.TYPE_USB_HEADSET
+
+        /**
+         * One-line risk report for the debug log: can other apps be expected to make
+         * sound on the USB DAC, and if not, which switch to look at.
+         *
+         * Only the combination is a problem — "match content audio resolution" on
+         * its own is fine for a DAC that advertises 16-bit, and a 16-bit-less DAC
+         * is fine while the switch is off (the HAL then converts on the mixer
+         * path).
+         *
+         * Deliberately phrased as a *risk*, not a verdict: the switch's value is
+         * only half the story. AudioPolicyManager caches it per device, and when
+         * the forced DIRECT search fails it may still fall back to the mixer — on
+         * this device a 16-bit track was created successfully with the switch ON,
+         * minutes after it had been failing with -38. So this reports the setting,
+         * the profile set, the mechanism and the fix, and leaves the actual routing
+         * to the framework's own logs.
+         *
+         * Deliberately says nothing about this app's own playback: it bypasses the
+         * audio policy entirely in usbdevfs mode.
+         */
+        fun usbOtherAppsAudibleVerdict(context: Context, devices: Array<out AudioDeviceInfo>): String {
+            val usb = devices.filter { isUsbOutput(it.type) }
+            if (usb.isEmpty()) return "no USB output device connected — this app's DAC hand-back cannot affect other apps"
+            val no16 = usb.filter { AudioFormat.ENCODING_PCM_16BIT !in it.encodings }
+            val mcar = usbMatchContentResolution(context)
+            return when {
+                mcar == null ->
+                    "\"USB match content audio resolution\" setting not present on this device (vendor-specific)"
+                mcar == true && no16.isNotEmpty() ->
+                    "OTHER APPS AT RISK: \"USB match content audio resolution\" is ON and " +
+                        no16.joinToString { "${it.productName} (encodings=${it.encodings.toList()})" } +
+                        " advertises no PCM_16_BIT. While the audio policy honors that setting it " +
+                        "forces DIRECT output, which cannot be matched, and 16-bit apps then fail " +
+                        "createTrack() with -38 (observed on this device). The policy caches the " +
+                        "setting per device, so it can still be routing via the mixer afterwards — " +
+                        "this is a risk report, not a live verdict, and turning it off may need a " +
+                        "DAC replug or an audio-service restart to take effect. Fix: Android " +
+                        "Settings → Sound → \"USB Match content audio resolution\" → off."
+                mcar == true ->
+                    "\"USB match content audio resolution\" is ON; every connected USB DAC advertises " +
+                        "PCM_16_BIT, so DIRECT output can still be matched."
+                else ->
+                    "\"USB match content audio resolution\" is OFF — other apps use the HAL's mixer " +
+                        "path, which is the combination that works on a 32-bit-only DAC."
+            }
+        }
+
+        /**
          * Live snapshot of every output device AudioManager (i.e. Android's audio
          * policy layer — the same layer every other app's AudioTrack routes through)
          * currently reports, with no adb and no filesystem access required. Added
          * because on this hardware adb and the USB DAC are mutually exclusive
          * (enabling wireless debugging disables the USB port entirely), so
          * `adb shell dumpsys audio` can never be run while the bug is actually
-         * reproducible — this is the adb-free substitute: call it (e.g. from
-         * Settings → Debug Log) right after confirming another app has no sound,
-         * with BitperfectPlayer not currently playing, to see whether Android
-         * itself still considers the USB DAC a connected, available sink.
+         * reproducible — this is the adb-free substitute: it runs on the way out of
+         * [prepareForProcessExit] (and can be called again at any time), so with
+         * BitperfectPlayer not playing you can tell whether Android itself still
+         * considers the USB DAC an available sink — and, from the encodings it
+         * reports together with "USB match content audio resolution", whether other
+         * apps are being routed into a DIRECT profile that cannot exist.
          */
         fun currentAudioOutputDevicesSnapshot(context: Context): String {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -466,18 +555,18 @@ class PlaybackService : MediaSessionService() {
                 return "getDevices() failed: ${e.message}"
             }
             if (devices.isEmpty()) return "AudioManager reports NO output devices at all (unusual — even the built-in speaker should normally be listed)."
-            val hasUsb = devices.any {
-                it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-                    it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
-                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-            }
             val lines = devices.joinToString("\n") { d ->
                 "  type=${audioDeviceTypeName(d.type)} id=${d.id} name=${d.productName} " +
                     "channelCounts=${d.channelCounts.toList()} " +
                     "encodings=${d.encodings.toList()} " +
                     "sampleRates=${d.sampleRates.toList()}"
             }
-            return "USB DAC present in AudioManager's output device list: $hasUsb\n$lines"
+            return "USB DAC present in AudioManager's output device list: " +
+                "${devices.any { isUsbOutput(it.type) }}\n" +
+                "USB match content audio resolution (Android Settings → Sound): " +
+                "${usbMatchContentResolution(context)}\n" +
+                "Other apps on the USB DAC: ${usbOtherAppsAudibleVerdict(context, devices)}\n" +
+                lines
         }
     }
 
@@ -625,6 +714,31 @@ class PlaybackService : MediaSessionService() {
     private var usbDriverOwnsDac = false
 
     /**
+     * True while the driver's exclusive usbfs claims on the DAC are in place — the
+     * state in which every other app is silent, because the kernel's snd-usb-audio
+     * stays detached for as long as the claims are.
+     *
+     * [usbDriverOwnsDac] alone is not enough: the claims are taken in the sink's
+     * configureUsbBitPerfect(), which the deferred cross-rate reconfiguration runs on
+     * its own background thread without going through configure()'s callback, so the
+     * flag could be false while the DAC was very much claimed. Every decision made
+     * from that flag alone (hand the DAC back on pause/idle/exit, keep the process
+     * alive while the DAC is claimed) was then skipped and the claims survived the
+     * app. The sink itself is the authority, so ask it too.
+     */
+    private fun usbDacClaimedByDriver(): Boolean =
+        usbDriverOwnsDac || usbAudioSink?.ownsUsbDevice == true
+
+    /**
+     * True while a DAC hand-back (stream stop → USBDEVFS_RESET soft-replug → close)
+     * is still running on the sink's release thread. Ownership is reported as gone
+     * at the *start* of that sequence, so this — not [usbDriverOwnsDac] — is what
+     * says the process may not be killed yet.
+     */
+    private fun usbDacHandBackInFlight(): Boolean =
+        usbAudioSink?.isIdleReleaseInFlight() == true
+
+    /**
      * Release the usbdevfs driver's claim on the USB DAC so the system audio
      * HAL can use it again (pause, stop, sleep — whenever the player is not
      * actively streaming). The driver re-claims lazily on the next play().
@@ -642,18 +756,50 @@ class PlaybackService : MediaSessionService() {
         // switch from usbdevfs to a system mode must return the DAC to the HAL
         // or the new AudioTrack opens into a still-claimed device and is silent.
         val sink = usbAudioSink ?: return false
-        if (!usbDriverOwnsDac) {
+        if (!usbDacClaimedByDriver()) {
             // Driver does not own the DAC (released, never engaged, or a failed
             // configure). Nothing to hand back — avoid a pointless USB reset.
             Log.d(TAG, "DAC release skipped — driver does not own the DAC")
             return false
         }
         return try {
+            // A second caller (pause + STATE_IDLE + screen-off are different threads)
+            // can still pass the ownership check above while the first hand-back is
+            // running: the stream is already gone, but the device is not closed until
+            // the release thread gets there. releaseUsbForIdle() then skips as a
+            // duplicate, so report the verdict only when this call is the one that
+            // actually started the hand-back.
+            val alreadyInFlight = usbDacHandBackInFlight()
             sink.releaseUsbForIdle()
+            if (!alreadyInFlight) logOtherAppsAudibleVerdict("DAC hand-back")
             true
         } catch (t: Throwable) {
             Log.w(TAG, "usbdevfs DAC release failed: ${t.message}")
             false
+        }
+    }
+
+    /**
+     * Records, in the debug log, whether other apps can be expected to make sound
+     * now that the DAC is (being) returned to the system — the one moment a user is
+     * likely to leave this app and press play somewhere else, and the moment a
+     * routing decision made entirely inside Android (see
+     * [SETTING_USB_MATCH_CONTENT_RESOLUTION]) can make that pointless. Only ever
+     * warns: the setting is vendor-specific and read-only for this app, so the
+     * verdict is reported with the switch name and its current value and the user
+     * decides.
+     */
+    private fun logOtherAppsAudibleVerdict(reason: String) {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val verdict = usbOtherAppsAudibleVerdict(this, devices)
+            appendDebugLog(this, "$reason — $verdict")
+            if (verdict.startsWith("OTHER APPS AT RISK")) {
+                Log.w(TAG, "$reason — $verdict")
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "$reason — could not evaluate other-app audibility: ${e.message}")
         }
     }
 
@@ -709,7 +855,7 @@ class PlaybackService : MediaSessionService() {
         // USBDEVFS_RESET hand-back is still running (same race as
         // prepareForProcessExit). Missing it meant the new system AudioTrack was
         // opened into a DAC that was still claimed / half re-enumerated → silence.
-        val wasOwned = sink != null && usbDriverOwnsDac
+        val wasOwned = sink != null && usbDacClaimedByDriver()
         val releaseInFlight = sink?.isIdleReleaseInFlight() == true
         // Snapshot the system sound cards before the soft-replug so we can watch
         // the USB card unbind/rebind (below) while the reset re-enumerates the DAC.
@@ -1128,7 +1274,7 @@ class PlaybackService : MediaSessionService() {
         // physical replug. So when the DAC is held we own the foreground service
         // ourselves, even while Media3 thinks it is playing.
         val dacHeld = usbDevfsDriverEnabled() &&
-            (usbDriverOwnsDac || usbAudioSink?.isIdleReleaseInFlight() == true)
+            (usbDacClaimedByDriver() || usbDacHandBackInFlight())
         val lanKeep = mpdEnabled && !media3OwnsFg
         val keepFg = lanKeep || dacHeld
 
@@ -1267,12 +1413,28 @@ class PlaybackService : MediaSessionService() {
      * release", skipping the wait for a reset that is, in fact, still
      * running. That silently reintroduced the exact race this function
      * exists to close.
+     *
+     * For the same reason the *in-flight* hand-back must be snapshotted too
+     * (usbDacHandBackInFlight(), read before stop() as well): ownership is
+     * reported as gone at the very start of a hand-back, while the usbfs
+     * interface claims are only dropped at the very end of it. Testing
+     * ownership alone made Exit kill the process during a hand-back that was
+     * already running — playback had just stopped/ended/paused a moment
+     * earlier, or another app's audio was already broken — so System.exit(0)
+     * took the release thread down with it, the force=true claims were never
+     * dropped, and the DAC's kernel driver stayed detached: no sound in any
+     * other app until it was physically replugged. When only a hand-back is
+     * pending, Exit waits for it to finish and then leaves; the rebind itself
+     * is not ours to wait for in that state (it was previously an instant
+     * exit, and the hand-back's own thread is what has to survive).
      */
     fun prepareForProcessExit(onReleased: () -> Unit) {
         val sink = usbAudioSink
-        val wasOwned = usbDriverOwnsDac
+        val wasOwned = usbDacClaimedByDriver()
+        val handBackInFlight = usbDacHandBackInFlight()
         val cardsBefore = sndCards()
-        appendDebugLog(this, "prepareForProcessExit: usbAudioSink=${sink != null} wasOwned=$wasOwned cardsBefore=$cardsBefore")
+        appendDebugLog(this, "prepareForProcessExit: usbAudioSink=${sink != null} " +
+            "wasOwned=$wasOwned handBackInFlight=$handBackInFlight cardsBefore=$cardsBefore")
 
         // System.exit() skips onDestroy() — put the user's sleep timer back now.
         sleepSuppressionShutDown = true
@@ -1283,43 +1445,92 @@ class PlaybackService : MediaSessionService() {
         try { mediaSession?.player?.stop() } catch (_: Exception) {}
         bitPerfectManager.clear()
         releaseUsbDriverDac()
+        // One verdict line per exit, after the hand-back has been requested, so it
+        // reflects the state the other apps are about to meet rather than this app
+        // still holding the DAC (while the claims are in place AudioManager cannot
+        // even list the device, which would report the uninformative "no USB output
+        // device connected"). Also runs on the instant-exit path below, which skips
+        // the detailed snapshot entirely. See usbOtherAppsAudibleVerdict().
+        logOtherAppsAudibleVerdict("Exit")
 
-        if (sink == null || !wasOwned) {
+        // Decide from the state *now*, not only from what was read at the top: a
+        // claim can also be taken in this window (the deferred cross-rate
+        // reconfiguration claims the DAC on its own thread), and the
+        // releaseUsbDriverDac() call above has only *requested* a hand-back — it
+        // runs on the sink's thread.
+        val needsRebindWait = wasOwned || usbDacClaimedByDriver()
+        val needsHandBackWait = handBackInFlight || usbDacHandBackInFlight()
+
+        if (sink == null || (!needsRebindWait && !needsHandBackWait)) {
             // The driver was not actively holding the DAC when Exit was
-            // pressed (not in usbdevfs mode, or already idle/paused) — there
-            // is nothing in flight to wait for.
+            // pressed (not in usbdevfs mode, or already idle/paused) and no
+            // hand-back is running — there is nothing in flight to wait for.
             appendDebugLog(this, "prepareForProcessExit: nothing to wait for — exiting immediately")
             onReleased()
             return
         }
         val startedAt = SystemClock.uptimeMillis()
-        appendDebugLog(this, "prepareForProcessExit: waiting for USB rebind before exit")
+        appendDebugLog(this, if (needsRebindWait)
+            "prepareForProcessExit: waiting for USB rebind before exit"
+        else
+            "prepareForProcessExit: waiting for the in-flight DAC hand-back before exit")
         Thread({
-            val rebound = waitForUsbRebind(sink, cardsBefore)
-            if (rebound) {
-                // On-device evidence: reboundObserved=true fired only 150-350ms after
-                // AudioDeviceCallback.onAudioDevicesAdded, yet other apps still had no
-                // sound afterward. That event is not trusted this fast anywhere else in
-                // this codebase — normal USB attach handling deliberately waits
-                // USB_SETTLE_MS after the same "device added" signal before touching the
-                // device, because the HAL/policy reports it before it is actually stable.
-                // Exiting (killing the whole process, including any native driver
-                // cleanup still finishing the handoff) within a few hundred ms of that
-                // same raw signal was very likely premature. Give it the same settle
-                // time used elsewhere before treating the rebind as durable.
-                appendDebugLog(this, "prepareForProcessExit: rebind observed — settling ${USB_SETTLE_MS}ms before exit")
-                sleepQuietly(USB_SETTLE_MS)
+            if (needsRebindWait) {
+                val rebound = waitForUsbRebind(sink, cardsBefore)
+                if (rebound) {
+                    // On-device evidence: reboundObserved=true fired only 150-350ms after
+                    // AudioDeviceCallback.onAudioDevicesAdded, yet other apps still had no
+                    // sound afterward. That event is not trusted this fast anywhere else in
+                    // this codebase — normal USB attach handling deliberately waits
+                    // USB_SETTLE_MS after the same "device added" signal before touching the
+                    // device, because the HAL/policy reports it before it is actually stable.
+                    // Exiting (killing the whole process, including any native driver
+                    // cleanup still finishing the handoff) within a few hundred ms of that
+                    // same raw signal was very likely premature. Give it the same settle
+                    // time used elsewhere before treating the rebind as durable.
+                    appendDebugLog(this, "prepareForProcessExit: rebind observed — settling ${USB_SETTLE_MS}ms before exit")
+                    sleepQuietly(USB_SETTLE_MS)
+                }
+                appendDebugLog(this, "prepareForProcessExit: wait finished after " +
+                    "${SystemClock.uptimeMillis() - startedAt}ms, reboundObserved=$rebound — exiting now")
+                // Captured from inside this (about to die) process, right before exit —
+                // the most direct evidence available, with no adb needed, of whether
+                // Android's audio policy still considers the USB DAC an available sink
+                // at the exact moment we hand control back.
+                appendDebugLog(this, "prepareForProcessExit: final device snapshot:\n" +
+                    currentAudioOutputDevicesSnapshot(this))
+            } else {
+                // Ownership was already given up before Exit was pressed, but the
+                // hand-back is still running. Its thread has not yet dropped the
+                // usbfs claims and closed the device, and killing the process now
+                // would leave the DAC claimed for good — so wait it out (bounded,
+                // so a stuck release cannot hang Exit) and then leave.
+                val done = awaitUsbDacHandBack(sink)
+                appendDebugLog(this, "prepareForProcessExit: in-flight hand-back " +
+                    "${if (done) "finished" else "did NOT finish"} after " +
+                    "${SystemClock.uptimeMillis() - startedAt}ms — exiting now")
             }
-            appendDebugLog(this, "prepareForProcessExit: wait finished after " +
-                "${SystemClock.uptimeMillis() - startedAt}ms, reboundObserved=$rebound — exiting now")
-            // Captured from inside this (about to die) process, right before exit —
-            // the most direct evidence available, with no adb needed, of whether
-            // Android's audio policy still considers the USB DAC an available sink
-            // at the exact moment we hand control back.
-            appendDebugLog(this, "prepareForProcessExit: final device snapshot:\n" +
-                currentAudioOutputDevicesSnapshot(this))
             onReleased()
         }, "exitDacRelease").start()
+    }
+
+    /**
+     * Blocks the calling background thread until an in-flight DAC hand-back has
+     * actually finished — i.e. until releaseUsbForIdle()'s thread has dropped the
+     * usbfs interface claims and closed the device (it clears the in-flight flag in
+     * a finally that runs after closeDevice(), so the flag is a truthful signal).
+     *
+     * Bounded by [USB_REBIND_MAX_WAIT_MS] so a genuinely stuck release can never
+     * hang Exit forever.
+     *
+     * @return true when the hand-back completed.
+     */
+    private fun awaitUsbDacHandBack(sink: com.decent.usbaudio.media3.UsbAudioSink): Boolean {
+        val deadline = SystemClock.uptimeMillis() + USB_REBIND_MAX_WAIT_MS
+        while (sink.isIdleReleaseInFlight() && SystemClock.uptimeMillis() < deadline) {
+            if (!sleepQuietly(10)) return false
+        }
+        return !sink.isIdleReleaseInFlight()
     }
 
     /**
@@ -1566,10 +1777,19 @@ class PlaybackService : MediaSessionService() {
                             // while the usbdevfs driver streams, BitPerfectAudioSink must not
                             // open its own direct AudioTrack on the DAC.
                             onDriverOwnsUsbDeviceChanged = { owns ->
-                                bitPerfectSink.driverOwnsUsbDevice = owns
-                                this@PlaybackService.usbDriverOwnsDac = owns
-                                Log.i(TAG, "UsbAudioSink driver ownership changed: releasedToDriver=$owns")
-                                updatePlaybackWakeLock()
+                                // The sink now reports ownership from the single place
+                                // the claims are taken, and reclaimUsbStream() re-reports
+                                // it immediately afterwards — an exact repeat is a no-op,
+                                // so skip it rather than log a phantom transition and
+                                // re-run the wake-lock update. Both mirrors are checked:
+                                // whichever is stale gets corrected.
+                                if (owns != bitPerfectSink.driverOwnsUsbDevice ||
+                                        owns != this@PlaybackService.usbDriverOwnsDac) {
+                                    bitPerfectSink.driverOwnsUsbDevice = owns
+                                    this@PlaybackService.usbDriverOwnsDac = owns
+                                    Log.i(TAG, "UsbAudioSink driver ownership changed: releasedToDriver=$owns")
+                                    updatePlaybackWakeLock()
+                                }
                             }
                         ).also {
                             this@PlaybackService.usbAudioSink = it
@@ -1673,7 +1893,7 @@ class PlaybackService : MediaSessionService() {
             val p = mediaSession?.player
             val exoRequested = p != null && p.playWhenReady &&
                 (p.playbackState == Player.STATE_READY || p.playbackState == Player.STATE_BUFFERING)
-            val hold = exoRequested || (usbAudioSink != null && usbDriverOwnsDac)
+            val hold = exoRequested || usbDacClaimedByDriver()
             if (hold) acquirePlaybackWakeLock() else releasePlaybackWakeLock()
             updateSleepSuppression(hold)
         }
@@ -1821,6 +2041,50 @@ class PlaybackService : MediaSessionService() {
                 return
             }
             saveCurrentPosition()
+            releaseDacForInactivity("playWhenReady=false (reason=$reason)")
+        }
+
+        override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
+            if (playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) return
+            // Another app took *transient* focus (it plays something now and hands
+            // focus back later). Media3 keeps playWhenReady=true in that case, so
+            // onPlayWhenReadyChanged never fires and the usbdevfs driver kept its
+            // exclusive claims on the DAC — the app that had just taken focus was
+            // silent. Drop the claims so it can play. No stop() here: an IDLE player
+            // abandons audio focus, and Media3 would then never get it back to
+            // resume. When focus returns, UsbAudioSink re-claims the DAC on the next
+            // buffer (reclaimAfterIdleRelease).
+            appendDebugLog(this@PlaybackService,
+                "Transient audio-focus loss — handing the DAC back " +
+                    "(driverOwns=${usbDacClaimedByDriver()})")
+            saveCurrentPosition()
+            releaseUsbDriverDac()
+            updatePlaybackWakeLock()
+        }
+
+        /**
+         * Playback was paused (by the user, or by another app taking audio focus while
+         * this one is in the background): give the DAC back to the rest of the system.
+         */
+        private fun releaseDacForInactivity(reason: String) {
+            // Decide *before* the release whether a USB DAC is attached. The old
+            // check asked AudioManager after releaseUsbDriverDac() — but that release
+            // is asynchronous, and while the usbdevfs driver still holds its claims
+            // the DAC is not in AudioManager's device list at all. So whenever the
+            // driver owned the DAC (i.e. every pause in USB-driver mode, including the
+            // one triggered by another app taking audio focus after Home), stop() was
+            // skipped: the player stayed prepared with its muted delegate AudioTrack
+            // attached. When the DAC re-registered, that track moved onto it and — on
+            // the Android 11 direct-only usb_audio HAL — pinned it to our rate, so the
+            // app that had just taken focus stayed silent. UsbManager lists the DAC
+            // whether or not it is claimed.
+            val dacAttached = usbDacClaimedByDriver() ||
+                usbDacHandBackInFlight() ||
+                findUsbAudioDevice(this@PlaybackService) != null ||
+                bitPerfectManager.findUsbOutputDevice() != null
+            appendDebugLog(this@PlaybackService,
+                "releaseDacForInactivity: $reason — dacAttached=$dacAttached " +
+                    "driverOwns=${usbDacClaimedByDriver()}")
             // The Android 11 usb_audio HAL is direct-only: while our
             // AudioTrack is attached, the DAC's output is pinned to the
             // track's sample rate and every other app's 48kHz stream fails
@@ -1834,7 +2098,7 @@ class PlaybackService : MediaSessionService() {
             // apps get the DAC back while we are paused.
             releaseUsbDriverDac()
             updatePlaybackWakeLock()
-            if (bitPerfectManager.findUsbOutputDevice() != null) {
+            if (dacAttached) {
                 mediaSession?.player?.stop()
             }
         }

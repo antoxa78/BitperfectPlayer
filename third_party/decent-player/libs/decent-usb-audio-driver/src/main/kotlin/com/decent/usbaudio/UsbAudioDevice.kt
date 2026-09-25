@@ -531,59 +531,42 @@ class UsbAudioDevice private constructor(private val context: Context) {
     }
 
     /**
-     * Hand the DAC back to the system: release our claimed interfaces FIRST,
-     * then reset the bus, then close the connection — in that order — so the
-     * kernel's own snd-usb-audio driver actually gets a chance to bind.
+     * Hand the DAC back to the system. Release the claimed interfaces, then reset
+     * the bus to force re-enumeration (which re-binds snd-usb-audio), then close.
      *
-     * ORDERING BUG FIX (this was the actual remaining cause of "other apps
-     * have no sound after Exit"): this function, and the caller's cleanup
-     * around it, previously did USBDEVFS_RESET *first* and released the
-     * claimed interfaces *afterward* (in a finally block one level up). That
-     * order doesn't work: while an interface is still claimed via usbfs
-     * (force = true, which is how it was originally taken), there is no
-     * kernel driver attached to it for USBDEVFS_RESET's reset-and-rebind
-     * cycle to act on — the kernel has nothing to do but preserve our own
-     * claim straight through the reset. By the time we released the claim a
-     * moment later, the reset's one opportunity to let a driver bind had
-     * already passed, and simply releasing afterward does not by itself
-     * trigger a fresh probe. The interface was just left unclaimed and idle
-     * — which is consistent with what was observed on-device: Android's
-     * audio policy still reported the USB device as present after this
-     * "release" (the bus reset alone is enough to cause a redetection event
-     * at that layer), yet no other app could get sound out of it, and sound
-     * only ever came back after a genuine physical unplug/replug (a real
-     * from-scratch enumeration with no stale claim in the way — nothing our
-     * software path was doing achieved that same clean slate).
+     * WHY THIS IS BEST-EFFORT, NOT A GUARANTEE (on-device, SHIELD Android TV
+     * kernel 4.9 + Audalytic DR70, locked/unrooted):
+     *  - The interfaces are claimed with force=true, which detaches snd-usb-audio
+     *    and marks them so a plain release does NOT re-bind them.
+     *  - The inverse ioctl, USBDEVFS_CONNECT, returns -EBUSY here whether issued
+     *    before release (the interface still being claimed means device_attach()
+     *    cannot re-match a driver) or after (a driver is already bound) — so it is
+     *    a dead primitive on this kernel.
+     *  - The only thing that ever re-binds the streaming interface is the
+     *    USBDEVFS_RESET re-enumeration, and that is racy: it reliably brings back
+     *    the control interface (controlC0) but only sometimes the streaming one
+     *    (pcmC0D0p). When it does not, other apps route to a stale card0 and the
+     *    HAL fails `proxy_open() ... /dev/snd/pcmC0D0p: No such file or directory`,
+     *    which is the "no sound in other apps after Exit" bug — and it can spin
+     *    badly enough to SIGABRT audioserver (observed: TimeCheckThread at 17:58).
+     *  - [forceKernelRebind] (a genuine sysfs unbind/bind) is the only reliable
+     *    software fix and it needs root, so on a locked box it degrades silently
+     *    and the user must physically replug the DAC.
      *
-     * Releasing before resetting at least removes the one confirmed reason
-     * the kernel had to skip rebinding. On-device evidence (logcat on a Mi TV
-     * box, Android 14): after this sequence the ALSA card files re-appear
-     * (pcmC2D0p + controlC2), the framework even routes other apps to
-     * OUT_USB_HEADSET — but the vendor audio HAL's USB output proxy then dies
-     * with a persistent `pcm oops: cannot prepare channel: No such device`
-     * because the underlying USB streaming PCM can only be re-armed by a real
-     * host-level disconnect/reconnect (a physical unplug, or a root sysfs
-     * unbind/bind via [forceKernelRebind]). A USBDEVFS_RESET merely
-     * re-enumerates on the same port, which the HAL provably never recovers
-     * from. So for other apps to regain the DAC, either the user physically
-     * replugs it, or the box must provide root for the sysfs fallback —
-     * nothing further at the usbfs level can force it.
+     * So: release, reset (best available rebind), best-effort CONNECT, close, then
+     * the root-only fallback. A USBDEVFS_RESET-only re-enumeration is the limit of
+     * what a third-party app can do on this hardware without root.
      *
-     * Trade-off: resuming playback after this now requires a full
-     * [openDevice] (re-open, re-claim, re-parse descriptors) instead of
-     * reusing the cached fd — slower to resume, but the fd staying open and
-     * claimed was exactly why the device was never truly released. No-op if
-     * the connection is already closed.
+     * Trade-off: resuming playback after this requires a full [openDevice] rather
+     * than reusing the cached fd. No-op if the connection is already closed.
      */
     fun resetUsbDevice() {
         val conn = connection ?: return
         val fd = conn.fileDescriptor
 
         // Capture the device while it is still known (closeDevice() below nulls
-        // currentDevice). The audio interface ids are needed so USBDEVFS_CONNECT
-        // can ask the kernel to re-bind snd-usb-audio (a force=true claim
-        // previously disconnected that driver everywhere); the product name is
-        // needed by the sysfs fallback to locate the device after the fd is gone.
+        // currentDevice). The audio interface ids are needed for the best-effort
+        // USBDEVFS_CONNECT; the product name for the sysfs fallback.
         val device = currentDevice
         val productNameForRebind = device?.productName
         val audioInterfaceIds = device?.let { d ->
@@ -594,46 +577,51 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 .toList()
         }?.distinct() ?: emptyList()
 
-        // Release BEFORE resetting — see doc comment above.
+        // Release BEFORE resetting: while an interface is still force-claimed
+        // there is no kernel driver attached for the reset's re-probe to act on,
+        // so the claim would survive the reset unchanged.
+        Log.i(TAG, "resetUsbDevice: release sequence start — device=${productNameForRebind} " +
+            "audioIfaces=$audioInterfaceIds")
         val controlInterface = device?.let { d ->
             (0 until d.interfaceCount).map { d.getInterface(it) }
                 .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO && it.interfaceSubclass == 1 }
         }
         controlInterface?.let {
-            Log.i(TAG, "resetUsbDevice: releaseInterface(control iface ${it.id}) before reset: ${conn.releaseInterface(it)}")
+            Log.i(TAG, "resetUsbDevice: releaseInterface(control iface ${it.id}): ${conn.releaseInterface(it)}")
         }
         claimedInterface?.let {
-            Log.i(TAG, "resetUsbDevice: releaseInterface(streaming iface ${it.id}) before reset: ${conn.releaseInterface(it)}")
+            Log.i(TAG, "resetUsbDevice: releaseInterface(streaming iface ${it.id}): ${conn.releaseInterface(it)}")
         }
         claimedInterface = null
 
-        // Re-enumerate the device so the kernel re-binds snd-usb-audio. This is
-        // required after our force=true claim detached the kernel driver: a plain
-        // releaseInterface + USBDEVFS_CONNECT is NOT sufficient on this hardware
-        // to bring the ALSA card back, which left the system/Android audio modes
-        // silent (regression). The earlier assumption that this reset caused the
-        // DR70 disconnects was wrong — those were HDMI-CEC / TV power-down events
-        // (whole-port USB power cut), not this per-device port reset.
+        // Re-enumerate so the kernel re-probes and (best-effort) re-binds
+        // snd-usb-audio. Racy on this SoC (see doc comment), but the only
+        // root-free rebind available.
         runCatching { UsbAudioStream.nativeUsbResetOnly(fd) }
             .onFailure { Log.w(TAG, "USBDEVFS_RESET failed: ${it.message}") }
             .getOrNull()?.let { if (it != 0) Log.w(TAG, "USBDEVFS_RESET returned $it") }
 
-        // Best-effort: also ask the kernel to re-bind each audio interface. After
-        // the reset above this typically returns EBUSY (driver already re-bound).
+        // Best-effort: ask the kernel to re-bind each audio interface. Dead on
+        // this kernel (always EBUSY), but harmless; nativeUsbConnect returns the
+        // POSIX errno so the real reason reaches this (surviving) debug log.
         for (ifaceId in audioInterfaceIds) {
-            runCatching { UsbAudioStream.nativeUsbConnect(fd, ifaceId) }
-                .onFailure { Log.w(TAG, "USBDEVFS_CONNECT iface=$ifaceId failed: ${it.message}") }
-                .getOrNull()?.let { if (it != 0) Log.w(TAG, "USBDEVFS_CONNECT iface=$ifaceId returned $it") }
+            val connectResult = runCatching { UsbAudioStream.nativeUsbConnect(fd, ifaceId) }.getOrNull()
+            when {
+                connectResult == null ->
+                    Log.w(TAG, "resetUsbDevice: CONNECT iface=$ifaceId threw an exception")
+                connectResult == 0 ->
+                    Log.i(TAG, "resetUsbDevice: CONNECT iface=$ifaceId OK — kernel driver re-bound")
+                else ->
+                    Log.w(TAG, "resetUsbDevice: CONNECT iface=$ifaceId errno=$connectResult — " +
+                        "no re-bind via CONNECT on this kernel (expected)")
+            }
         }
 
         // Finally close the connection fully (releases any remaining claims).
         closeDevice()
 
-        // Fallback: on some SoCs USBDEVFS_RESET + USBDEVFS_CONNECT only
-        // re-enumerate the device at the bus level and the kernel audio driver
-        // never binds again, so the system/Android output modes stay silent
-        // until a physical replug. Force a genuine kernel re-probe via sysfs
-        // unbind/bind (best-effort; needs root and degrades silently without).
+        // Fallback: a genuine sysfs unbind/bind — the only reliable rebind, but it
+        // needs root and degrades silently without it.
         forceKernelRebind(productNameForRebind)
     }
 
@@ -769,6 +757,17 @@ class UsbAudioDevice private constructor(private val context: Context) {
             null
         }
     }
+
+    /**
+     * True while this process holds the device open with its audio interface
+     * claimed — i.e. while the kernel's snd-usb-audio is kept detached by our
+     * force=true usbfs claims, which is what silences every other app on the DAC.
+     * The claims live exactly as long as this, so it (not "is a stream running")
+     * is the honest answer to "does the driver still hold the DAC?": a stream can
+     * be released between tracks while the connection is deliberately kept open.
+     */
+    val isDeviceOpen: Boolean
+        get() = connection != null && claimedInterface != null
 
     /**
      * Close the USB device and release all resources.
