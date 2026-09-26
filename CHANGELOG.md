@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.1.0-beta7 - 2026-09-26
+
+### Added
+
+- **WavPack (`.wv`) playback:** `.wv` was already listed as playable in the browser, the library and the track picker, but nothing could actually play it — media3 has no WavPack extractor — so a listed `.wv` either failed outright or, worse, appeared to play. Decoding is `com.tianscar.javasound:javasound-wavpack` 1.4.0, a pure-Java port of the reference unpacker, rather than vendoring libwavpack and a JNI layer for it. The extractor owns its I/O outright, because neither API on either side of it can seek: media3 1.5.1's `ExtractorInput` has no seek, and `javasound-wavpack` has no seek API of its own. Seeking therefore closes the decoder, reopens it on a stream starting exactly at a block boundary, and decodes-and-discards the remainder of that block. Block headers are parsed as the bytes flow past, so the map from byte offset to first sample is built for free during ordinary playback and a seek into already-played territory is exact with no I/O at all. A seek past that recorded prefix bisects the byte range, using the block-resync scan as a monotonic oracle — an earlier estimate-and-walk scheme cost reads in proportion to the jump distance (a 40-minute seek began decoding at 1.5 MB), whereas bisection is flat at ~150–190 reads however far the jump. `GetSeekPoints`, which may run on the app thread, stops at the estimate and never pays for the search.
+- **Playlists (`.m3u`, `.pls`, `.cue`) on SMB shares over MPD:** `add smb://host/share/list.m3u` and `load smb://host/share/list.m3u` now work, so playlists no longer have to be copied to local storage first. `lsinfo` on an `smb://` directory reports a playlist as a playlist rather than as a plain file, so clients list it in the right place, and entries in a playlist read from a share may be relative paths, absolute local paths, or further `smb://` URIs — all three resolve against the playlist's own location. The three playlist parsers moved out of `MainActivity` into `PlaylistParser` so the MPD server and the UI share one implementation.
+
+### Notes
+
+- WavPack bit-exactness is verified per block rather than taken on trust: decoding each of a 300 MB / 44.1 kHz / 16-bit test file's 5373 blocks individually reproduces the CRC stored in that block's header, 5373 of 5373 matching across 118,463,772 samples. Seeking was fuzzed with 200 randomised targets into unexplored territory (200/200 landing exactly, ≤189 reads) and confirmed on-device, with seeks landing on byte offsets identical to host predictions. `WavpackGetNumErrors()` is reported but deliberately not treated as an integrity signal: this port seeds its running block checksum once per open and never resets it between blocks, so a file that decodes perfectly still reports a handful of errors across a full playthrough. Each block's own stored checksum, which the encoder reseeds per block, is the check that means something.
+- A clean WavPack playthrough therefore ends with a `decoder reported N error(s)` warning from `WavPackExtractor`. On files that are in fact intact this is the library's own bookkeeping, and the log says so; it is left in place because on a genuinely damaged file it is the only integrity signal available.
+- WavPack 5.x is untested rather than known-broken: the Java port nominally declares stream versions 4.2–4.16, and no 5.x sample was available to check against. 4.x is confirmed working.
+
+### Fixed
+
+- **A path containing a space in an `smb://` URI was reported as `%20` and not found:** percent-escapes are now decoded on the way in, since jcifs does not do it itself. This is deliberately receive-side only — per the MPD protocol an argument containing a space is to be wrapped in double quotes (which `tokenize()` already handles), and response values are raw text after `NAME: ` where a literal space is unambiguous. Percent-encoding outgoing URIs would only surface `%20` in clients instead of a readable path.
+
 ## 3.1.0-beta6 - 2026-09-25
 
 ### Fixed
