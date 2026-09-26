@@ -99,6 +99,9 @@ dependencies {
     implementation(libs.androidx.media3.datasource.okhttp)
     implementation(libs.androidx.leanback)
     implementation(libs.jcifs.ng)
+    // Pure-Java WavPack decoder (BSD-3-Clause), used by WavPackExtractor.
+    // Bit-exact: each block's CRC-32 is verified against the value in its header.
+    implementation(libs.javasound.wavpack)
 
     // decent-player userspace USB audio driver (vendored in third_party/)
     implementation(project(":decent-usb-audio-driver"))

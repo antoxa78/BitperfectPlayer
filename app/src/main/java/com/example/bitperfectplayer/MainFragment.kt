@@ -1853,7 +1853,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso", ".dsf", ".dff")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso", ".dsf", ".dff", ".wv")
         return extensions.any { filename.lowercase().endsWith(it) }
     }
 

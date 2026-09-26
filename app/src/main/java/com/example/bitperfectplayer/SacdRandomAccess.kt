@@ -1,5 +1,7 @@
 package com.example.bitperfectplayer
 
+import android.content.res.AssetFileDescriptor
+import android.os.ParcelFileDescriptor
 import jcifs.smb.SmbFile
 import jcifs.smb.SmbRandomAccessFile
 import java.io.IOException
@@ -93,6 +95,43 @@ class SmbSacdRandomAccess(private val smbFile: SmbFile) : SacdRandomAccess {
 
     @Synchronized
     override fun close() = closeHandle()
+}
+
+/**
+ * [SacdRandomAccess] backed by a `content://` provider, for the paths a document picker
+ * hands out. The provider exposes a seekable [AssetFileDescriptor], so a real seek is
+ * used rather than a read-and-discard.
+ */
+class ContentResolverRandomAccess(
+    private val afd: AssetFileDescriptor
+) : SacdRandomAccess {
+    private val handle = ParcelFileDescriptor.AutoCloseInputStream(afd.parcelFileDescriptor)
+    private val channel = handle.channel
+
+    @Synchronized
+    override fun read(offset: Long, buffer: ByteArray, length: Int): Int {
+        val want = minOf(length, buffer.size)
+        channel.position(offset)
+        var done = 0
+        while (done < want) {
+            val n = handle.read(buffer, done, want - done)
+            if (n <= 0) break
+            done += n
+        }
+        return done
+    }
+
+    @Synchronized
+    override fun length(): Long = afd.length
+
+    @Synchronized
+    override fun close() {
+        try {
+            handle.close()
+        } catch (_: IOException) {
+        }
+        afd.close()
+    }
 }
 
 /** [SacdRandomAccess] backed by a local file. */

@@ -9,6 +9,7 @@ material = "1.10.0"
 media3 = "1.5.1"
 leanback = "1.2.0"
 jcifsNg = "2.1.10"
+javasoundWavpack = "1.4.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -23,6 +24,7 @@ androidx-media3-session = { group = "androidx.media3", name = "media3-session", 
 androidx-media3-datasource-okhttp = { group = "androidx.media3", name = "media3-datasource-okhttp", version.ref = "media3" }
 androidx-leanback = { group = "androidx.leanback", name = "leanback", version.ref = "leanback" }
 jcifs-ng = { group = "eu.agno3.jcifs", name = "jcifs-ng", version.ref = "jcifsNg" }
+javasound-wavpack = { group = "com.tianscar.javasound", name = "javasound-wavpack", version.ref = "javasoundWavpack" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

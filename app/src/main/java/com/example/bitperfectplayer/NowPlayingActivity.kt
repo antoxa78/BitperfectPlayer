@@ -1090,7 +1090,7 @@ class NowPlayingActivity : BaseActivity() {
         }
     }
 
-    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso").any { name.lowercase().endsWith(it) }
+    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso",".wv").any { name.lowercase().endsWith(it) }
 
     private fun getThemeColor(): Int {
         val idx = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
