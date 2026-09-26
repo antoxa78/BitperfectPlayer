@@ -1321,6 +1321,23 @@ class MpdServer(private val context: Context) {
     private fun isSmbPath(p: String): Boolean = p.trim().startsWith("smb://") || p.trim().startsWith("/smb://")
 
     /**
+     * Decodes percent-escapes in an incoming smb:// URI. jcifs does not do this
+     * itself, so without it a client that percent-encodes a path containing a space
+     * (`%20`) finds nothing on the share.
+     *
+     * Note this is tolerance on the *receive* side only, deliberately not applied
+     * when emitting: per the MPD protocol, arguments containing spaces are to be
+     * wrapped in double quotation marks (which tokenize() already handles), and
+     * response values are raw text after `NAME: `, where a literal space is
+     * unambiguous. Percent-encoding outgoing URIs would just surface `%20` in
+     * clients instead of a readable path.
+     */
+    private fun decSmbUri(raw: String): String {
+        val u = raw.trim()
+        return try { Uri.decode(u) } catch (e: Exception) { u }
+    }
+
+    /**
      * Loads the player's configured network shares from the "SmbShares" prefs
      * (the same store MainFragment uses) and returns each as an smb:// root URI
      * with embedded credentials, e.g. smb://user:pass@ip/share/.
@@ -1369,11 +1386,14 @@ class MpdServer(private val context: Context) {
                 if (name.startsWith(".")) continue
                 val isDir = f.isDirectory()
                 if (isDir) {
+                    // Raw, unencoded — matches reference MPD. Response values are the
+                    // rest of the line, so spaces are unambiguous; clients quote the URI
+                    // when sending it back as a command argument.
                     out.append("directory: ").append(f.path.trimEnd('/')).append('/').append('\n')
                 } else if (MpdLibrary.isAudioFile(name)) {
                     out.append("file: ").append(f.path).append('\n')
                     out.append("Title: ").append(name).append('\n')
-                } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8")) {
+                } else if (PlaylistParser.isPlaylistName(name)) {
                     out.append("playlist: ").append(f.path).append('\n')
                 }
             }
@@ -1408,7 +1428,7 @@ class MpdServer(private val context: Context) {
         }
         // Network share browsing — the mpdUri is a virtual smb:// directory.
         if (isSmbPath(arg)) {
-            writeSmbLsInfo(arg.trim().removePrefix("/"), out)
+            writeSmbLsInfo(decSmbUri(arg.trim().removePrefix("/")), out)
             return
         }
         val dir = resolveLocalPath(arg)
@@ -1635,8 +1655,35 @@ class MpdServer(private val context: Context) {
     }
 
     private fun loadStoredPlaylist(name: String): List<MediaItem> {
+        // A remote playlist URI is expanded straight from the share — the stored-playlist
+        // lookup below is File-based and can never match an smb:// path. Clients get
+        // smb:// URIs from the `playlist:` lines that writeSmbLsInfo emits, and the
+        // protocol says those are loaded with `load` (replace queue), not `add`.
+        if (isSmbPath(name)) {
+            val uri = decSmbUri(name.trim().removePrefix("/"))
+            val file = try { SmbFile(uri, SmbContext.getContextForUri(uri)) }
+                catch (e: Exception) { throw MpdAck(ACK_NO_EXIST, e.message ?: "No such playlist") }
+            if (!file.exists() || !file.isFile() || !PlaylistParser.isPlaylistName(file.name)) {
+                throw MpdAck(ACK_NO_EXIST, "No such playlist")
+            }
+            val items = parseSmbPlaylist(file)
+            if (items.isEmpty()) throw MpdAck(ACK_NO_EXIST, "Playlist is empty or unreadable")
+            return items
+        }
         val f = findPlaylist(name) ?: throw MpdAck(ACK_NO_EXIST, "No such playlist")
         return parseM3uFile(f)
+    }
+
+    /**
+     * Parses a playlist file on an SMB share. Entries resolve against the playlist's
+     * parent share dir, so relative .m3u entries become smb:// URIs carrying the
+     * share's embedded credentials (SmbFile.getParent() keeps the authority).
+     */
+    private fun parseSmbPlaylist(file: SmbFile): List<MediaItem> = try {
+        file.getInputStream().use { PlaylistParser.parsePlaylistStream(file.name, it, file.parent) }
+    } catch (e: Exception) {
+        Log.w(TAG, "SMB playlist parse failed: ${file.path}", e)
+        emptyList()
     }
 
     private fun saveStoredPlaylist(name: String) {
@@ -1659,7 +1706,7 @@ class MpdServer(private val context: Context) {
     private fun expandUri(mpdUri: String): List<MediaItem> {
         val u = mpdUri.trim()
         if (u.startsWith("http://") || u.startsWith("https://")) return listOf(streamItem(u))
-        if (u.startsWith("smb://") || u.startsWith("/smb://")) return expandSmbUri(u.removePrefix("/"))
+        if (u.startsWith("smb://") || u.startsWith("/smb://")) return expandSmbUri(decSmbUri(u.removePrefix("/")))
         if (u.startsWith("content://")) return listOf(genericItem(u))
         // try stored playlist name first
         findPlaylist(u)?.let { return parseM3uFile(it) }
@@ -1727,6 +1774,9 @@ class MpdServer(private val context: Context) {
             if (!file.exists()) throw MpdAck(ACK_NO_EXIST, "No such file or directory")
             if (!file.isDirectory()) {
                 if (file.name.lowercase().endsWith(".iso")) return expandSacdIsoSmb(file)
+                // Remote playlists: parse the stream with the share dir as base so
+                // relative entries resolve to authenticated smb:// URIs.
+                if (PlaylistParser.isPlaylistName(file.name)) return parseSmbPlaylist(file)
                 if (!MpdLibrary.isAudioFile(file.name)) throw MpdAck(ACK_NO_EXIST, "Not a playable file")
                 return listOf(genericItem(file.path))
             }
