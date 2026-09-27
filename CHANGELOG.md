@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.1.0-beta8 - 2026-09-27
+
+### Fixed
+
+- **Back closed the folder browser instead of going up a folder:** Back in the browser only went up where the platform can derive a parent, and even there it walked out of what the user had opened. It is now the same in every browser: one folder up per press, and closing at the root of what was opened. The SAF browser (local storage) could not go up at all — a tree URI has no parent URI — so the folders above the current one are now carried down the recursion and replayed on Back. SMB stops at the root of the share rather than climbing to `smb://host/`, and the file-storage browser stops at internal storage (or a USB drive) instead of stepping up into the virtual `/storage/emulated` listing. The dialog's own Back button and the remote/phone Back key now do the same thing: Back *cancels* a dialog while the buttons `dismiss()` it, so the key was only ever reaching the default cancel-and-close path, and it is now routed to the same handler via `setOnCancelListener` — which is also the only hook that fires under predictive back, where a key listener never sees `KEYCODE_BACK` at all. Since these dialogs are no longer cancel-on-touch-outside, a stray tap while browsing can no longer silently drop a level of the tree.
+- **A folder added from local storage did not start at its first track:** after scanning, the queue was re-sorted by a leading number in each track's *title*. For local files the title comes from the tags ("There is More to this World"), which normally carry no number, so the whole folder fell back to alphabetical-by-song-name and `01 There is More to this World.flac` could land anywhere. SMB folders only worked by accident, since their titles are the file names. Folders are now walked in natural file-name order (`2` before `10`, files before sub-folders, `Disc 2` before `Disc 10`) and the queue keeps that scan order — which also stops CUE sheets and SACD ISOs inside a folder from having their tracks reshuffled alphabetically by title. Applies to local (SAF and file-path) and SMB folders in the browser, and to Add All / Replace All on the Now Playing screen.
+
+### Changed
+
+- **Local folders follow the tags' track numbers when every track has one:** a folder whose file names carry no number (`There is More to this World.flac`) but whose tags do now plays in disc-then-track order. The rule is per folder and all-or-nothing — if any audio file in the folder lacks a track-number tag, or the folder contains a playlist, CUE sheet or ISO, it keeps file-name order, so untagged tracks never land in an arbitrary place. Tracks sharing a number keep file-name order among themselves. Track and disc numbers are now also set on each queued item's metadata. SMB folders stay on file-name order: their tags are not read while scanning, and reading every file's header over the network would make adding a large folder slow.
+
 ## 3.1.0-beta7 - 2026-09-26
 
 ### Added

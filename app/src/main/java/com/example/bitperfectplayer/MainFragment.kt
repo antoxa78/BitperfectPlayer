@@ -754,10 +754,14 @@ class MainFragment : BrowseSupportFragment() {
         uri: String,
         mediaId: String? = null,
         startMs: Long = 0,
-        endMs: Long = androidx.media3.common.C.TIME_UNSET
+        endMs: Long = androidx.media3.common.C.TIME_UNSET,
+        trackNumber: Int? = null,
+        discNumber: Int? = null
     ): MediaItem {
         val metadataBuilder = MediaMetadata.Builder()
             .setTitle(title)
+            .setTrackNumber(trackNumber)
+            .setDiscNumber(discNumber)
         
         if (artist.isNotEmpty()) {
             metadataBuilder.setArtist(artist)
@@ -911,9 +915,10 @@ class MainFragment : BrowseSupportFragment() {
                         addSmbToPlaylist(dir, replace = true)
                     }, { // Long click
                         which -> handleSmbSelection(browseItems[which].path)
-                    }, { // onBack
+                    }, { // onBack: up one folder; at the share root, just close
+                        val depth = dir.path.removePrefix("smb://").split('/').count { it.isNotEmpty() }
                         val parent = dir.parent
-                        if (parent != null) {
+                        if (depth > 2 && parent != null) {   // host + share = the share root
                             browseSmbDirectory(parent)
                         }
                     })
@@ -933,7 +938,8 @@ class MainFragment : BrowseSupportFragment() {
         }.start()
     }
 
-    private fun browseLocalDirectory(uriString: String) {
+    /** [history] = the folders above this one, outermost first, so Back can go up (SAF has no parent URI). */
+    private fun browseLocalDirectory(uriString: String, history: List<String> = emptyList()) {
         val context = activity ?: return
         val uri = uriString.toUri()
         val loadingToast = Toast.makeText(context, "Scanning folder...", Toast.LENGTH_SHORT)
@@ -998,15 +1004,15 @@ class MainFragment : BrowseSupportFragment() {
 
                     showBrowserDialog("Browse Folder", BrowseAdapter(context, sortedItems), { which ->
                         val item = sortedItems[which]
-                        if (item.isDirectory) browseLocalDirectory(item.path) else handleLocalSelection(item.path, item.name)
+                        if (item.isDirectory) browseLocalDirectory(item.path, history + uriString) else handleLocalSelection(item.path, item.name)
                     }, { // Add All
                         addLocalToPlaylist(uriString, "Current Folder", replace = false)
                     }, { // Replace
                         addLocalToPlaylist(uriString, "Current Folder", replace = true)
                     }, { // Long click
                         which -> handleLocalSelection(sortedItems[which].path, sortedItems[which].name)
-                    }, { // onBack
-                        // For local SAF, we don't easily have the parent URI here, but we can dismiss
+                    }, { // onBack: up one folder; at the folder the user picked, just close
+                        if (history.isNotEmpty()) browseLocalDirectory(history.last(), history.dropLast(1))
                     })
                 }
             } catch (e: Exception) {
@@ -1086,6 +1092,14 @@ class MainFragment : BrowseSupportFragment() {
             }
         }
 
+        if (onBack != null) {
+            // Remote/phone Back goes up one level, like the dialog's Back button. Back
+            // cancels the dialog on every API level (incl. predictive back on 16+, where
+            // key listeners never see KEYCODE_BACK); the buttons dismiss(), not cancel().
+            dialog.setCanceledOnTouchOutside(false)
+            dialog.setOnCancelListener { onBack() }
+        }
+
         dialog.show()
     }
 
@@ -1137,18 +1151,27 @@ class MainFragment : BrowseSupportFragment() {
                             android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                             android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
                         )
+                        // (uri, isDir, name) — collected first so the folder is walked in
+                        // file-name order; the provider's cursor order is unspecified.
+                        val children = mutableListOf<Triple<Uri, Boolean, String>>()
                         context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
                             val idCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                             val nameCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                             val mimeCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE)
                             while (cursor.moveToNext()) {
                                 val childId = cursor.getString(idCol)
-                                val childName = cursor.getString(nameCol)
+                                val childName = cursor.getString(nameCol) ?: continue
                                 val childMime = cursor.getString(mimeCol)
                                 val childUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
-                                scanRecursive(childUri, childMime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR, childName)
+                                children.add(Triple(childUri, childMime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR, childName))
                             }
                         }
+                        val (dirs, files) = NaturalOrder.sortChildren(children, { it.second }, { it.third })
+                            .partition { it.second }
+                        val folderStart = itemsToAdd.size
+                        files.forEach { (childUri, _, childName) -> scanRecursive(childUri, false, childName) }
+                        if (files.none { NaturalOrder.isListFile(it.third) }) NaturalOrder.applyTagOrder(itemsToAdd, folderStart)
+                        dirs.forEach { (childUri, _, childName) -> scanRecursive(childUri, true, childName) }
                     } catch (e: Exception) {
                         // Fallback if buildChildDocumentsUriUsingTree fails (might not be a tree URI)
                         if (isPlayable(displayName)) {
@@ -1187,7 +1210,7 @@ class MainFragment : BrowseSupportFragment() {
                         }
                     } else {
                         val meta = MetadataUtils.getMetadata(context, uri)
-                        itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
+                        itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString(), trackNumber = meta.trackNumber, discNumber = meta.discNumber))
                     }
                 }
             }
@@ -1232,13 +1255,12 @@ class MainFragment : BrowseSupportFragment() {
 
             activity?.runOnUiThread {
                 if (itemsToAdd.isNotEmpty()) {
-                    val sortedItems = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) {
-                        itemsToAdd
-                    } else {
-                        // Sort items by track number extracted from title, then by title
-                        itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
-                    }
-                    
+                    // Already in play order: folders are walked in natural file-name order,
+                    // and playlist / CUE / ISO entries keep their own order. Re-sorting by
+                    // title here put tagged tracks ("There is More to this World", no
+                    // number) in alphabetical order instead of track order.
+                    val sortedItems = itemsToAdd
+
                     if (replace) {
                         controller.setMediaItems(sortedItems)
                         controller.prepare()
@@ -1306,15 +1328,17 @@ class MainFragment : BrowseSupportFragment() {
             try {
                 val mainActivity = activity as? MainActivity
                 val itemsToAdd = mutableListOf<MediaItem>()
-                val isPlaylistFile = !file.isDirectory() && isPlayable(file.name) &&
-                    (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue"))
                 
                 // Ensure we use a context with credentials if needed for recursion
                 val credentialContext = SmbContext.getContextForUri(file.path)
 
                 fun scanRecursive(f: SmbFile) {
                     if (f.isDirectory()) {
-                        f.listFiles()?.forEach { scanRecursive(it) }
+                        // jcifs directory names end in '/', which avoids a round trip per child
+                        f.listFiles()?.let { kids ->
+                            NaturalOrder.sortChildren(kids.asList(), { it.name.endsWith("/") }, { it.name })
+                                .forEach { scanRecursive(it) }
+                        }
                     } else if (isPlayable(f.name)) {
                         val lower = f.name.lowercase()
                         if (lower.endsWith(".iso")) {
@@ -1371,13 +1395,9 @@ class MainFragment : BrowseSupportFragment() {
                     if (activity?.isFinishing == true) return@runOnUiThread
                     loadingToast.cancel()
                     if (itemsToAdd.isNotEmpty()) {
-                        val sortedItems = if (isPlaylistFile) {
-                            itemsToAdd
-                        } else {
-                            // Sort items by track number extracted from title, then by title
-                            itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
-                        }
-                        
+                        // Already in play order (natural file-name walk; playlist/CUE/ISO order kept)
+                        val sortedItems = itemsToAdd
+
                         val controller = mainActivity?.getController()
                         if (controller != null) {
                             if (replace) {
@@ -1590,7 +1610,9 @@ class MainFragment : BrowseSupportFragment() {
                     
                     val onBack: () -> Unit = {
                         val parent = currentDir.parentFile
-                        if (parent != null && parent.absolutePath != "/storage" && parent.absolutePath != "/") {
+                        val internalRoot = android.os.Environment.getExternalStorageDirectory().absolutePath
+                        if (parent != null && currentDir.absolutePath != internalRoot &&
+                            parent.absolutePath != "/storage" && parent.absolutePath != "/") {
                             browseFileStorage(parent.absolutePath, isSelectionMode)
                         }
                     }
@@ -1679,6 +1701,14 @@ class MainFragment : BrowseSupportFragment() {
             dialog.dismiss()
         }
 
+        if (onBack != null) {
+            // Remote/phone Back goes up one level, like the dialog's Back button. Back
+            // cancels the dialog on every API level (incl. predictive back on 16+, where
+            // key listeners never see KEYCODE_BACK); the buttons dismiss(), not cancel().
+            dialog.setCanceledOnTouchOutside(false)
+            dialog.setOnCancelListener { onBack() }
+        }
+
         dialog.show()
     }
 
@@ -1745,12 +1775,17 @@ class MainFragment : BrowseSupportFragment() {
 
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
-            val isPlaylistFile = !root.isDirectory && isPlayable(root.name) &&
-                (root.name.lowercase().endsWith(".m3u") || root.name.lowercase().endsWith(".m3u8") || root.name.lowercase().endsWith(".pls") || root.name.lowercase().endsWith(".cue"))
             
             fun scanRecursive(file: java.io.File) {
                 if (file.isDirectory) {
-                    file.listFiles()?.forEach { scanRecursive(it) }
+                    file.listFiles()?.let { kids ->
+                        val (dirs, files) = NaturalOrder.sortChildren(kids.asList(), { it.isDirectory }, { it.name })
+                            .partition { it.isDirectory }
+                        val folderStart = itemsToAdd.size
+                        files.forEach { scanRecursive(it) }
+                        if (files.none { NaturalOrder.isListFile(it.name) }) NaturalOrder.applyTagOrder(itemsToAdd, folderStart)
+                        dirs.forEach { scanRecursive(it) }
+                    }
                 } else if (isPlayable(file.name)) {
                     val lower = file.name.lowercase()
                     if (lower.endsWith(".iso")) {
@@ -1818,7 +1853,7 @@ class MainFragment : BrowseSupportFragment() {
                     } else {
                         val uri = Uri.fromFile(file)
                         val meta = MetadataUtils.getMetadata(context, uri)
-                        itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
+                        itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString(), trackNumber = meta.trackNumber, discNumber = meta.discNumber))
                     }
                 }
             }
@@ -1828,12 +1863,9 @@ class MainFragment : BrowseSupportFragment() {
             activity?.runOnUiThread {
                 loadingToast.cancel()
                 if (itemsToAdd.isNotEmpty()) {
-                    val sortedItems = if (isPlaylistFile) {
-                        itemsToAdd
-                    } else {
-                        itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
-                    }
-                    
+                    // Already in play order (natural file-name walk; playlist/CUE/ISO order kept)
+                    val sortedItems = itemsToAdd
+
                     if (replace) {
                         controller.setMediaItems(sortedItems)
                         controller.prepare()
@@ -1855,13 +1887,6 @@ class MainFragment : BrowseSupportFragment() {
     private fun isPlayable(filename: String): Boolean {
         val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso", ".dsf", ".dff", ".wv")
         return extensions.any { filename.lowercase().endsWith(it) }
-    }
-
-    private fun extractTrackNumber(title: String): Int {
-        val cleanTitle = title.trim()
-        val regex = Regex("^(\\d+)")
-        val match = regex.find(cleanTitle)
-        return match?.value?.toInt() ?: Int.MAX_VALUE
     }
 
     private fun hasPlayableContent(context: Context, treeUri: Uri, docId: String): Boolean {

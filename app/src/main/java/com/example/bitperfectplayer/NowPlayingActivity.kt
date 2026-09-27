@@ -939,7 +939,13 @@ class NowPlayingActivity : BaseActivity() {
                     val br = android.widget.LinearLayout(this).apply { orientation=android.widget.LinearLayout.HORIZONTAL; gravity=android.view.Gravity.CENTER; layoutParams=android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT) }
                     val dlg = android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle(title).setView(dv).create()
                     fun btn(lbl: String, cb: () -> Unit) = android.widget.Button(this).apply { text=lbl; setOnClickListener { cb(); dlg.dismiss() }; layoutParams=android.widget.LinearLayout.LayoutParams(0,android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,1f); isFocusable=true }
-                    br.addView(btn("Back") { val p=dir.parentFile; val root=android.os.Environment.getExternalStorageDirectory().parent; if (p!=null && p.absolutePath!=root) browseFileStorage(p.absolutePath, isSelectionMode, isDirectoryMode) })
+                    // Up one folder; at a storage root (internal storage or a USB drive), just close
+                    fun goUp() { val p=dir.parentFile; val internal=android.os.Environment.getExternalStorageDirectory().absolutePath; if (p!=null && dir.absolutePath!=internal && p.absolutePath!="/storage" && p.absolutePath!="/" && p.absolutePath!=java.io.File(internal).parent) browseFileStorage(p.absolutePath, isSelectionMode, isDirectoryMode) }
+                    br.addView(btn("Back") { goUp() })
+                    // Remote Back = the Back button. Back cancels the dialog on every API level
+                    // (incl. predictive back); the buttons and list clicks dismiss(), not cancel().
+                    dlg.setCanceledOnTouchOutside(false)
+                    dlg.setOnCancelListener { goUp() }
                     if (isDirectoryMode) br.addView(btn("Add Folder") { addFilesToPlaylist(dir, false) })
                     else { br.addView(btn("Add All") { addFilesToPlaylist(dir, false) }); br.addView(btn("Replace All") { addFilesToPlaylist(dir, true) }) }
                     dv.addView(br)
@@ -962,9 +968,17 @@ class NowPlayingActivity : BaseActivity() {
         val toast = Toast.makeText(this, "Processing files…", Toast.LENGTH_SHORT); toast.show()
         Thread {
             val items = mutableListOf<MediaItem>()
-            val isPl = !root.isDirectory && isPlayable(root.name) && root.name.lowercase().run { endsWith(".m3u")||endsWith(".m3u8")||endsWith(".pls")||endsWith(".cue") }
             fun scan(f: java.io.File) {
-                if (f.isDirectory) { f.listFiles()?.forEach { scan(it) }; return }
+                if (f.isDirectory) {
+                    f.listFiles()?.let { k ->
+                        val (dirs, files) = NaturalOrder.sortChildren(k.asList(), { it.isDirectory }, { it.name }).partition { it.isDirectory }
+                        val folderStart = items.size
+                        files.forEach { scan(it) }
+                        if (files.none { NaturalOrder.isListFile(it.name) }) NaturalOrder.applyTagOrder(items, folderStart)
+                        dirs.forEach { scan(it) }
+                    }
+                    return
+                }
                 if (!isPlayable(f.name)) return
                 val lo = f.name.lowercase(); val fu = android.net.Uri.fromFile(f)
                 when {
@@ -979,7 +993,7 @@ class NowPlayingActivity : BaseActivity() {
             runOnUiThread {
                 toast.cancel()
                 if (items.isEmpty()) { Toast.makeText(this, "No music found.", Toast.LENGTH_SHORT).show(); return@runOnUiThread }
-                val sorted = if (isPl) items else items.sortedBy { it.mediaMetadata.title?.toString()?.lowercase() }
+                val sorted = items   // already in play order: natural file-name walk, playlist/CUE/ISO order kept
                 if (replace) controller.setMediaItems(sorted) else controller.addMediaItems(sorted)
                 controller.prepare(); controller.play()
                 Toast.makeText(this, "Added ${sorted.size} items", Toast.LENGTH_SHORT).show(); updateUI()
@@ -1072,6 +1086,8 @@ class NowPlayingActivity : BaseActivity() {
                     .setTitle(meta.title ?: f.name.substringBeforeLast("."))
                     .setArtist(meta.artist ?: "")
                     .setAlbumTitle(meta.album ?: "")
+                    .setTrackNumber(meta.trackNumber)
+                    .setDiscNumber(meta.discNumber)
                     .build()
             )
             .build()
