@@ -7,10 +7,12 @@ import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.common.util.Util
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
+import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaExtractor
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -63,17 +65,39 @@ class SacdMediaSourceFactory(
         // local configuration for sources created via the session, so gate on
         // the machine-readable mediaId alone.
         val info = SacdSupport.parseTrackInfo(mediaItem.mediaId)
-        if (info != null) return createSacdSource(info, mediaItem)
+        if (info != null) return maybeClip(mediaItem, createSacdSource(info, mediaItem))
 
         val dsf = dataSourceFactory
         val uri = mediaItem.localConfiguration?.uri?.toString() ?: mediaItem.mediaId
         if (dsf != null && (DsdFileExtractor.isDsdFileUri(uri) || isDsdContentUri(uri))) {
-            return createDsdFileSource(mediaItem, dsf)
+            return maybeClip(mediaItem, createDsdFileSource(mediaItem, dsf))
         }
         if (dsf != null && (WavPackExtractor.isWavPackUri(uri) || isWavPackContentUri(uri))) {
             return createWavPackSource(mediaItem, uri)
         }
+        // DefaultMediaSourceFactory applies the item's ClippingConfiguration itself.
         return delegate.createMediaSource(mediaItem)
+    }
+
+    /**
+     * ProgressiveMediaSource.Factory ignores [MediaItem.clippingConfiguration];
+     * only DefaultMediaSourceFactory wraps sources in a [ClippingMediaSource].
+     * Sources built here must do it themselves, or a CUE track over a .wv/.dsf/.dff
+     * file plays the whole file instead of its slice. Same arguments as Media3
+     * 1.5.1's DefaultMediaSourceFactory.maybeClipMediaSource. Both extractors expose
+     * a seekable SeekMap, which ClippingMediaSource requires for a non-zero start.
+     */
+    private fun maybeClip(mediaItem: MediaItem, source: MediaSource): MediaSource {
+        val c = mediaItem.clippingConfiguration
+        if (c == MediaItem.ClippingConfiguration.UNSET) return source
+        return ClippingMediaSource(
+            source,
+            Util.msToUs(c.startPositionMs),
+            Util.msToUs(c.endPositionMs),
+            /* enableInitialDiscontinuity= */ !c.startsAtKeyFrame,
+            /* allowDynamicClippingUpdates= */ c.relativeToLiveWindow,
+            /* relativeToDefaultPosition= */ c.relativeToDefaultPosition,
+        )
     }
 
     /**
@@ -125,7 +149,7 @@ class SacdMediaSourceFactory(
             extractors
         )
         loadErrorHandlingPolicy?.let { factory.setLoadErrorHandlingPolicy(it) }
-        return factory.createMediaSource(mediaItem)
+        return maybeClip(mediaItem, factory.createMediaSource(mediaItem))
     }
 
     private fun createSacdSource(info: SacdSupport.TrackInfo, mediaItem: MediaItem): MediaSource {

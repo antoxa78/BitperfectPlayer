@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.1.0-beta9 - 2026-10-01
+
+### Fixed
+
+- **CUE sheets with several `FILE` lines played the wrong audio:** the parser kept only the last `FILE`, so on sheets with one file per track, multi-disc sheets, or EAC "gaps appended" layouts every track pointed at the last file. Each track is now tied to the file that was current at its `INDEX 01` (EAC puts a track's `INDEX 00` in the previous file), and a track that is the last in its file plays to the end of that file instead of being cut at the next file's `00:00:00`. Windows path separators in `FILE` (`CD1\disc.ape`) are normalised.
+- **Non-UTF-8 CUE sheets showed garbled titles and failed to find their audio file:** sheets were always read as UTF-8, so the windows-1251/1252 (and Shift_JIS, windows-1255, ...) text common in older rips turned into replacement characters, including in the `FILE` name. Text is now decoded from its BOM (UTF-8/UTF-16), as BOM-less UTF-16, as strict UTF-8, and otherwise as a windows-1251 / windows-1252 code page, chosen from how the high bytes fall in the text.
+- **CUE parsing was fragile:** `TRACK  01` (two spaces) became track 0, unquoted `TITLE`/`FILE` values were mangled, a malformed `INDEX` time dropped the whole sheet on the Now Playing screen, and data tracks (`TRACK 02 MODE1/2352`) were mapped onto the audio file. Each of these is now handled per line; a track with no `INDEX 01` uses its first `INDEX`.
+- **CUE tracks over WavPack/DSF/DFF files played the whole file:** clipping is applied by `DefaultMediaSourceFactory`, which those formats bypass. `SacdMediaSourceFactory` now wraps its WavPack, DSD-file and SACD sources in a `ClippingMediaSource` when the item is clipped.
+
+### Changed
+
+- **One CUE parser:** the Now Playing screen and the MPD server had their own copies that had drifted (MPD dropped artist and album). All three callers now use `PlaylistParser.parseCueFromStream`, with parsing and decoding in the Android-free `CueSheet` (unit tested in `CueSheetTest`). CUE tracks also carry their track number and album artist. `mimeTypeFor` is shared too and now covers `.wv`, `.dsf` and `.dff`.
+
 ## 3.1.0-beta8 - 2026-09-27
 
 ### Fixed

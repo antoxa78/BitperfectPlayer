@@ -1839,18 +1839,7 @@ class MpdServer(private val context: Context) {
         MediaItem.Builder().setMediaId(uri).setUri(uri).setMimeType(mimeFor(uri))
             .setMediaMetadata(MediaMetadata.Builder().setTitle(uri.substringAfterLast('/')).build()).build()
 
-    private fun mimeFor(uri: String): String? {
-        val l = uri.lowercase()
-        return when {
-            l.endsWith(".flac") -> MimeTypes.AUDIO_FLAC
-            l.endsWith(".mp3") -> MimeTypes.AUDIO_MPEG
-            l.endsWith(".wav") -> MimeTypes.AUDIO_WAV
-            l.endsWith(".m4a") || l.endsWith(".aac") -> MimeTypes.AUDIO_AAC
-            l.endsWith(".ogg") -> MimeTypes.AUDIO_OGG
-            l.endsWith(".ape") -> "audio/x-ape"
-            else -> null
-        }
-    }
+    private fun mimeFor(uri: String): String? = PlaylistParser.mimeTypeFor(uri)
 
     private fun mpdPath(mediaId: String): String = when {
         mediaId.startsWith("file://") -> Uri.decode(mediaId.removePrefix("file://"))
@@ -2064,44 +2053,10 @@ class MpdServer(private val context: Context) {
         return out
     }
 
-    private fun parseCueFile(f: File): List<MediaItem> {
-        // Minimal cue: expand to single file item with clipping per track if possible
-        // For MPD we flatten to one entry per track using same audio file with start/end
-        try {
-            var audioFile: String? = null
-            data class CueTrack(var title: String? = null, var startMs: Long = 0)
-            val tracks = mutableListOf<CueTrack>()
-            var cur: CueTrack? = null
-            FileInputStream(f).bufferedReader().use { br ->
-                for (raw in br.lineSequence()) {
-                    val line = raw.trim().removePrefix("\uFEFF")
-                    val up = line.uppercase()
-                    when {
-                        up.startsWith("FILE") -> audioFile = line.substringAfter('"').substringBeforeLast('"')
-                        up.startsWith("TRACK") -> { cur = CueTrack(); tracks.add(cur) }
-                        up.startsWith("TITLE") && cur != null -> cur.title = line.substringAfter('"').substringBeforeLast('"')
-                        up.startsWith("INDEX 01") && cur != null -> {
-                            val t = line.substringAfter("INDEX 01").trim()
-                            val parts = t.split(":")
-                            if (parts.size == 3) {
-                                val m = parts[0].toLongOrNull() ?: 0; val s = parts[1].toLongOrNull() ?: 0; val fr = parts[2].toLongOrNull() ?: 0
-                                cur.startMs = m * 60 * 1000 + s * 1000 + fr * 1000 / 75
-                            }
-                        }
-                    }
-                }
-            }
-            if (audioFile != null && tracks.isNotEmpty()) {
-                val audioPath = if (audioFile.startsWith("/") || audioFile.contains("://")) audioFile else File(f.parentFile, audioFile).absolutePath
-                val audioUri = Uri.fromFile(File(audioPath)).toString()
-                return tracks.mapIndexed { idx, tr ->
-                    val next = tracks.getOrNull(idx + 1)?.startMs ?: C.TIME_UNSET
-                    MediaItem.Builder().setMediaId("${audioUri}_${idx + 1}").setUri(audioUri).setMimeType(mimeFor(audioUri))
-                        .setMediaMetadata(MediaMetadata.Builder().setTitle(tr.title ?: "Track ${idx + 1}").build())
-                        .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder().setStartPositionMs(tr.startMs).apply { if (next != C.TIME_UNSET) setEndPositionMs(next) }.build()).build()
-                }
-            }
-        } catch (_: Exception) {}
-        return emptyList()
+    /** One clipped item per CUE track, via the parser shared with the TV UI. */
+    private fun parseCueFile(f: File): List<MediaItem> = try {
+        FileInputStream(f).use { PlaylistParser.parseCueFromStream(it, f.parentFile?.absolutePath) }
+    } catch (e: Exception) {
+        Log.w(TAG, "cue read failed: ${f.path}", e); emptyList()
     }
 }

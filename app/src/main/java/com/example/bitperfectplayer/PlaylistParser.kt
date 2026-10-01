@@ -3,7 +3,6 @@ package com.example.bitperfectplayer
 import android.net.Uri
 import android.util.Log
 import androidx.core.net.toUri
-import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
@@ -140,85 +139,68 @@ object PlaylistParser {
         return items
     }
 
+    /** CUE sheets are a few KB; anything far larger is not a CUE sheet. */
+    private const val MAX_CUE_BYTES = 1 shl 20
+
+    /**
+     * Expands a CUE sheet into one clipped [MediaItem] per audio track.
+     * Parsing and text decoding live in [CueSheet]; this resolves each track's
+     * FILE against [basePath] (local dir, SAF document URI or smb:// dir) and
+     * builds the items. Tracks of sheets with several FILE lines point at their
+     * own file; a track whose file cannot be resolved is skipped.
+     */
     fun parseCueFromStream(inputStream: InputStream, basePath: String?): List<MediaItem> {
         val items = mutableListOf<MediaItem>()
         try {
-            val reader = BufferedReader(InputStreamReader(inputStream))
-            var line: String?
-            var currentFile: String? = null
-            var albumTitle: String? = null
-            var albumArtist: String? = null
-
-            data class CueTrack(val number: Int, var title: String? = null, var artist: String? = null, var startTimeMs: Long = 0)
-            val tracks = mutableListOf<CueTrack>()
-            var currentTrack: CueTrack? = null
-
-            while (reader.readLine().also { line = it } != null) {
-                val trimmed = line?.trim()?.removePrefix("\uFEFF") ?: continue
-                val upper = trimmed.uppercase()
-
-                when {
-                    upper.startsWith("FILE") -> {
-                        currentFile = trimmed.substringAfter("\"").substringBeforeLast("\"")
-                    }
-                    upper.startsWith("TITLE") && currentTrack == null -> {
-                        albumTitle = trimmed.substringAfter("\"").substringBeforeLast("\"")
-                    }
-                    upper.startsWith("PERFORMER") && currentTrack == null -> {
-                        albumArtist = trimmed.substringAfter("\"").substringBeforeLast("\"")
-                    }
-                    upper.startsWith("TRACK") -> {
-                        val num = trimmed.split(" ")[1].toIntOrNull() ?: 0
-                        currentTrack = CueTrack(num)
-                        tracks.add(currentTrack)
-                    }
-                    upper.startsWith("TITLE") && currentTrack != null -> {
-                        currentTrack.title = trimmed.substringAfter("\"").substringBeforeLast("\"")
-                    }
-                    upper.startsWith("PERFORMER") && currentTrack != null -> {
-                        currentTrack.artist = trimmed.substringAfter("\"").substringBeforeLast("\"")
-                    }
-                    upper.startsWith("INDEX 01") && currentTrack != null -> {
-                        val timeStr = trimmed.substringAfter("INDEX 01").trim()
-                        currentTrack.startTimeMs = parseCueTime(timeStr)
-                    }
-                }
+            val bytes = readCapped(inputStream, MAX_CUE_BYTES)
+            if (bytes == null) {
+                Log.w("PlaylistParser", "cue skipped: larger than $MAX_CUE_BYTES bytes")
+                return items
             }
+            val sheet = CueSheet.parse(CueSheet.decode(bytes))
+            val resolved = HashMap<String, Uri?>()
 
-            if (currentFile != null && tracks.isNotEmpty()) {
-                val audioUriString = resolveRelativePath(currentFile, basePath)
-                val audioUri = parseEntryUri(audioUriString, basePath)
+            for (track in sheet.tracks) {
+                val audioUri = resolved.getOrPut(track.file) {
+                    parseEntryUri(resolveRelativePath(track.file, basePath), basePath)
+                } ?: continue
 
-                if (audioUri != null) {
-                    for (i in tracks.indices) {
-                        val track = tracks[i]
-                        val nextTrackStart = if (i + 1 < tracks.size) tracks[i+1].startTimeMs else C.TIME_UNSET
+                val meta = MediaMetadata.Builder()
+                    .setTitle(track.title ?: "Track ${track.number}")
+                    .setArtist(track.performer ?: sheet.performer ?: "Unknown Artist")
+                    .setAlbumTitle(sheet.title ?: "Unknown Album")
+                    .setTrackNumber(track.number)
+                sheet.performer?.let { meta.setAlbumArtist(it) }
 
-                        val metaBuilder = MediaMetadata.Builder()
-                            .setTitle(track.title ?: "Track ${track.number}")
-                            .setArtist(track.artist ?: albumArtist ?: "Unknown Artist")
-                            .setAlbumTitle(albumTitle ?: "Unknown Album")
+                val clipping = MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(track.startMs)
+                track.endMs?.let { clipping.setEndPositionMs(it) }
 
-                        val clippingBuilder = MediaItem.ClippingConfiguration.Builder()
-                            .setStartPositionMs(track.startTimeMs)
-                        if (nextTrackStart != C.TIME_UNSET) {
-                            clippingBuilder.setEndPositionMs(nextTrackStart)
-                        }
-
-                        items.add(
-                            MediaItem.Builder()
-                                .setMediaId("${audioUri}_${track.number}")
-                                .setUri(audioUri)
-                                .setMimeType(mimeTypeFor(audioUri.toString()))
-                                .setMediaMetadata(metaBuilder.build())
-                                .setClippingConfiguration(clippingBuilder.build())
-                                .build()
-                        )
-                    }
-                }
+                items.add(
+                    MediaItem.Builder()
+                        .setMediaId("${audioUri}_${track.number}")
+                        .setUri(audioUri)
+                        .setMimeType(mimeTypeFor(audioUri.toString()))
+                        .setMediaMetadata(meta.build())
+                        .setClippingConfiguration(clipping.build())
+                        .build()
+                )
             }
         } catch (e: Exception) { Log.w("PlaylistParser", "cue parse failed", e) }
         return items
+    }
+
+    /** Reads at most [limit] bytes; null if the stream is longer than that. */
+    private fun readCapped(input: InputStream, limit: Int): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+            if (out.size() > limit) return null
+        }
+        return out.toByteArray()
     }
 
     /**
@@ -261,17 +243,12 @@ object PlaylistParser {
             lower.endsWith(".m4a") || lower.endsWith(".aac") -> MimeTypes.AUDIO_AAC
             lower.endsWith(".ogg")                -> MimeTypes.AUDIO_OGG
             lower.endsWith(".ape")                -> "audio/x-ape"
+            // Not used for routing (SacdMediaSourceFactory picks the WavPack/DSD
+            // extractors by file name), but keeps every item's MIME type set.
+            lower.endsWith(".wv") || lower.endsWith(".wvp") -> "audio/x-wavpack"
+            lower.endsWith(".dsf")                -> "audio/x-dsf"
+            lower.endsWith(".dff")                -> "audio/x-dff"
             else                                  -> null
         }
-    }
-
-    private fun parseCueTime(timeStr: String): Long {
-        // MM:SS:FF where FF is frames (1/75th of a second)
-        val parts = timeStr.split(":")
-        if (parts.size != 3) return 0
-        val m = parts[0].toLongOrNull() ?: 0
-        val s = parts[1].toLongOrNull() ?: 0
-        val f = parts[2].toLongOrNull() ?: 0
-        return (m * 60 * 1000) + (s * 1000) + (f * 1000 / 75)
     }
 }

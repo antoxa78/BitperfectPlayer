@@ -24,7 +24,6 @@ import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
@@ -984,7 +983,7 @@ class NowPlayingActivity : BaseActivity() {
                 when {
                     lo.endsWith(".iso") -> { try { val a = LocalSacdRandomAccess(f); val r = SacdSupport.buildTrackMediaItems(a, SacdSupport.AREA_STEREO, null, fu.toString()); a.close(); r.onSuccess { android.util.Log.i("SacdAdd", "local iso ${f.path} -> ${it.size} items") }; r.onFailure { android.util.Log.w("SacdAdd", "local iso ${f.path} failed", it) }; items.addAll(r.getOrDefault(emptyList())) } catch (e: Exception) { android.util.Log.w("SacdAdd", "local iso ${f.path} threw", e); e.printStackTrace() } }
                     lo.endsWith(".m3u")||lo.endsWith(".m3u8") -> { val p = try { java.io.FileInputStream(f).use { parseM3uLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
-                    lo.endsWith(".cue") -> { val p = try { java.io.FileInputStream(f).use { parseCueLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
+                    lo.endsWith(".cue") -> { val p = try { java.io.FileInputStream(f).use { PlaylistParser.parseCueFromStream(it, f.parent) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
                     lo.endsWith(".pls") -> { val p = try { java.io.FileInputStream(f).use { parsePlsLocal(it, fu) } } catch (e: Exception) { emptyList() }; if (p.isNotEmpty()) items.addAll(p) else items.add(buildMediaItem(f, fu)) }
                     else -> items.add(buildMediaItem(f, fu))
                 }
@@ -1022,44 +1021,6 @@ class NowPlayingActivity : BaseActivity() {
         } catch (e: Exception) { e.printStackTrace() }; return items
     }
 
-    private fun parseCueLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> {
-        val items = mutableListOf<MediaItem>()
-        val bp = base?.toString()?.substringBeforeLast("/")
-        try {
-            val r = java.io.BufferedReader(java.io.InputStreamReader(s))
-            var line: String?; var curFile: String? = null; var albT: String? = null; var albA: String? = null
-            class Trk(val num: Int, var t: String? = null, var a: String? = null, var start: Long = 0)
-            val trks = mutableListOf<Trk>(); var curTrk: Trk? = null
-            while (r.readLine().also { line = it } != null) {
-                val t = line?.trim()?.removePrefix("\uFEFF") ?: continue; val u = t.uppercase()
-                when {
-                    u.startsWith("FILE") -> curFile = t.substringAfter("\"").substringBeforeLast("\"")
-                    u.startsWith("TITLE") && curTrk == null -> albT = t.substringAfter("\"").substringBeforeLast("\"")
-                    u.startsWith("PERFORMER") && curTrk == null -> albA = t.substringAfter("\"").substringBeforeLast("\"")
-                    u.startsWith("TRACK") -> { curTrk = Trk(t.split(" ")[1].toIntOrNull() ?: 0); trks.add(curTrk) }
-                    u.startsWith("TITLE") && curTrk != null -> curTrk.t = t.substringAfter("\"").substringBeforeLast("\"")
-                    u.startsWith("PERFORMER") && curTrk != null -> curTrk.a = t.substringAfter("\"").substringBeforeLast("\"")
-                    u.startsWith("INDEX 01") && curTrk != null -> {
-                        val ts = t.substringAfter("INDEX 01").trim().split(":")
-                        if (ts.size == 3) curTrk.start = (ts[0].toLong() * 60000) + (ts[1].toLong() * 1000) + (ts[2].toLong() * 1000 / 75)
-                    }
-                }
-            }
-            if (curFile != null && trks.isNotEmpty()) {
-                val au = resolvePlaylistEntry(curFile, bp)
-                if (au != null) {
-                    for (i in trks.indices) {
-                        val trk = trks[i]; val next = if (i + 1 < trks.size) trks[i+1].start else C.TIME_UNSET
-                        val m = MediaMetadata.Builder().setTitle(trk.t ?: "Track ${trk.num}").setArtist(trk.a ?: albA ?: "Unknown Artist").setAlbumTitle(albT ?: "Unknown Album")
-                        val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(trk.start)
-                        if (next != C.TIME_UNSET) clip.setEndPositionMs(next)
-                        items.add(MediaItem.Builder().setMediaId("${au}_${trk.num}").setUri(au).setMimeType(mimeTypeFor(au.toString())).setMediaMetadata(m.build()).setClippingConfiguration(clip.build()).build())
-                    }
-                }
-            }
-        } catch (e: Exception) { e.printStackTrace() }; return items
-    }
-
     private fun resolvePlaylistEntry(path: String, base: String?): Uri? {
         var r = path; if (base!=null && !path.contains("://") && !path.startsWith("/")) r = if (base.endsWith("/")) "$base$path" else "$base/$path"
         return try { when { r.startsWith("/") -> Uri.fromFile(java.io.File(r)); r.startsWith("file://") -> Uri.fromFile(java.io.File(r.substring(7))); r.startsWith("content://")||r.startsWith("http://")||r.startsWith("https://")||r.startsWith("smb://") -> r.toUri(); else -> null } } catch (e: Exception) { null }
@@ -1093,18 +1054,7 @@ class NowPlayingActivity : BaseActivity() {
             .build()
     }
 
-    private fun mimeTypeFor(uriString: String): String? {
-        val lo = uriString.lowercase()
-        return when {
-            lo.endsWith(".flac") -> MimeTypes.AUDIO_FLAC
-            lo.endsWith(".mp3") -> MimeTypes.AUDIO_MPEG
-            lo.endsWith(".wav") -> MimeTypes.AUDIO_WAV
-            lo.endsWith(".m4a")||lo.endsWith(".aac") -> MimeTypes.AUDIO_AAC
-            lo.endsWith(".ogg") -> MimeTypes.AUDIO_OGG
-            lo.endsWith(".ape") -> "audio/x-ape"
-            else -> null
-        }
-    }
+    private fun mimeTypeFor(uriString: String): String? = PlaylistParser.mimeTypeFor(uriString)
 
     private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso",".wv").any { name.lowercase().endsWith(it) }
 
