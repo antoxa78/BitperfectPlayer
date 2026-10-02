@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.0-beta11 - 2026-10-02
+
+### Changed
+
+- **The x86 SSE2 code in the DST decoder is gone:** with the APK ARM-only, the SSE2 branches in `libdstdec` were dead weight on every shipped ABI rather than an optimisation on any of them. Removed the `emmintrin.h` include and its `_M_IX86`/`_M_X64`/`__i386__`/`__x86_64__` guard, the `_mm_malloc(…, 16)`/`_mm_free` allocator branch, the CPUID feature probe, and the `ebunch.SSE2` field it fed — that field was written in two places and read nowhere in the tree, so it went with the probe rather than being left as a member whose value no longer meant anything. `MemoryAllocate`/`MemoryFree` now use plain `malloc`/`free`, the path ARM already took; nothing depended on the 16-byte alignment `_mm_malloc` provided, since `dst_fram.c`'s aligned buffers are `__attribute__((aligned(16)))` stack arrays and `buffer_pool.c` does its own `_aligned_malloc`. Also corrected a comment in `unpack_dst.c` that justified a `memset` by pointing at "the SSE2 code"; the `memset` itself stays, as the scalar decoder does read the full prediction order. **No audible or measurable change** — the shipped `arm64-v8a` and `armeabi-v7a` libraries behave identically, and the APK is 4 bytes smaller than beta10's (14,853,747 vs 14,853,751), the difference being the removed `ebunch.SSE2` struct field shifting member offsets.
+
 ## 3.1.0-beta10 - 2026-10-02
 
 ### Fixed
@@ -9,7 +15,7 @@
 
 ### Changed
 
-- **The APK is now ARM-only:** native libraries are built for `arm64-v8a` and `armeabi-v7a` only, dropping `x86` and `x86_64` and taking about 1 MB off the download (15,851,173 → 14,853,751 bytes). Those two ABIs only ever served emulators; every real target, including the 32-bit Android TV boxes that the 2.9.1 `INSTALL_FAILED_NO_MATCHING_ABIS` fix was about, is ARM. The x86 SSE2 paths in the DST decoder are gone too — `D->SSE2` was written twice and never read by any code, so the CPUID probe and the `_mm_malloc`/`_mm_free` allocator branch were dead weight rather than an optimisation on any ABI still shipped. No decoding behaviour changes: the NEON paths in `dsd_conv.c` and `sacd_pcm.c` are `__aarch64__`/`__ARM_NEON`-guarded with a scalar fallback, which is what the x86 builds already used, and `MemoryAllocate`/`MemoryFree` now use plain `malloc`/`free` — the same path ARM already took, so the 16-byte alignment `_mm_malloc` provided is not depended on by anything. **The app will no longer install on an x86 emulator**; use an ARM system image or a physical device.
+- **The APK is now ARM-only:** native libraries are built for `arm64-v8a` and `armeabi-v7a` only, dropping `x86` and `x86_64` and taking about 1 MB off the download (15,851,173 → 14,853,751 bytes). Those two ABIs only ever served emulators; every real target, including the 32-bit Android TV boxes that the 2.9.1 `INSTALL_FAILED_NO_MATCHING_ABIS` fix was about, is ARM. No decoding behaviour changes — the NEON paths in `dsd_conv.c` and `sacd_pcm.c` are `__aarch64__`/`__ARM_NEON`-guarded with a scalar fallback, which is what the x86 builds already used. **The app will no longer install on an x86 emulator**; use an ARM system image or a physical device.
 
 ## 3.1.0-beta9 - 2026-10-01
 
