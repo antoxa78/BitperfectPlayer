@@ -34,10 +34,14 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // Include all common ABIs so the APK installs on any device (e.g. 32-bit
-            // armeabi-v7a Android TV boxes). The NEON fast path is aarch64-guarded;
-            // other ABIs fall back to the scalar decoder.
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            // ARM only. armeabi-v7a is here for 32-bit Android TV boxes (e.g. Xiaomi
+            // Mi TV), which is what the 2.9.1 INSTALL_FAILED_NO_MATCHING_ABIS fix was
+            // actually about. x86/x86_64 only ever served emulators, and they cost ~1 MB
+            // of APK and a full extra copy of every native lib for no real device.
+            // The NEON fast path in dsd_conv.c/sacd_pcm.c is aarch64- and
+            // __ARM_NEON-guarded, with a scalar fallback, so dropping the x86 ABIs
+            // leaves no unbuilt code path.
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
         }
     }
 

@@ -7,6 +7,10 @@
 - **Adding a stored `.pls` or `.cue` playlist over MPD added nothing:** `findPlaylist` matches all four playlist extensions, but `add` and `load` both handed whatever they found to the `.m3u` parser, so a PLS list or CUE sheet resolved to an empty queue. A single `parsePlaylistFile` entry point now dispatches on the extension, which is what the SMB path already did through `PlaylistParser.parsePlaylistStream`.
 - **MPD listed stored playlists wrongly:** the root listing's filter was `it.isFile && endsWith(".m3u") || endsWith(".m3u8")`, and `&&` binds tighter than `||` — so a *directory* named `something.m3u8` was reported as a playlist, while `.pls` and `.cue` were never reported as playlists at all. Both listings now use `PlaylistParser.isPlaylistName`, so a client sees the same set the rest of the app treats as playlists.
 
+### Changed
+
+- **The APK is now ARM-only:** native libraries are built for `arm64-v8a` and `armeabi-v7a` only, dropping `x86` and `x86_64` and taking about 1 MB off the download (15,851,173 → 14,853,751 bytes). Those two ABIs only ever served emulators; every real target, including the 32-bit Android TV boxes that the 2.9.1 `INSTALL_FAILED_NO_MATCHING_ABIS` fix was about, is ARM. No decoding behaviour changes — the NEON paths in `dsd_conv.c` and `sacd_pcm.c` are `__aarch64__`/`__ARM_NEON`-guarded with a scalar fallback, which is what the x86 builds already used, and the shipped `arm64-v8a` libraries are byte-identical to before. **The app will no longer install on an x86 emulator**; use an ARM system image or a physical device.
+
 ## 3.1.0-beta9 - 2026-10-01
 
 ### Fixed
