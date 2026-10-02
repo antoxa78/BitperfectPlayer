@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "speaker" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,12 C10.343,12,9,13.343,9,15 C9,16.657,10.343,18,12,18 C13.657,18,15,16.657,15,15 C15,13.343,13.657,12,12,12 M12,20 C9.239,20,7,17.761,7,15 C7,12.239,9.239,10,12,10 C14.761,10,17,12.239,17,15 C17,17.761,14.761,20,12,20 M12,4 C13.105,4,14,4.895,14,6 C14,7.105,13.105,8,12,8 C10.895,8,10,7.105,10,6 C10,4.89,10.89,4,12,4 M17,2 L7,2 C5.89,2,5,2.89,5,4 L5,20 C5,21.105,5.895,22,7,22 L17,22 C18.105,22,19,21.105,19,20 L19,4 C19,2.895,18.105,2,17,2" />
+</vector>

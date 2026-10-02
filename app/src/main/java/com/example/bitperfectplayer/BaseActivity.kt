@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -30,8 +31,45 @@ abstract class BaseActivity : FragmentActivity() {
     protected val screensaverRunnable = Runnable { showScreensaver() }
     protected var isScreensaverActive  = false
 
+    // Bounce animation handler kept as a field so it can be cancelled when the
+    // screensaver is hidden or the activity is destroyed (BUG-15).
+    private val bounceHandler = Handler(Looper.getMainLooper())
+
+    // Keep the TV box out of standby while music plays. On Android TV the
+    // playback service's PARTIAL_WAKE_LOCK does not stop the normal inactivity
+    // timeout (system screensaver → "Put device to sleep") — only a visible
+    // window with FLAG_KEEP_SCREEN_ON (or a screen-level wake lock) does. The
+    // flag is set only while PlaybackService reports active playback; the
+    // app's own screensaver overlay still blanks the panel against burn-in.
+    // (Android TV's separate inattentive-sleep timer ignores this flag — the
+    // service handles that one itself, see PlaybackService.suppressAttentiveSleep.)
+    private val keepAwakeListener: (Boolean) -> Unit = { awake -> applyKeepScreenOn(awake) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        PlaybackService.addKeepAwakeListener(keepAwakeListener)
+    }
+
+    override fun onStop() {
+        PlaybackService.removeKeepAwakeListener(keepAwakeListener)
+        super.onStop()
+    }
+
+    private fun applyKeepScreenOn(on: Boolean) {
+        if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    override fun onDestroy() {
+        // Stop the bounce animation and screensaver timer so the handlers do not
+        // fire on a dead window after the activity is torn down (BUG-16).
+        hideScreensaver()
+        screensaverHandler.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 
     override fun onUserInteraction() {
@@ -101,8 +139,9 @@ abstract class BaseActivity : FragmentActivity() {
 
         onScreensaverCreated(container)
 
-        // Bouncing animation
-        val bounceHandler = Handler(Looper.getMainLooper())
+        // Bouncing animation — uses the class-level bounceHandler so it can be
+        // cancelled by hideScreensaver() / onDestroy() (BUG-15).
+        bounceHandler.removeCallbacksAndMessages(null)
         bounceHandler.post(object : Runnable {
             private var dx = BOUNCE_STEP_PX
             private var dy = BOUNCE_STEP_PX
@@ -131,6 +170,7 @@ abstract class BaseActivity : FragmentActivity() {
 
     protected fun hideScreensaver() {
         isScreensaverActive = false
+        bounceHandler.removeCallbacksAndMessages(null)   // stop the bounce loop (BUG-15)
         window.decorView.findViewWithTag<View>(SCREENSAVER_TAG)?.let { overlay ->
             (overlay.parent as? ViewGroup)?.removeView(overlay)
         }

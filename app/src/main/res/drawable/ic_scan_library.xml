@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "folder-sync" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M10,4 L12,6 L20,6 C21.105,6,22,6.895,22,8 L22,11.5 C21.23,11.18,20.39,11,19.5,11 C15.91,11,13,13.91,13,17.5 C13,18.39,13.18,19.23,13.5,20 L4,20 C2.895,20,2,19.105,2,18 L2,6 C2,4.89,2.89,4,4,4 Z M19,12 L19,13.5 C21.209,13.5,23,15.291,23,17.5 C23,18.32,22.75,19.08,22.33,19.71 L21.24,18.62 C21.41,18.28,21.5,17.9,21.5,17.5 C21.5,16.119,20.381,15,19,15 L19,16.5 L16.75,14.25 Z M19,23 L19,21.5 C16.791,21.5,15,19.709,15,17.5 C15,16.68,15.25,15.92,15.67,15.29 L16.76,16.38 C16.59,16.72,16.5,17.1,16.5,17.5 C16.5,18.881,17.619,20,19,20 L19,18.5 L21.25,20.75 Z" />
+</vector>

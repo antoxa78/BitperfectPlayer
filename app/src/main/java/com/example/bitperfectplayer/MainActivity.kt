@@ -6,21 +6,22 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ImageSpan
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
-import com.google.common.util.concurrent.MoreExecutors
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 class MainActivity : BaseActivity() {
 
@@ -45,21 +46,28 @@ class MainActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
-        // Write defaults on first run only
+        // Write defaults before the UI is created so the fragment reads the
+        // correct initial values (e.g., resume_playback defaults to true).
         val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)
         if (!prefs.contains("screensaver_delay")) {
-            prefs.edit()
-                .putInt("screensaver_delay",   1)
-                .putBoolean("resume_playback", true)
-                .putBoolean("auto_scan",       true)
-                .putBoolean("network_buffer",  true)
-                .putBoolean("auto_reconnect",  true)
-                .putInt(KEY_WAVEFORM,          4)
-                .putInt(KEY_COLOR_SCHEME,      5)
-                .apply()
+            prefs.edit {
+                putInt("screensaver_delay", 1)
+                putBoolean("resume_playback", true)
+                putBoolean("auto_scan", true)
+                putBoolean("network_buffer", true)
+                putBoolean("auto_reconnect", true)
+                putInt(KEY_WAVEFORM, 4)
+                putInt(KEY_COLOR_SCHEME, 5)
+            }
         }
+        // Initialize newly added settings independently so upgrades do not silently
+        // disable features when older preferences already contain screensaver_delay.
+        if (!prefs.contains("resume_playback")) {
+            prefs.edit { putBoolean("resume_playback", true) }
+        }
+
+        setContentView(R.layout.activity_main)
 
         checkPermissions()
 
@@ -81,7 +89,7 @@ class MainActivity : BaseActivity() {
             } catch (e: Exception) {
                 e.printStackTrace()
             }
-        }, MoreExecutors.directExecutor())
+        }, ContextCompat.getMainExecutor(this))
     }
 
     override fun onDestroy() {
@@ -106,13 +114,52 @@ class MainActivity : BaseActivity() {
 
     override fun updateScreensaverText(textView: TextView) {
         val controller = mediaController
-        if (controller == null || controller.mediaMetadata.title == null) {
+        if (controller == null || controller.currentMediaItem == null) {
             textView.text = "Bitperfect Player"
             return
         }
-        val title  = controller.mediaMetadata.title?.toString() ?: "Bitperfect Player"
-        val artist = controller.mediaMetadata.artist?.toString() ?: ""
-        textView.text = if (artist.isNotEmpty()) "Now Playing:\n$title\n$artist" else "Now Playing:\n$title"
+        // Same track/artist/album resolution as the Now Playing screen and card.
+        val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+        var title = info.track
+        val artist = info.artist
+        val album = info.album
+
+        // When the title embeds the artist ("Artist - Track") alongside a separate
+        // artist row, strip the prefix so the value is not shown twice (BUG).
+        if (artist.isNotBlank()) {
+            for (d in arrayOf(" - ", " – ", " — ", " : ", " | ")) {
+                val prefix = artist + d
+                if (title.startsWith(prefix)) { title = title.substring(prefix.length).trim(); break }
+            }
+        }
+
+        val sb = SpannableStringBuilder()
+        sb.append("Now Playing:\n\n")
+
+        val iconColor = android.graphics.Color.LTGRAY
+        val iconSize = (textView.textSize * 1.2f).toInt()
+
+        fun appendRow(text: String, iconRes: Int) {
+            if (text.isBlank()) return
+            val start = sb.length
+            sb.append("  ") // placeholder
+            val drawable = androidx.core.content.ContextCompat.getDrawable(this, iconRes)?.mutate()?.apply {
+                setTint(iconColor)
+                setBounds(0, 0, iconSize, iconSize)
+            }
+            if (drawable != null) {
+                sb.setSpan(ImageSpan(drawable, ImageSpan.ALIGN_BOTTOM), start, start + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            sb.append(text).append("\n")
+        }
+
+        appendRow(title, R.drawable.ic_audio)
+        // Skip the artist row when the artist is already part of the title
+        // (e.g. station "Solar Radio High" in title "Solar Radio High [256kbps]")
+        if (artist.isNotBlank() && artist != title && !title.startsWith(artist)) appendRow(artist, R.drawable.ic_artist)
+        if (album.isNotBlank() && album != title && album != artist) appendRow(album, R.drawable.ic_album_art)
+
+        textView.text = sb
         textView.textAlignment = android.view.View.TEXT_ALIGNMENT_CENTER
     }
 
@@ -153,6 +200,7 @@ class MainActivity : BaseActivity() {
                 when {
                     fileName.endsWith(".m3u") || fileName.endsWith(".m3u8") -> allItems.addAll(parseM3u(uri))
                     fileName.endsWith(".pls")                               -> allItems.addAll(parsePls(uri))
+                    fileName.endsWith(".cue")                               -> allItems.addAll(parseCue(uri))
                     else                                                    -> allItems.add(createMediaItem(uri))
                 }
             }
@@ -178,13 +226,16 @@ class MainActivity : BaseActivity() {
             contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         } catch (_: Exception) {}
 
+        val meta = MetadataUtils.getMetadata(this, uri)
         return MediaItem.Builder()
             .setMediaId(uri.toString())
             .setUri(uri)
-            .setMimeType(mimeTypeFor(uri.toString()))
+            .setMimeType(PlaylistParser.mimeTypeFor(uri.toString()))
             .setMediaMetadata(
                 MediaMetadata.Builder()
-                    .setTitle(uri.lastPathSegment ?: "Unknown")
+                    .setTitle(meta.title ?: uri.lastPathSegment ?: "Unknown")
+                    .setArtist(meta.artist ?: "")
+                    .setAlbumTitle(meta.album ?: "")
                     .build()
             )
             .build()
@@ -205,48 +256,8 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    fun parseM3uFromStream(inputStream: java.io.InputStream, basePath: String? = null): List<MediaItem> {
-        val items = mutableListOf<MediaItem>()
-        try {
-            val reader = BufferedReader(InputStreamReader(inputStream))
-            var line: String?
-            var currentTitle: String? = null
-
-            while (reader.readLine().also { line = it } != null) {
-                var trimmed = line!!.trim().removePrefix("\uFEFF")
-                if (trimmed.isEmpty()) continue
-
-                if (trimmed.startsWith("#EXTINF:")) {
-                    val comma = trimmed.indexOf(',')
-                    if (comma != -1) currentTitle = trimmed.substring(comma + 1)
-                } else if (!trimmed.startsWith("#")) {
-                    // Normalise Windows path separators
-                    val normalizedPath = trimmed.replace("\\", "/")
-                    val itemUriString  = resolveRelativePath(normalizedPath, basePath)
-                    val itemUri        = parseEntryUri(itemUriString, basePath) ?: run { currentTitle = null; continue }
-
-                    val metaBuilder = MediaMetadata.Builder()
-                    var finalTitle  = currentTitle ?: itemUri.lastPathSegment ?: trimmed
-                    if (finalTitle.contains(" - ")) {
-                        val parts = finalTitle.split(" - ", limit = 2)
-                        metaBuilder.setArtist(parts[0].trim())
-                        finalTitle = parts[1].trim()
-                    }
-
-                    items.add(
-                        MediaItem.Builder()
-                            .setMediaId(itemUri.toString())
-                            .setUri(itemUri)
-                            .setMimeType(mimeTypeFor(itemUri.toString()))
-                            .setMediaMetadata(metaBuilder.setTitle(finalTitle).build())
-                            .build()
-                    )
-                    currentTitle = null
-                }
-            }
-        } catch (e: Exception) { e.printStackTrace() }
-        return items
-    }
+    fun parseM3uFromStream(inputStream: java.io.InputStream, basePath: String? = null): List<MediaItem> =
+        PlaylistParser.parseM3uFromStream(inputStream, basePath)
 
     fun parsePls(uri: Uri, basePath: String? = null): List<MediaItem> {
         return try {
@@ -259,49 +270,8 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    fun parsePlsFromStream(inputStream: java.io.InputStream, basePath: String? = null): List<MediaItem> {
-        val items = mutableListOf<MediaItem>()
-        try {
-            val reader = BufferedReader(InputStreamReader(inputStream))
-            val props  = linkedMapOf<String, String>()
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                var trimmed = line!!.trim().removePrefix("\uFEFF")
-                if (trimmed.isEmpty() || trimmed.startsWith("[")) continue
-                val eq = trimmed.indexOf('=')
-                if (eq != -1) props[trimmed.substring(0, eq).trim().lowercase()] = trimmed.substring(eq + 1).trim()
-            }
-
-            val count = props.remove("numberofentries")?.toIntOrNull() ?: 0
-            for (i in 1..count) {
-                val file = props.remove("file$i") ?: continue
-                val normalizedPath = file.replace("\\", "/")
-                val itemUriString  = resolveRelativePath(normalizedPath, basePath)
-                val itemUri        = parseEntryUri(itemUriString, basePath) ?: continue
-
-                var finalTitle = props.remove("title$i")
-                    ?: itemUri.lastPathSegment
-                    ?: itemUriString.substringAfterLast("/").substringBeforeLast(".")
-                props.remove("length$i") // consume but ignore
-
-                val metaBuilder = MediaMetadata.Builder()
-                if (finalTitle.contains(" - ")) {
-                    val parts = finalTitle.split(" - ", limit = 2)
-                    metaBuilder.setArtist(parts[0].trim())
-                    finalTitle = parts[1].trim()
-                }
-                items.add(
-                    MediaItem.Builder()
-                        .setMediaId(itemUri.toString())
-                        .setUri(itemUri)
-                        .setMimeType(mimeTypeFor(itemUri.toString()))
-                        .setMediaMetadata(metaBuilder.setTitle(finalTitle).build())
-                        .build()
-                )
-            }
-        } catch (e: Exception) { e.printStackTrace() }
-        return items
-    }
+    fun parsePlsFromStream(inputStream: java.io.InputStream, basePath: String? = null): List<MediaItem> =
+        PlaylistParser.parsePlsFromStream(inputStream, basePath)
 
     // ---------------------------------------------------------------------------
     // File picker (legacy ACTION_GET_CONTENT fallback used by some Android TV devices)
@@ -365,45 +335,17 @@ class MainActivity : BaseActivity() {
     // Private helpers
     // ---------------------------------------------------------------------------
 
-    /**
-     * Resolves a relative playlist entry path against [basePath], handling both
-     * regular filesystem paths and SAF (Storage Access Framework) URIs.
-     */
-    private fun resolveRelativePath(path: String, basePath: String?): String {
-        if (basePath == null || path.contains("://") || path.startsWith("/")) return path
-        return when {
-            basePath.contains("%2F") && !basePath.startsWith("file://") -> {
-                val encoded = Uri.encode(path).replace("/", "%2F")
-                if (basePath.endsWith("%2F")) "$basePath$encoded" else "$basePath%2F$encoded"
-            }
-            basePath.endsWith("/") -> "$basePath$path"
-            else -> "$basePath/$path"
+    fun parseCue(uri: Uri): List<MediaItem> {
+        return try {
+            contentResolver.openInputStream(uri)?.use { inputStream ->
+                val basePath = if (uri.scheme == "file") uri.path?.substringBeforeLast("/") else uri.toString().substringBeforeLast("%2F")
+                parseCueFromStream(inputStream, basePath)
+            } ?: emptyList()
+        } catch (e: Exception) {
+            e.printStackTrace(); emptyList()
         }
     }
 
-    private fun parseEntryUri(uriString: String, basePath: String?): Uri? = try {
-        when {
-            uriString.startsWith("/")          -> Uri.fromFile(java.io.File(uriString))
-            uriString.startsWith("file://")    -> Uri.fromFile(java.io.File(uriString.substring(7)))
-            uriString.startsWith("content://") ||
-            uriString.startsWith("http://")    ||
-            uriString.startsWith("https://")   ||
-            uriString.startsWith("smb://")     -> Uri.parse(uriString)
-            // Last-ditch attempt: partial SAF path
-            basePath == null && uriString.startsWith("primary%3A") -> Uri.parse(uriString)
-            else -> null
-        }
-    } catch (e: Exception) { null }
-
-    private fun mimeTypeFor(uriString: String): String? {
-        val lower = uriString.lowercase()
-        return when {
-            lower.endsWith(".flac")               -> MimeTypes.AUDIO_FLAC
-            lower.endsWith(".mp3")                -> MimeTypes.AUDIO_MPEG
-            lower.endsWith(".wav")                -> MimeTypes.AUDIO_WAV
-            lower.endsWith(".m4a") || lower.endsWith(".aac") -> MimeTypes.AUDIO_AAC
-            lower.endsWith(".ogg")                -> MimeTypes.AUDIO_OGG
-            else                                  -> null
-        }
-    }
+    fun parseCueFromStream(inputStream: java.io.InputStream, basePath: String?): List<MediaItem> =
+        PlaylistParser.parseCueFromStream(inputStream, basePath)
 }

@@ -1,5 +1,6 @@
 *.iml
 .gradle
+.kotlin/
 /local.properties
 /.idea/
 /build
@@ -9,3 +10,19 @@
 local.properties
 *.apk
 *.aar
+/probe/build/
+# Vendored decent-player USB audio driver. The build-required modules under
+# libs/ are tracked (decent-usb-audio-driver, decent-usb-audio-wrapper-media3,
+# and the FLAC decoder module, which the driver's CMakeLists.txt compiles
+# libFLAC + flac_parser.cc from — a fresh clone must have it). The nested repo's
+# docs/driver/player dirs and its root metafiles are excluded; the modules' build
+# output is covered by the nested .gitignore. Nested repo history is preserved in
+# a git bundle (third_party/decent-player/.git was removed).
+/third_party/decent-player/.git/
+/third_party/decent-player/driver/
+/third_party/decent-player/docs/
+/third_party/decent-player/player/
+/third_party/decent-player/CONTRIBUTING.md
+/third_party/decent-player/LICENSE
+/third_party/decent-player/NOTICE.md
+/third_party/decent-player/README.md

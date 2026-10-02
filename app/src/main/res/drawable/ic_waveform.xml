@@ -1,13 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "waveform" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M2,12c0,0 2,-8 5,-8s5,16 10,16s5,-8 5,-8"
-        android:strokeWidth="2"
-        android:strokeColor="#FFFFFF"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M22,12 L20,13 L19,14 L18,13 L17,16 L16,13 L15,21 L14,13 L13,15 L12,13 L11,17 L10,13 L9,22 L8,13 L7,19 L6,13 L5,14 L4,13 L2,12 L4,11 L5,10 L6,11 L7,5 L8,11 L9,2 L10,11 L11,7 L12,11 L13,9 L14,11 L15,3 L16,11 L17,8 L18,11 L19,10 L20,11 Z" />
 </vector>

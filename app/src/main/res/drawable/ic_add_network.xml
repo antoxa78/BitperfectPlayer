@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "plus-network" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M16,11 L16,9 L13,9 L13,6 L11,6 L11,9 L8,9 L8,11 L11,11 L11,14 L13,14 L13,11 Z M17,3 C18.105,3,19,3.895,19,5 L19,15 C19,16.105,18.105,17,17,17 L13,17 L13,19 L14,19 C14.552,19,15,19.448,15,20 L22,20 L22,22 L15,22 C15,22.552,14.552,23,14,23 L10,23 C9.448,23,9,22.552,9,22 L2,22 L2,20 L9,20 C9,19.448,9.448,19,10,19 L11,19 L11,17 L7,17 C5.895,17,5,16.105,5,15 L5,5 C5,3.895,5.895,3,7,3 Z" />
+</vector>

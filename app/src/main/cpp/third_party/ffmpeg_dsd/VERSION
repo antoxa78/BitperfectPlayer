@@ -1,0 +1,1 @@
+upstream: FFmpeg libavcodec/dsd.c dsd.h libavutil/reverse.c (as of 2026)

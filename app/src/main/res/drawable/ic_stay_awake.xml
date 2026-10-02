@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "coffee" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2,21 L20,21 L20,19 L2,19 M20,8 L18,8 L18,5 L20,5 M20,3 L4,3 L4,13 C4,15.209,5.791,17,8,17 L14,17 C16.209,17,18,15.209,18,13 L18,10 L20,10 C21.105,10,22,9.105,22,8 L22,5 C22,3.895,21.105,3,20,3" />
+</vector>

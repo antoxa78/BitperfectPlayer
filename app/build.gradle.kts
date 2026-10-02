@@ -1,6 +1,19 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
+
+// Read signing credentials from local.properties (which is gitignored).
+val localProperties = Properties().apply {
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { load(it) }
+    }
+}
+
+fun prop(name: String): String? = localProperties.getProperty(name)
+    ?: providers.gradleProperty(name).orNull
 
 android {
     namespace = "com.example.bitperfectplayer"
@@ -14,22 +27,59 @@ android {
         applicationId = "com.github.antoxa78.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 29
-        versionName = "2.4.2"
+        versionCode = 63
+        versionName = "3.1.0-beta11"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            // ARM only. armeabi-v7a is here for 32-bit Android TV boxes (e.g. Xiaomi
+            // Mi TV), which is what the 2.9.1 INSTALL_FAILED_NO_MATCHING_ABIS fix was
+            // actually about. x86/x86_64 only ever served emulators, and they cost ~1 MB
+            // of APK and a full extra copy of every native lib for no real device.
+            // The NEON fast path in dsd_conv.c/sacd_pcm.c is aarch64- and
+            // __ARM_NEON-guarded, with a scalar fallback, so dropping the x86 ABIs
+            // leaves no unbuilt code path.
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     buildFeatures {
         buildConfig = true
     }
 
+    signingConfigs {
+        if (prop("RELEASE_STORE_FILE") != null) {
+            create("release") {
+                storeFile = file(prop("RELEASE_STORE_FILE")!!)
+                storePassword = prop("RELEASE_STORE_PASSWORD")!!
+                keyAlias = prop("RELEASE_KEY_ALIAS")!!
+                keyPassword = prop("RELEASE_KEY_PASSWORD")!!
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            // Distinguishes this build in Settings → About (reads versionName)
+            // so it's obvious which APK is actually installed when comparing
+            // test results against a release build. Same applicationId as
+            // release (no suffix) so `adb install -r` upgrades in place and
+            // keeps settings/playlist/DAC preferences instead of resetting them.
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -53,8 +103,30 @@ dependencies {
     implementation(libs.androidx.media3.datasource.okhttp)
     implementation(libs.androidx.leanback)
     implementation(libs.jcifs.ng)
+    // Pure-Java WavPack decoder (BSD-3-Clause), used by WavPackExtractor.
+    // Bit-exact: each block's CRC-32 is verified against the value in its header.
+    implementation(libs.javasound.wavpack)
+
+    // decent-player userspace USB audio driver (vendored in third_party/)
+    implementation(project(":decent-usb-audio-driver"))
+    implementation(project(":decent-usb-audio-wrapper-media3"))
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
+}
+
+// Defensive version pin: keep the whole media3 stack on 1.5.1. The vendored
+// decent-player wrapper also builds against 1.5.1, but pinning here guarantees
+// no transitive path (a future wrapper bump or another media3 artifact) silently
+// upgrades ExoPlayer/session/common out from under the AudioSink APIs the app
+// relies on (verified against 1.5.1).
+configurations.configureEach {
+    resolutionStrategy {
+        force(
+            "androidx.media3:media3-exoplayer:1.5.1",
+            "androidx.media3:media3-common:1.5.1",
+            "androidx.media3:media3-session:1.5.1"
+        )
+    }
 }
