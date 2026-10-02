@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.0-beta10 - 2026-10-02
+
+### Fixed
+
+- **Adding a stored `.pls` or `.cue` playlist over MPD added nothing:** `findPlaylist` matches all four playlist extensions, but `add` and `load` both handed whatever they found to the `.m3u` parser, so a PLS list or CUE sheet resolved to an empty queue. A single `parsePlaylistFile` entry point now dispatches on the extension, which is what the SMB path already did through `PlaylistParser.parsePlaylistStream`.
+- **MPD listed stored playlists wrongly:** the root listing's filter was `it.isFile && endsWith(".m3u") || endsWith(".m3u8")`, and `&&` binds tighter than `||` — so a *directory* named `something.m3u8` was reported as a playlist, while `.pls` and `.cue` were never reported as playlists at all. Both listings now use `PlaylistParser.isPlaylistName`, so a client sees the same set the rest of the app treats as playlists.
+
 ## 3.1.0-beta9 - 2026-10-01
 
 ### Fixed

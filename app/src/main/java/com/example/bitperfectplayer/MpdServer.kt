@@ -1420,7 +1420,7 @@ class MpdServer(private val context: Context) {
             }
             // stored playlists at root
             if (playlistDir.isDirectory) {
-                playlistDir.listFiles()?.filter { it.isFile && it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8") }
+                playlistDir.listFiles()?.filter { it.isFile && PlaylistParser.isPlaylistName(it.name) }
                     ?.sortedBy { it.name.lowercase() }
                     ?.forEach { out.append("playlist: ").append(it.nameWithoutExtension).append('\n'); out.append("Last-Modified: ").append(iso8601(it.lastModified())).append('\n') }
             }
@@ -1440,7 +1440,7 @@ class MpdServer(private val context: Context) {
             if (f.isDirectory) {
                 out.append("directory: ").append(f.absolutePath).append('\n')
                 out.append("Last-Modified: ").append(iso8601(f.lastModified())).append('\n')
-            } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8")) {
+            } else if (PlaylistParser.isPlaylistName(f.name)) {
                 out.append("playlist: ").append(f.absolutePath).append('\n')
                 out.append("Last-Modified: ").append(iso8601(f.lastModified())).append('\n')
             } else if (MpdLibrary.isAudioFile(f.name)) {
@@ -1671,7 +1671,7 @@ class MpdServer(private val context: Context) {
             return items
         }
         val f = findPlaylist(name) ?: throw MpdAck(ACK_NO_EXIST, "No such playlist")
-        return parseM3uFile(f)
+        return parsePlaylistFile(f)
     }
 
     /**
@@ -1709,7 +1709,7 @@ class MpdServer(private val context: Context) {
         if (u.startsWith("smb://") || u.startsWith("/smb://")) return expandSmbUri(decSmbUri(u.removePrefix("/")))
         if (u.startsWith("content://")) return listOf(genericItem(u))
         // try stored playlist name first
-        findPlaylist(u)?.let { return parseM3uFile(it) }
+        findPlaylist(u)?.let { return parsePlaylistFile(it) }
         val f = try { resolveLocalPath(u) } catch (e: MpdAck) {
             // fallback: maybe absolute path not under roots but still exists (e.g. /storage/emulated/0/...)
             val alt = File(Uri.decode(u))
@@ -2058,5 +2058,16 @@ class MpdServer(private val context: Context) {
         FileInputStream(f).use { PlaylistParser.parseCueFromStream(it, f.parentFile?.absolutePath) }
     } catch (e: Exception) {
         Log.w(TAG, "cue read failed: ${f.path}", e); emptyList()
+    }
+
+    /**
+     * Parses a local playlist document, dispatching on its extension. [findPlaylist]
+     * matches any of .m3u/.m3u8/.pls/.cue, so a single parser entry point keeps
+     * inactive playlist types (especially CUE sheets) out of the .m3u parser.
+     */
+    private fun parsePlaylistFile(f: File): List<MediaItem> = when {
+        f.name.lowercase().endsWith(".cue") -> parseCueFile(f)
+        f.name.lowercase().endsWith(".pls") -> parsePlsFile(f)
+        else -> parseM3uFile(f)
     }
 }
