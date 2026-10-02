@@ -702,7 +702,8 @@ int ReadFilterCoefSets(StrData     *SD,
       }
     }
 
-    /* Clear out remaining coeffs, as the SSE2 code uses them all. */
+    /* Clear out remaining coeffs: the decoder reads the whole prediction
+       order even when the segment carries fewer coded coefficients. */
     memset(&FH->ICoefA[FilterNr][CoefNr], 0, ((1<<SIZE_CODEDPREDORDER) - CoefNr) * sizeof(**FH->ICoefA));
   }
 

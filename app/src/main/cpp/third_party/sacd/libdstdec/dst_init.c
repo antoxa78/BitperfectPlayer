@@ -61,12 +61,6 @@ Changes:
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
-#ifndef __APPLE__
-#include <malloc.h>
-#endif
-#if !defined(NO_SSE2) && (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
-#include <emmintrin.h>
-#endif
 #include "dst_init.h"
 #include "ccp_calc.h"
 #include "conststr.h"
@@ -80,27 +74,16 @@ Changes:
 static void *MemoryAllocate(int NrOfElements, int SizeOfElement) 
 {
   void *Array;
-#if defined(__arm__) || defined(__aarch64__)
   if ((Array = malloc(NrOfElements * SizeOfElement)) == NULL)
   {
     fprintf(stderr,"ERROR: not enough memory available!\n\n");
   }
-#else
-  if ((Array = _mm_malloc(NrOfElements * SizeOfElement, 16)) == NULL) 
-  {
-    fprintf(stderr,"ERROR: not enough memory available!\n\n");
-  }
-#endif
   return Array;
 }
 
 static void MemoryFree(void *Array) 
 {
-#if defined(__arm__) || defined(__aarch64__)
   free(Array);
-#else
-  _mm_free(Array);
-#endif
 }
 
 /* General function for allocating memory for array of any type */
@@ -320,24 +303,6 @@ int DST_InitDecoder(ebunch * D, int NrOfChannels, int SampleRate)
   {
     retval = CCP_CalcInit(&D->StrPtable);
   }
-
-  D->SSE2 = 0;
-#if !defined(NO_SSE2) && (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
-  {
-    int CPUInfo[4];
-#if defined(__i386__) || defined(__x86_64__)
-#define cpuid(type, a, b, c, d) \
-    __asm__ ("cpuid":\
-    "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (type));
-
-    cpuid(1, CPUInfo[0], CPUInfo[1], CPUInfo[2], CPUInfo[3]);
-#else
-    __cpuid(CPUInfo, 1);
-#endif
-
-    D->SSE2 = (CPUInfo[3] & (1L << 26)) ? 1 : 0;
-  }
-#endif
 
   return(retval);
 }

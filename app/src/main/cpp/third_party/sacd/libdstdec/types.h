@@ -167,8 +167,6 @@ typedef struct
                                                                  /* of a complete frame                         */
     int          ADataLen;                                       /* Number of code bits contained in AData[]    */
     StrData      S;                                              /* DST data stream */
-
-    int          SSE2;
 } ebunch;
 
 #endif  /* __TYPES_H_INCLUDED */
