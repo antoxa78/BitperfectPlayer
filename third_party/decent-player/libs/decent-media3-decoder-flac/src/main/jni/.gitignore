@@ -1,0 +1,6 @@
+# libFLAC source is vendored in-tree so the app builds from a fresh clone
+# without needing this module's setup.sh (which would clone
+# https://github.com/xiph/flac.git). Pinned at upstream commit
+# e94ff9f68b8e7dbd3e9f8b1ac18a8eca1914f181 (see the commit that vendored it).
+# Only the clone's bookkeeping is excluded; the sources are tracked.
+libflac/.git/
