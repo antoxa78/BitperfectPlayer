@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.0-beta12 - 2026-10-03
+
+### Fixed
+
+- **USB DAC sample rate handling with direct USB driver:** Fixed per-track sample rate switching in "USB Driver" mode where 48 kHz tracks were being resampled to 44.1 kHz while 44.1 kHz and 96 kHz could play at native rates. The driver now properly reopens the USB stream at the track's native sample rate for all supported rates (including 48 kHz) when switching between tracks with a full stop, avoiding unnecessary fractional resampling.
+
 ## 3.1.0-beta11 - 2026-10-02
 
 ### Changed
