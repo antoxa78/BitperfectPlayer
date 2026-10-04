@@ -241,6 +241,18 @@ class UsbAudioSink(
      */
     @Volatile private var reclaimAfterIdleRelease = false
 
+    /**
+     * Deadline (uptimeMillis) for the bounded re-claim retry window, and the
+     * earliest time the next attempt may run. 0 = window not started. See the
+     * reclaim block in [handleBuffer]: a failed re-claim must not silently
+     * downgrade playback to the Android mixer for the rest of the track.
+     */
+    @Volatile private var reclaimDeadlineMs = 0L
+    @Volatile private var reclaimNextAttemptMs = 0L
+
+    /** Diagnostic counter for the bit-perfect-bypassed warning (rate limit). */
+    private var bypassLogCount = 0L
+
     /** Deferred USB reconfiguration — applied after engine finishes playing. */
     private var deferredRate: Int = 0
     private var deferredChannels: Int = 0
@@ -351,8 +363,38 @@ class UsbAudioSink(
             // Keep the DAC released while paused, and wait for an in-flight
             // hand-back (USB reset) to finish before claiming it again.
             if (!isPlaying || idleReleaseInFlight) return false
-            reclaimAfterIdleRelease = false
-            reclaimUsbStream()
+            val now = SystemClock.uptimeMillis()
+            if (reclaimDeadlineMs == 0L) reclaimDeadlineMs = now + RECLAIM_RETRY_TIMEOUT_MS
+            // Each attempt re-enumerates the USB device, so throttle them: we
+            // return false below, and ExoPlayer re-calls within milliseconds.
+            if (now >= reclaimNextAttemptMs) {
+                reclaimNextAttemptMs = now + RECLAIM_RETRY_INTERVAL_MS
+                reclaimUsbStream()
+            }
+            if (usbAudioStream?.isAlive == true) {
+                reclaimAfterIdleRelease = false
+                reclaimDeadlineMs = 0L
+                reclaimNextAttemptMs = 0L
+            } else if (now < reclaimDeadlineMs) {
+                // Still inside the retry window: block this buffer and try again.
+                //
+                // The old code cleared reclaimAfterIdleRelease BEFORE calling
+                // reclaimUsbStream(), so a single failed reclaim fell straight
+                // through to the Android mixer for the rest of the track — a
+                // silent, permanent loss of bit-perfect. The DAC is absent from
+                // the device list until its post-USBDEVFS_RESET re-enumeration
+                // finishes, so a failed first attempt is expected, not fatal.
+                return false
+            } else {
+                // Bounded, so a genuinely unplugged DAC cannot stall playback
+                // forever. Logged loudly: this is a downgrade, not a hiccup.
+                Log.e(TAG, "BIT-PERFECT BYPASSED: DAC did not come back within " +
+                        "${RECLAIM_RETRY_TIMEOUT_MS}ms of an idle release — using the Android " +
+                        "audio path for the rest of this configuration")
+                reclaimAfterIdleRelease = false
+                reclaimDeadlineMs = 0L
+                reclaimNextAttemptMs = 0L
+            }
         }
         val stream = usbAudioStream
         if (config.bitPerfectEnabled && stream?.isAlive == true) {
@@ -725,7 +767,7 @@ class UsbAudioSink(
         //
         // 1. setAlt(0)       → xHCI Configure Endpoint (FREE old rings)
         // 2. SET_CUR          → write new sample rate to Clock Source
-        // 3. GET_CUR          → verify clock accepted (CLOCK_VALID_CONTROL)
+        // 3. GET_CUR          → verify the DAC really took the rate (fatal if not)
         // 4. setAlt(0) AGAIN  → defensive reset after clock change
         // 5. setAlt(N)        → xHCI Configure Endpoint (ALLOC new rings)
         // 6. wait ~47ms       → DAC PLL lock time
@@ -761,12 +803,40 @@ class UsbAudioSink(
         }
         Log.i(TAG, "Step 1: setAlt(0) — old ISO ring freed")
 
-        // Step 2: SET_CUR — write new sample rate
-        usbAudioDevice.setSampleRate(sampleRate)
+        // Step 2: SET_CUR — write new sample rate.
+        // The result is honoured: setSampleRate() returns false when no Clock
+        // Source of the DAC takes the rate. Not fatal on its own — a legacy
+        // auto-detect DAC reports false here and still takes the rate from the
+        // data stream — so the GET_CUR in Step 3 is what decides.
+        val rateAccepted = usbAudioDevice.setSampleRate(sampleRate)
+        if (!rateAccepted) {
+            Log.w(TAG, "Step 2: setSampleRate($sampleRate) not confirmed by the DAC")
+        }
 
-        // Step 3: GET_CUR(CLOCK_VALID_CONTROL) — verify clock is locked
+        // Step 3: GET_CUR(SAM_FREQ_CONTROL) — prove the DAC is on the rate we are
+        // about to stream at, and refuse to stream if it is not.
+        //
+        // This is the check that was missing. A DAC left on the wrong rate is a
+        // resampling DAC: the stream is converted on the way out and sounds hard,
+        // metallic and depthless for the rest of the track, with no error
+        // anywhere. setSampleRate()'s own KDoc describes exactly this failure (a
+        // 48 kHz track shown as 44.1 kHz on a Gustard X16), so refuse to play it.
+        val readback = usbAudioDevice.readSampleRate()
+        if (readback > 0 && readback != sampleRate) {
+            Log.e(TAG, "Step 3: DAC reports $readback Hz but $sampleRate Hz was requested — " +
+                    "abandoning bit-perfect rather than streaming at the wrong rate")
+            stream.release()
+            usbAudioDevice.closeDevice()
+            return
+        }
+
+        // CLOCK_VALID is logged, not acted on: readClockValid() cannot tell "the
+        // DAC does not implement this control" apart from "the clock is
+        // unlocked", so it cannot gate the sequence.
         val clockValid = usbAudioDevice.readClockValid()
-        Log.i(TAG, "Step 2-3: SET_CUR=$sampleRate, CLOCK_VALID=$clockValid")
+        Log.i(TAG, "Step 2-3: SET_CUR=$sampleRate accepted=$rateAccepted " +
+                "readback=${if (readback > 0) "$readback Hz" else "unsupported"} " +
+                "CLOCK_VALID=$clockValid")
 
         // Step 4: setAlt(0) AGAIN — defensive reset after clock change
         usbAudioDevice.setAltSetting(0)
@@ -919,7 +989,11 @@ class UsbAudioSink(
         }
         // Re-claim on the next buffer after play() if the player keeps this
         // configuration (a stop()/new item goes through configure() instead).
-        if (usbAudioStream != null && currentSampleRate > 0) reclaimAfterIdleRelease = true
+        if (usbAudioStream != null && currentSampleRate > 0) {
+            reclaimAfterIdleRelease = true
+            reclaimDeadlineMs = 0L
+            reclaimNextAttemptMs = 0L
+        }
         val th = Thread({
             try {
                 releaseUsbStream()
@@ -995,7 +1069,25 @@ class UsbAudioSink(
     }
 
     private fun unmuteDelegateIfNeeded() {
-        if (delegateMuted) { super.setVolume(pendingVolume); delegateMuted = false }
+        if (delegateMuted) {
+            super.setVolume(pendingVolume)
+            delegateMuted = false
+            if (config.bitPerfectEnabled) {
+                // The delegate is the Android audio sink (AudioFlinger mixer /
+                // resampler). Unmuting it while bit-perfect is configured means
+                // this buffer is NOT going through the USB driver — a silent
+                // downgrade that is otherwise invisible in logs. Rate-limited so
+                // a stuck fallback cannot flood.
+                bypassLogCount++
+                if (bypassLogCount <= 5L || bypassLogCount % 100L == 0L) {
+                    Log.w(TAG, "BIT-PERFECT BYPASSED: unmuting the Android audio delegate " +
+                            "(streamAlive=${usbAudioStream?.isAlive == true}, " +
+                            "reclaimPending=$reclaimAfterIdleRelease, " +
+                            "cause=${if (usbAudioStream == null) "no USB stream" else "USB stream not alive"}) " +
+                            "[#${bypassLogCount}]")
+                }
+            }
+        }
     }
 
     // ── Audio routing helpers ───────────────────────────────────────
@@ -1261,6 +1353,17 @@ class UsbAudioSink(
         /** Upper bound for the player to reach the next item after a gapless
          *  switch before position reporting falls back to normal. */
         private const val GAPLESS_ADVANCE_TIMEOUT_MS = 5_000L
+
+        /**
+         * How long to keep retrying to re-claim the DAC after an idle release
+         * before giving up and using the Android audio path. An idle release
+         * performs a USBDEVFS_RESET, so the DAC is briefly absent from the
+         * device list; the first reclaim attempt after that is expected to fail.
+         */
+        private const val RECLAIM_RETRY_TIMEOUT_MS = 3_000L
+
+        /** Minimum gap between reclaim attempts (each re-enumerates the device). */
+        private const val RECLAIM_RETRY_INTERVAL_MS = 150L
 
         /**
          * Wraps a [LoadControl] to suppress ExoPlayer loading when the native

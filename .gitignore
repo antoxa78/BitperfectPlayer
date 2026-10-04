@@ -11,6 +11,11 @@ local.properties
 *.apk
 *.aar
 /probe/build/
+
+# Local test material for on-device USB/DAC debugging (test tones and captures);
+# not part of the app.
+/test_*.flac
+/x16_*.log
 # Vendored decent-player USB audio driver. The build-required modules under
 # libs/ are tracked (decent-usb-audio-driver, decent-usb-audio-wrapper-media3,
 # and the FLAC decoder module, which the driver's CMakeLists.txt compiles

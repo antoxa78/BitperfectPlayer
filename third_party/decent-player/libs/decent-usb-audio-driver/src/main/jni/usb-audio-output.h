@@ -149,6 +149,45 @@ struct UsbAudioContext {
      *  frames per microframe (0 for spec-conforming DACs); detected from the
      *  first plausible reading. FEEDBACK_SHIFT_UNKNOWN until then. */
     int feedbackShift;
+
+    // ── Feedback clock instrumentation (writer thread only) ───────────
+    // handleFeedbackCompletion() runs on the audio thread at ~1 kHz, so this
+    // accumulates arithmetic there and only formats (expensive) when a window
+    // closes or an outlier appears. The point is the min/max envelope: an
+    // instantaneous value that looks stable says nothing about how far the
+    // clock actually swings between reports.
+
+    /** Deviation-from-nominal envelope over the current window, in ppm.
+     *  fbWindowStarted guards against reporting 0/0 for an empty window. */
+    double fbPpmMin;
+    double fbPpmMax;
+    bool fbWindowStarted;
+
+    /** Accepted feedback samples in the current window. */
+    int64_t fbWindowCount;
+
+    /** Samples rejected by the ±1% sanity gate: this window, and cumulative. */
+    int64_t fbRejectedWindow;
+    int64_t fbRejectedTotal;
+
+    /** Largest |ppm| rejected in the current window. */
+    double fbRejectedWorstPpm;
+
+    /** Samples feedbackToFpmf could not parse (zero value, bad scale, short
+     *  transfer) in the current window. Distinct from an out-of-range value. */
+    int64_t fbUnusableWindow;
+
+    // ── Float-path input level instrumentation (writer thread only) ───
+    // The float decoder path (radio / MP3 / AAC: media3 → float →
+    // convertFloatToIntNN) is the only place a stream is not integer-exact.
+    // clampf() is its one lossy operation: a decoded sample beyond ±1.0 is
+    // hard-clipped, which is audible as a hard, metallic, depthless signal and
+    // is invisible everywhere else in the pipeline. Peak level plus a clip
+    // count turns "sounds bad sometimes" into a number.
+    double floatPeakAbs;   // max |sample| since the window started
+    int64_t floatClipped;  // samples hard-clipped since the window started
+    int64_t floatSamples;  // samples processed since the window started
+    int64_t floatClipWarned;// floatClipped value of the last per-clip warning
 };
 
 #define FEEDBACK_SHIFT_UNKNOWN (-1000)

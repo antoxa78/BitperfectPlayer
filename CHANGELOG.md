@@ -1,10 +1,25 @@
 # Changelog
 
-## 3.1.0-beta12 - 2026-10-03
+## 3.1.0-beta13 - 2026-10-04
 
 ### Fixed
 
-- **USB DAC sample rate handling with direct USB driver:** Fixed per-track sample rate switching in "USB Driver" mode where 48 kHz tracks were being resampled to 44.1 kHz while 44.1 kHz and 96 kHz could play at native rates. The driver now properly reopens the USB stream at the track's native sample rate for all supported rates (including 48 kHz) when switching between tracks with a full stop, avoiding unnecessary fractional resampling.
+- **A stop immediately followed by play tore the bit-perfect USB stream down and rebuilt it:** pausing, stopping or clearing the queue handed the DAC back to the system the instant the player reached `STATE_IDLE` — the ordinary station-change / `clear`→`add`→`play` sequence — even when playback resumed milliseconds later, leaving a multi-second silent gap while the stream was reopened and re-negotiated. The pause/idle hand-back is now debounced by 1.2 s and dropped if playback resumes first (on a resume, an active play intent, or entering `BUFFERING`/`READY`). A genuine pause still returns the DAC, just a moment later, and the hand-back paths that must complete at once remain immediate: transient audio-focus loss, screen off/on, output-mode change and process exit bypass the debounce entirely, and a permanent audio-focus loss (`reason=2`/`3`) is released immediately rather than waiting it out.
+- **A failed re-claim after an idle release silently downgraded playback to the Android mixer for the rest of the track:** `handleBuffer()` cleared `reclaimAfterIdleRelease` *before* attempting the re-claim, so a single failure fell straight through to `super.handleBuffer()` — AudioFlinger, with its resampler and mixer — with no retry until the next track. The first attempt after a hand-back routinely fails, because the DAC is absent from the device list until its post-`USBDEVFS_RESET` re-enumeration finishes. The flag is now cleared only on success and the re-claim is retried every 150 ms for up to 3 s before it will fall back.
+- **USB DAC sample rate handling with the direct USB driver:** per-track rate switching in "USB Driver" mode was resampling 48 kHz tracks to 44.1 kHz while 44.1 kHz and 96 kHz played natively. The driver now reopens the USB stream at the track's native rate for every supported rate (including 48 kHz) when switching tracks with a full stop, instead of letting the rate be fractionally resampled.
+- **The driver could stream to a DAC left on the wrong sample rate:** `setSampleRate()` can fail on a DAC whose clock source did not take the rate — the case its own documentation describes, a 48 kHz track shown as 44.1 kHz on a Gustard X16 — and the sink streamed regardless. A DAC on the wrong rate resamples, which is audible as a hard, metallic, depthless signal with no error reported anywhere. The sink now reads the rate back with `GET_CUR` after `SET_CUR` and refuses to stream bit-perfect on a mismatch, falling back to the system audio path instead.
+
+### Changed
+
+- **The per-write `nativeWrite` log is no longer emitted on every call:** a write blocks for roughly half the audio it submits in the steady state — the URB ring is full by design and the call is paced by the DAC — so the `>10ms` threshold fired on every write, about 40 lines a second on the audio thread and into logd. It now logs only genuine stalls (>150 ms), with the once-a-second `Write:` line as the heartbeat.
+
+### Added
+
+- **Diagnostics for the USB path.** An `UsbAudioSink: BIT-PERFECT BYPASSED` warning is logged whenever the Android audio delegate becomes audible while bit-perfect is configured — i.e. the buffer is about to go through the system mixer, which was previously invisible in logs. The native driver now reports DAC clock drift per window as a min/max envelope in ppm, plus counts of samples rejected by the sanity gate and of feedback it could not parse; the float decode path reports its peak level in dBFS and how many samples were hard-clipped past full scale.
+
+### Removed
+
+- **The on-device debug log (`exit_debug.log`) is gone.** The USB hand-back / exit path used to mirror its messages into a small file in the app's external storage so they could be read on the TV without adb. The app no longer writes any log file: the constants, the 50 KB rotation logic and the `appendDebugLog()` helper are deleted, and every former call site emits a plain `Log.i` line to logcat instead. The diagnostics themselves are unchanged — only the on-disk copy is gone.
 
 ## 3.1.0-beta11 - 2026-10-02
 

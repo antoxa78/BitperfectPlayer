@@ -49,6 +49,16 @@ static bool feedbackPollDisabled() {
 
 static inline float clampf(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v); }
 
+/** Track the float-path peak and count values clampf() will hard-clip.
+ *  Returns [v] unchanged so it can wrap the input in the converters below
+ *  without changing what they compute. */
+static inline float trackFloatLevel(UsbAudioContext *ctx, float v) {
+    float a = v < 0.0f ? -v : v;
+    if (a > ctx->floatPeakAbs) ctx->floatPeakAbs = a;
+    if (a > 1.0f) ctx->floatClipped++;
+    return v;
+}
+
 // Bit-perfect float→int conversion matching FFmpeg's libswresample normalization.
 // FFmpeg normalizes: int / 2^N (e.g., int16 / 32768.0).
 // Reconversion: float × 2^N gives exact round-trip for 16-bit and 24-bit because:
@@ -62,30 +72,30 @@ static inline float clampf(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0
 // exact anyway (see above), but any upstream resampling/mixing/gain that
 // isn't itself power-of-two-exact makes this bias real, not just theoretical.
 
-static void convertFloatToInt16(const float *src, uint8_t *dst, int n) {
+static void convertFloatToInt16(UsbAudioContext *ctx, const float *src, uint8_t *dst, int n) {
     auto *out = reinterpret_cast<int16_t *>(dst);
     for (int i = 0; i < n; i++) {
-        float s = roundf(clampf(src[i]) * 32768.0f);
+        float s = roundf(clampf(trackFloatLevel(ctx, src[i])) * 32768.0f);
         if (s > 32767.0f) s = 32767.0f;
         if (s < -32768.0f) s = -32768.0f;
         out[i] = (int16_t)s;
     }
 }
-static void convertFloatToInt24(const float *src, uint8_t *dst, int n) {
+static void convertFloatToInt24(UsbAudioContext *ctx, const float *src, uint8_t *dst, int n) {
     for (int i = 0; i < n; i++) {
-        float s = roundf(clampf(src[i]) * 8388608.0f);
+        float s = roundf(clampf(trackFloatLevel(ctx, src[i])) * 8388608.0f);
         if (s > 8388607.0f) s = 8388607.0f;
         if (s < -8388608.0f) s = -8388608.0f;
         int32_t v = (int32_t)s;
         dst[i*3] = v & 0xFF; dst[i*3+1] = (v>>8) & 0xFF; dst[i*3+2] = (v>>16) & 0xFF;
     }
 }
-static void convertFloatToInt32(const float *src, uint8_t *dst, int n) {
+static void convertFloatToInt32(UsbAudioContext *ctx, const float *src, uint8_t *dst, int n) {
     auto *out = reinterpret_cast<int32_t *>(dst);
     for (int i = 0; i < n; i++) {
         // Use double: float32 can't represent 2147483648.0 exactly (needs 31 bits,
         // float32 has 24-bit mantissa). Double has 53-bit mantissa — sufficient.
-        double s = round((double)clampf(src[i]) * 2147483648.0);
+        double s = round((double)clampf(trackFloatLevel(ctx, src[i])) * 2147483648.0);
         if (s > 2147483647.0) s = 2147483647.0;
         if (s < -2147483648.0) s = -2147483648.0;
         out[i] = (int32_t)s;
@@ -246,15 +256,31 @@ static bool submitFeedbackUrb(UsbAudioContext *ctx) {
 /**
  * Process a completed feedback URB: parse the DAC's clock rate and
  * update calibratedFpmf for real-time clock tracking.
+ *
+ * Also keeps the instrumentation that answers the question this loop exists to
+ * answer: is the DAC's reported clock steady, or does it swing? The instantaneous
+ * value is already logged by the once-per-second "Write:" line; what this adds is
+ * the per-window min/max ppm envelope, plus counts of rejected and unparseable
+ * samples. A single bad reading, or quiet noise, is invisible in an
+ * instantaneous log but shows up here.
  */
 static std::atomic<int64_t> g_feedbackCount{0};
+
+/** Feedback samples per instrumentation window (≈10 s at the ~1 kHz feedback rate). */
+static const int64_t kFeedbackWindowSamples = 10000;
 
 static void handleFeedbackCompletion(UsbAudioContext *ctx) {
     ctx->feedbackInFlight = false;
     int64_t count = ++g_feedbackCount;
 
     unsigned len = ctx->feedbackUrb->iso_frame_desc[0].actual_length;
-    if (len >= 3) {
+    if (len < 3) {
+        // Short/empty transfer: there is no value to parse at all.
+        ctx->fbUnusableWindow++;
+        if (ctx->fbUnusableWindow <= 3) {
+            LOGW("Feedback UNUSABLE: short transfer (len=%u)", len);
+        }
+    } else {
         uint8_t *fb = ctx->feedbackBuffer;
         uint32_t raw = (uint32_t)fb[0] | ((uint32_t)fb[1] << 8) | ((uint32_t)fb[2] << 16) |
                        (len >= 4 ? ((uint32_t)fb[3] << 24) : 0u);
@@ -262,14 +288,66 @@ static void handleFeedbackCompletion(UsbAudioContext *ctx) {
 
         // Sanity check: feedback should be within ±1% of nominal
         double nominal = ctx->sampleRate / 8000.0;
-        if (newFpmf > nominal * 0.99 && newFpmf < nominal * 1.01) {
-            ctx->calibratedFpmf = newFpmf;
-            // Log only every 10000th feedback — logging in the audio path is expensive
-            if (count % 10000 == 0) {
-                LOGI("Feedback #%lld: fpmf=%.4f (%.1f Hz)",
-                     (long long)count, newFpmf, newFpmf * 8000.0);
+
+        if (newFpmf == 0.0) {
+            // feedbackToFpmf() refused the value: a zero read, or feedbackShift
+            // is still unknown and no power-of-two scale brought it near nominal.
+            // A different failure from "parsed, but out of range".
+            ctx->fbUnusableWindow++;
+            if (ctx->fbUnusableWindow <= 3) {
+                LOGW("Feedback UNUSABLE: raw=0x%08x len=%u (feedbackShift=%d)",
+                     raw, len, ctx->feedbackShift);
+            }
+        } else {
+            double ppm = (newFpmf - nominal) / nominal * 1e6;
+            if (newFpmf > nominal * 0.99 && newFpmf < nominal * 1.01) {
+                if (!ctx->fbWindowStarted) {
+                    ctx->fbPpmMin = ppm;
+                    ctx->fbPpmMax = ppm;
+                    ctx->fbWindowStarted = true;
+                } else {
+                    if (ppm < ctx->fbPpmMin) ctx->fbPpmMin = ppm;
+                    if (ppm > ctx->fbPpmMax) ctx->fbPpmMax = ppm;
+                }
+                ctx->fbWindowCount++;
+                ctx->calibratedFpmf = newFpmf;
+            } else {
+                // Outside ±1% of nominal — must never size packets (it could push
+                // an URB past its slot buffer). Full detail for the first few,
+                // then one in a hundred: a DAC that always reports garbage must
+                // not flood logd from the audio thread.
+                ctx->fbRejectedWindow++;
+                ctx->fbRejectedTotal++;
+                double absPpm = ppm < 0 ? -ppm : ppm;
+                if (absPpm > ctx->fbRejectedWorstPpm) ctx->fbRejectedWorstPpm = absPpm;
+                if (ctx->fbRejectedTotal <= 5 || ctx->fbRejectedTotal % 100 == 0) {
+                    LOGW("Feedback REJECTED #%lld: raw=0x%08x fpmf=%.4f (%.1f Hz) = %+.0f ppm off nominal",
+                         (long long)ctx->fbRejectedTotal, raw, newFpmf, newFpmf * 8000.0, ppm);
+                }
             }
         }
+    }
+
+    // Window summary. The min/max envelope is the measurement that matters: a
+    // clock that reads 6.0002 every time gives min=max=+33 ppm, whereas one that
+    // averages +33 ppm while swinging between -200 and +400 does not.
+    if (count % kFeedbackWindowSamples == 0) {
+        LOGI("Feedback #%lld: now=%.4f (%.1f Hz); drift min=%+.1f max=%+.1f ppm over %lld samples; "
+             "rejected=%lld (total %lld, worst |%.0f| ppm); unusable=%lld",
+             (long long)count, ctx->calibratedFpmf, ctx->calibratedFpmf * 8000.0,
+             ctx->fbWindowStarted ? ctx->fbPpmMin : 0.0,
+             ctx->fbWindowStarted ? ctx->fbPpmMax : 0.0,
+             (long long)ctx->fbWindowCount,
+             (long long)ctx->fbRejectedWindow,
+             (long long)ctx->fbRejectedTotal,
+             ctx->fbRejectedWorstPpm,
+             (long long)ctx->fbUnusableWindow);
+        // Start a fresh window.
+        ctx->fbWindowStarted = false;
+        ctx->fbWindowCount = 0;
+        ctx->fbRejectedWindow = 0;
+        ctx->fbRejectedWorstPpm = 0.0;
+        ctx->fbUnusableWindow = 0;
     }
 
     // Resubmit for continuous tracking
@@ -538,6 +616,20 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioCreate(
     ctx->feedbackShift = FEEDBACK_SHIFT_UNKNOWN;
     ctx->mergeBuffer = nullptr;
     ctx->mergeCapacity = 0;
+    // Feedback instrumentation
+    ctx->fbPpmMin = 0.0;
+    ctx->fbPpmMax = 0.0;
+    ctx->fbWindowStarted = false;
+    ctx->fbWindowCount = 0;
+    ctx->fbRejectedWindow = 0;
+    ctx->fbRejectedTotal = 0;
+    ctx->fbRejectedWorstPpm = 0.0;
+    ctx->fbUnusableWindow = 0;
+    // Float-path level instrumentation
+    ctx->floatPeakAbs = 0.0;
+    ctx->floatClipped = 0;
+    ctx->floatSamples = 0;
+    ctx->floatClipWarned = 0;
 
     if (!allocRing(ctx)) {
         delete ctx;
@@ -593,6 +685,19 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioStart(
     double nominalFpmf = ctx->sampleRate / 8000.0;
     ctx->calibratedFpmf = nominalFpmf;
     ctx->feedbackShift = FEEDBACK_SHIFT_UNKNOWN;
+    // Fresh instrumentation window for this stream (fbRejectedTotal is kept:
+    // it is cumulative over the context's lifetime).
+    ctx->fbPpmMin = 0.0;
+    ctx->fbPpmMax = 0.0;
+    ctx->fbWindowStarted = false;
+    ctx->fbWindowCount = 0;
+    ctx->fbRejectedWindow = 0;
+    ctx->fbRejectedWorstPpm = 0.0;
+    ctx->fbUnusableWindow = 0;
+    ctx->floatPeakAbs = 0.0;
+    ctx->floatClipped = 0;
+    ctx->floatSamples = 0;
+    ctx->floatClipWarned = 0;
 
     if (ctx->endpointFeedback > 0) {
         double fb = feedbackToFpmf(ctx, readFeedbackRaw(ctx->fd, ctx->endpointFeedback));
@@ -657,12 +762,36 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWrite(
     jfloat *f = env->GetFloatArrayElements(pcm, nullptr);
     if (!f) return;
     switch (ctx->bitDepth) {
-        case 16: convertFloatToInt16(f, ctx->transferBuffer, totalSamples); break;
-        case 24: convertFloatToInt24(f, ctx->transferBuffer, totalSamples); break;
-        case 32: convertFloatToInt32(f, ctx->transferBuffer, totalSamples); break;
+        case 16: convertFloatToInt16(ctx, f, ctx->transferBuffer, totalSamples); break;
+        case 24: convertFloatToInt24(ctx, f, ctx->transferBuffer, totalSamples); break;
+        case 32: convertFloatToInt32(ctx, f, ctx->transferBuffer, totalSamples); break;
         default: env->ReleaseFloatArrayElements(pcm, f, JNI_ABORT); return;
     }
     env->ReleaseFloatArrayElements(pcm, f, JNI_ABORT);
+
+    // ── Float-path level / clipping instrumentation ──────────────────
+    // clampf() is the only lossy step in the float path, and hard-clipping a
+    // decoded sample is a real, audible defect (harsh, metallic, compressed).
+    // Count it and report the window peak; a non-zero clip count with a peak
+    // above 0 dBFS is the fingerprint of it.
+    ctx->floatSamples += totalSamples;
+    if (ctx->floatClipped > 0 && ctx->floatClipped != ctx->floatClipWarned) {
+        ctx->floatClipWarned = ctx->floatClipped;
+        if (ctx->floatClipWarned <= 3 || ctx->floatClipWarned % 1000 == 0) {
+            LOGW("Float path CLIPPING: %lld samples past full scale (peak %.2f)",
+                 (long long)ctx->floatClipped, ctx->floatPeakAbs);
+        }
+    }
+    if (ctx->floatSamples >= (int64_t)ctx->sampleRate * 10) {
+        double peakDb = ctx->floatPeakAbs > 0.0 ? 20.0 * log10(ctx->floatPeakAbs) : -999.0;
+        LOGI("Float path #%ld: peak=%.2f dBFS, clipped=%lld of %lld samples%s",
+             writeCallCount, peakDb,
+             (long long)ctx->floatClipped, (long long)ctx->floatSamples,
+             ctx->floatClipped > 0 ? "  <-- INPUT EXCEEDS FULL SCALE" : "");
+        ctx->floatPeakAbs = 0.0;
+        ctx->floatClipped = 0;
+        ctx->floatSamples = 0;
+    }
 
     // Submit converted PCM to USB pipeline (shared with raw path)
     submitPcmToUrbs(ctx, ctx->transferBuffer, totalBytes);
@@ -672,9 +801,15 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWrite(
     clock_gettime(CLOCK_MONOTONIC, &writeEnd);
     long writeUs = (writeEnd.tv_sec - writeStart.tv_sec) * 1000000L +
                    (writeEnd.tv_nsec - writeStart.tv_nsec) / 1000L;
-    // Log every call that took > 10ms, or every 100th call
-    if (writeUs > 10000 || writeCallCount % 100 == 0) {
-        LOGI("nativeWrite #%ld: %d samples, %ldus (%.1fms), inflight=%d",
+    // Log genuine stalls only. In the steady state a write blocks for roughly
+    // half the audio it submits — the URB ring is full by design and the call is
+    // paced by the DAC — so the old ">10ms" threshold fired on every single
+    // call: ~40 lines/s on the audio thread and into logd, drowning the useful
+    // signal. 150ms is above anything this design produces and below the 200ms
+    // reap timeout, so it marks real trouble. The once-a-second "Write:" line
+    // below is the heartbeat.
+    if (writeUs > 150000) {
+        LOGW("nativeWrite #%ld: %d samples took %ldus (%.1fms) — long stall, inflight=%d",
              writeCallCount, totalSamples, writeUs, writeUs / 1000.0, ctx->urbsInFlight);
     }
 
