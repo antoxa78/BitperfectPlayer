@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.1.0-beta14 - 2026-10-05
+
+### Fixed
+
+- **Seeking with the TV remote did nothing on the Now Playing screen.** Arrow keys change a `SeekBar` through its key handler, which never calls `onStartTrackingTouch`/`onStopTrackingTouch` — so the seek was applied only on touch release and every key press was silently dropped (the progress poller then snapped the thumb back). `onProgressChanged(fromUser=true)` now applies the seek whenever a touch drag is not in progress, ignoring live streams where there is no meaningful position. The progress poller is tracked as a field, so starting/stopping it no longer cancels unrelated one-shot work (the DAC-reset retry, deferred UI refreshes).
+- **MPD song IDs were recycled by queue position, so clients could address the wrong song after an edit.** Deleting an entry from `[A#1, B#2, C#3]` made C take id 2 while B's id 2 still appeared to exist, and a reorder could move ids to different songs. The server now keeps a parallel mediaId list and preserves every remaining entry's id (FIFO when the same track appears twice); ids are only allocated for genuinely new entries.
+- **`addid` returned a stale or duplicated id.** The id was read from bookkeeping that had not yet seen the insertion (MediaController timeline updates asynchronously), so two `addid` calls in a row could both return id 1. The insertion is now recorded locally when the command runs, and the returned id is the first inserted track's own id.
+- **The MPD server could read files outside the music/storage roots and leaked SMB credentials.** `add`/`load` accepted any existing absolute path as a fallback, playlist entries could escape their folder with `../`, and `lsinfo`/`playlistinfo`/saved playlists contained `smb://user:pass@host/...` URIs. Path containment is now enforced everywhere (including playlist entries and playlists themselves), credentials are never emitted or persisted, and a client-supplied `smb://` URI is re-authenticated server-side from the configured share before any SMB I/O.
+- **WavPack: the `WavpackSetConfiguration()` encoder routine was being called on the live decoder.** After every 44.1 kHz reopen/seek it zeroed `context.total_samples` and overwrote `stream.wphdr` flags/bits, corrupting float/int32 fixups for the block decoded right after the seek. A mid-file reopen that reports the library's 44100 fallback now only patches the extractor's own sample-rate field from the first-open config.
+
 ## 3.1.0-beta13 - 2026-10-04
 
 ### Fixed

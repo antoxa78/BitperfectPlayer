@@ -215,12 +215,18 @@ class WavPackExtractor(
         }
 
         // A decoder reopened mid-file only sees the block it starts on, and an explicit
-        // sample rate lives in an ID_SAMPLE_RATE sub-block of block 0 only. Replay the
-        // config captured on the first open so the rate survives a seek.
+        // sample rate lives in an ID_SAMPLE_RATE sub-block of block 0 only, so the
+        // library reports its 44100 fallback. Use the rate captured on the first open
+        // for the extractor's output format/seek math instead.
+        //
+        // Deliberately NOT WavpackSetConfiguration(): that is an encoder-side setup
+        // routine. Called on a live decoder it zeroes context.total_samples and
+        // overwrites stream.wphdr (flags/bits), which corrupts float/int32 fixups for
+        // the block decoded right after the reopen. The stream's sample rate is only
+        // used by this extractor, so patching the local field is sufficient.
         if (savedConfig == null) {
             savedConfig = c.config
         } else if (sampleRate == SAMPLE_RATE_FALLBACK && savedConfig!!.sample_rate > 0) {
-            WavpackUtils.WavpackSetConfiguration(c, savedConfig!!, 0)
             sampleRate = savedConfig!!.sample_rate.toInt()
         }
 

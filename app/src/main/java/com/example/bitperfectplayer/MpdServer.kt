@@ -112,9 +112,11 @@ class MpdServer(private val context: Context) {
     @Volatile private var boundPort = 0
     fun getPort(): Int = if (boundPort > 0) boundPort else getConfiguredPort(appContext)
 
-    // Queue bookkeeping
+    // Queue bookkeeping. songIds/songMediaIds are parallel lists: entry i of the
+    // player queue has id songIds[i] and mediaId songMediaIds[i].
     private val qLock = Any()
     private var songIds: List<Int> = emptyList()
+    private var songMediaIds: List<String> = emptyList()
     private var nextSongId = 1
     private var queueVersion = 1
     private var lastFingerprint = ""
@@ -307,40 +309,59 @@ class MpdServer(private val context: Context) {
     private fun syncIdsIfNeeded(c: MediaController) {
         synchronized(qLock) {
             val count = c.mediaItemCount
-            if (songIds.size != count) {
-                // rebuild preserving where mediaId stable at same index
-                val newIds = MutableList(count) { 0 }
-                for (i in 0 until count) {
-                    val mid = c.getMediaItemAt(i).mediaId
-                    val oldMid = if (i < songIds.size) runCatching { c.getMediaItemAt(i).mediaId }.getOrNull() else null
-                    // naive reuse check: if old slot had same mediaId keep its id
-                    val reused = if (i < songIds.size && oldMid == mid) songIds[i] else 0
-                    newIds[i] = if (reused != 0) reused else nextSongId++
+            val currentMediaIds = ArrayList<String>(count)
+            for (i in 0 until count) currentMediaIds.add(c.getMediaItemAt(i).mediaId)
+            val fp = buildFingerprint(c)
+            if (currentMediaIds == songMediaIds) {
+                if (fp != lastFingerprint) {
+                    // order changed — ids stay attached to their songs; bump version
+                    lastFingerprint = fp
+                    scheduleVersionBump(fp)
                 }
-                val fp = buildFingerprint(c)
-                if (firstSyncDone) {
-                    if (newIds != songIds) {
-                        songIds = newIds
-                        scheduleVersionBump(fp)
-                    }
-                } else {
-                    // Fresh server after an app restart: keep the persisted version
-                    // when the queue is unchanged (restored), so clients don't see a
-                    // version change and don't clear/refetch their playlist view.
-                    firstSyncDone = true
-                    songIds = newIds
-                    if (fp != lastFingerprint) scheduleVersionBump(fp)
-                }
-                lastFingerprint = fp
                 return
             }
-            val fp = buildFingerprint(c)
-            if (fp != lastFingerprint) {
-                // order changed — assign fresh ids for moved entries is OK; bump version
-                lastFingerprint = fp
-                scheduleVersionBump(fp)
+            // Queue changed. Keep every id whose song is still in the queue
+            // (FIFO when the same mediaId appears more than once) instead of
+            // recycling ids by position: a deleted entry's id must not silently
+            // become another song's id (clients address songs by id).
+            val available = HashMap<String, ArrayDeque<Int>>()
+            for (i in songMediaIds.indices) {
+                available.getOrPut(songMediaIds[i]) { ArrayDeque() }.addLast(songIds[i])
             }
+            val newIds = ArrayList<Int>(count)
+            for (mid in currentMediaIds) {
+                newIds.add(available[mid]?.removeFirstOrNull() ?: nextSongId++)
+            }
+            if (firstSyncDone) {
+                val idsChanged = newIds != songIds
+                songIds = newIds
+                if (idsChanged || fp != lastFingerprint) scheduleVersionBump(fp)
+            } else {
+                // Fresh server after an app restart: keep the persisted version
+                // when the queue is unchanged (restored), so clients don't see a
+                // version change and don't clear/refetch their playlist view.
+                firstSyncDone = true
+                songIds = newIds
+                if (fp != lastFingerprint) scheduleVersionBump(fp)
+            }
+            songMediaIds = currentMediaIds
+            lastFingerprint = fp
         }
+    }
+
+    /**
+     * Records [items] as inserted at [at] in the local id bookkeeping and returns
+     * the id of the first inserted item. MediaController timeline changes are
+     * applied asynchronously, so [syncIdsIfNeeded] reconciles this on the next
+     * read command if the optimistic record ever drifts from the player.
+     */
+    private fun noteItemsInserted(at: Int, items: List<MediaItem>): Int = synchronized(qLock) {
+        val pos = at.coerceIn(0, songMediaIds.size)
+        val ids = ArrayList<Int>(items.size)
+        for (i in items.indices) ids.add(nextSongId++)
+        songMediaIds = songMediaIds.toMutableList().also { it.addAll(pos, items.map { item -> item.mediaId }) }
+        songIds = songIds.toMutableList().also { it.addAll(pos, ids) }
+        ids.firstOrNull() ?: -1
     }
 
     /**
@@ -675,11 +696,9 @@ class MpdServer(private val context: Context) {
                     c.addMediaItems(at, items)
                     at
                 }
-                // need id of first inserted
-                synchronized(qLock) { /* ids will be synced on next poll/status; approximate */ }
-                // Return Id of inserted first track (best effort)
-                val newId = synchronized(qLock) { songIds.getOrNull(insertedPos) ?: nextSongId }
-                out.append("Id: ").append(newId).append('\n')
+                // Return the id of the first inserted track. The controller timeline
+                // may not have caught up yet, so record the insertion locally now.
+                out.append("Id: ").append(noteItemsInserted(insertedPos, items)).append('\n')
             }
             "delete" -> {
                 if (args.isEmpty()) throw MpdAck(ACK_ARG, "need pos")
@@ -832,7 +851,7 @@ class MpdServer(private val context: Context) {
             // Network-share files: look for common cover images in the SMB folder
             // beside the track, mirroring the local folder-art behavior below.
             if (uri.trim().startsWith("smb://") || uri.trim().startsWith("/smb://")) {
-                val trackUri = uri.trim().removePrefix("/")
+                val trackUri = enrichSmbUri(uri.trim().removePrefix("/"))
                 try {
                     val trackFile = SmbFile(trackUri, SmbContext.getContextForUri(trackUri))
                     if (trackFile.exists() && !trackFile.isDirectory()) {
@@ -847,7 +866,7 @@ class MpdServer(private val context: Context) {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "No SMB folder art for $trackUri: ${e.message}")
+                    Log.w(TAG, "No SMB folder art for ${sanitizeSmbUri(trackUri)}: ${e.message}")
                 }
             } else {
             val file = resolveLocalPath(uri)
@@ -1296,6 +1315,19 @@ class MpdServer(private val context: Context) {
         return out
     }
 
+    /** Canonical root directories a local path is allowed to live in. */
+    private fun storageRootPaths(): List<String> =
+        storageRoots().map { it.first.absolutePath.trimEnd('/') } + "/storage"
+
+    private fun canonicalPath(f: File): String =
+        try { f.canonicalPath } catch (_: Exception) { f.absolutePath }
+
+    private fun isUnderRoots(canonPath: String, roots: List<String>): Boolean =
+        roots.any { canonPath == it || canonPath.startsWith("$it/") }
+
+    /** True when [f] resolves inside one of the browsable storage roots (or /storage). */
+    private fun isUnderStorageRoots(f: File): Boolean = isUnderRoots(canonicalPath(f), storageRootPaths())
+
     private fun resolveLocalPath(mpdUri: String): File {
         val trimmed = mpdUri.trim()
         if (trimmed.isEmpty() || trimmed == "/") throw MpdAck(ACK_NO_EXIST, "use lsinfo with empty uri for roots")
@@ -1308,11 +1340,7 @@ class MpdServer(private val context: Context) {
         if (!f.isAbsolute) throw MpdAck(ACK_ARG, "relative paths not supported")
         // /storage is the parent of all roots — allow it
         if (f.absolutePath == "/storage") return f
-        // Containment check against roots (+ /storage parent)
-        val roots = storageRoots().map { it.first.absolutePath.trimEnd('/') } + "/storage"
-        val canon = try { f.canonicalPath } catch (_: Exception) { f.absolutePath }
-        val allowed = roots.any { canon == it || canon.startsWith("$it/") }
-        if (!allowed) throw MpdAck(ACK_NO_EXIST, "No such directory")
+        if (!isUnderStorageRoots(f)) throw MpdAck(ACK_NO_EXIST, "No such directory")
         return f
     }
 
@@ -1338,9 +1366,60 @@ class MpdServer(private val context: Context) {
     }
 
     /**
+     * Attaches the credentials configured for [uri]'s host/share (from the
+     * "SmbShares" prefs) when the URI carries none. Credentials are never emitted
+     * to MPD clients, so a URI that comes back from `lsinfo`/`playlistinfo` is
+     * enriched here for jcifs before any I/O happens.
+     */
+    private fun enrichSmbUri(uri: String): String {
+        val bare = uri.trim().removePrefix("/")
+        if (!isSmbPath(bare)) return bare
+        return try {
+            val parsed = bare.toUri()
+            if (parsed.userInfo != null) return bare
+            val host = parsed.host ?: return bare
+            val share = parsed.pathSegments?.firstOrNull()?.takeIf { it.isNotBlank() } ?: return bare
+            val cred = findSmbCredentials(host, share) ?: return bare
+            "smb://${Uri.encode(cred.first)}:${Uri.encode(cred.second)}@" + bare.removePrefix("smb://")
+        } catch (_: Exception) { bare }
+    }
+
+    /** Configured user/password for [host] + [share], or null for guest shares. */
+    private fun findSmbCredentials(host: String, share: String): Pair<String, String>? = try {
+        val prefs = appContext.getSharedPreferences("SmbShares", Context.MODE_PRIVATE)
+        val arr = JSONArray(prefs.getString("shares", "[]") ?: "[]")
+        var found: Pair<String, String>? = null
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            if (!obj.optString("ip").trim().equals(host, ignoreCase = true)) continue
+            if (!obj.optString("share").trim().equals(share, ignoreCase = true)) continue
+            val user = obj.optString("user").trim()
+            if (user.isEmpty()) continue
+            found = user to obj.optString("pass")
+            break
+        }
+        found
+    } catch (_: Exception) { null }
+
+    /** Strips `user:pass@` from an smb:// URI before it is sent to a client. */
+    private fun sanitizeSmbUri(uri: String): String {
+        if (!isSmbPath(uri)) return uri.trim()
+        val trimmed = uri.trim()
+        val prefix = if (trimmed.startsWith("/smb://")) "/smb://" else "smb://"
+        val body = trimmed.substringAfter("smb://")
+        val at = body.indexOf('@')
+        if (at < 0) return trimmed
+        // Only an '@' in the authority (before the first '/') is userinfo.
+        val slash = body.indexOf('/')
+        if (slash in 0..at) return trimmed
+        return prefix + body.substring(at + 1)
+    }
+
+    /**
      * Loads the player's configured network shares from the "SmbShares" prefs
-     * (the same store MainFragment uses) and returns each as an smb:// root URI
-     * with embedded credentials, e.g. smb://user:pass@ip/share/.
+     * (the same store MainFragment uses) and returns each as a credential-free
+     * smb:// root URI, e.g. smb://ip/share/. Credentials never leave the server;
+     * [enrichSmbUri] re-attaches them when a client sends the URI back.
      */
     private fun smbShareRoots(): List<String> {
         val roots = ArrayList<String>()
@@ -1353,15 +1432,10 @@ class MpdServer(private val context: Context) {
                 val ip = obj.optString("ip").trim()
                 val share = obj.optString("share").trim()
                 if (ip.isEmpty() || share.isEmpty()) continue
-                val user = obj.optString("user").trim()
-                val pass = obj.optString("pass")
                 val encShare = Uri.encode(share)
-                val uri = if (user.isNotEmpty()) {
-                    "smb://${Uri.encode(user)}:${Uri.encode(pass)}@$ip/$encShare/"
-                } else {
-                    "smb://$ip/$encShare/"
-                }
-                roots.add(uri)
+                // Emit credential-free roots: credentials stay server-side and are
+                // re-attached by enrichSmbUri() when a client sends the URI back.
+                roots.add("smb://$ip/$encShare/")
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load SMB share roots", e)
@@ -1376,7 +1450,7 @@ class MpdServer(private val context: Context) {
             // sends "smb://host/share" not "smb://host/share/"), which would make
             // child paths lose the share ("smb://host/child"). Re-add it so the
             // emitted child URIs keep the full "smb://host/share/child" prefix.
-            val dirUri = mpdUri.trim().let { if (it.endsWith("/")) it else "$it/" }
+            val dirUri = enrichSmbUri(mpdUri.trim()).let { if (it.endsWith("/")) it else "$it/" }
             val dir = SmbFile(dirUri, SmbContext.getContextForUri(dirUri))
             if (!dir.exists() || !dir.isDirectory) throw MpdAck(ACK_NO_EXIST, "No such directory")
             val children = try { dir.listFiles() } catch (e: Exception) { null } ?: throw MpdAck(ACK_NO_EXIST, "No such directory")
@@ -1389,12 +1463,12 @@ class MpdServer(private val context: Context) {
                     // Raw, unencoded — matches reference MPD. Response values are the
                     // rest of the line, so spaces are unambiguous; clients quote the URI
                     // when sending it back as a command argument.
-                    out.append("directory: ").append(f.path.trimEnd('/')).append('/').append('\n')
+                    out.append("directory: ").append(sanitizeSmbUri(f.path.trimEnd('/'))).append('/').append('\n')
                 } else if (MpdLibrary.isAudioFile(name)) {
-                    out.append("file: ").append(f.path).append('\n')
+                    out.append("file: ").append(sanitizeSmbUri(f.path)).append('\n')
                     out.append("Title: ").append(name).append('\n')
                 } else if (PlaylistParser.isPlaylistName(name)) {
-                    out.append("playlist: ").append(f.path).append('\n')
+                    out.append("playlist: ").append(sanitizeSmbUri(f.path)).append('\n')
                 }
             }
         } catch (e: MpdAck) {
@@ -1600,8 +1674,9 @@ class MpdServer(private val context: Context) {
         if (name.isBlank()) return null
         // Only treat real playlist files as playlists — matching by exists()/isFile
         // alone would hijack "add <dir>" or "add <song.mp3>" into an empty playlist
-        // parse (BUG).
-        File(name).takeIf { it.isFile && isPlaylistFile(it.name) }?.let { return it }
+        // parse (BUG). Absolute paths must also stay inside the browsable roots:
+        // otherwise `load /data/local/tmp/evil.m3u` could pull in arbitrary files.
+        File(name).takeIf { it.isFile && isPlaylistFile(it.name) && isUnderStorageRoots(it) }?.let { return it }
         cachedPlaylists()[name]?.let { return it }
         return cachedPlaylists().entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
     }
@@ -1615,7 +1690,7 @@ class MpdServer(private val context: Context) {
         if (args.isEmpty()) throw MpdAck(ACK_ARG, "need playlist name")
         val f = findPlaylist(args[0]) ?: throw MpdAck(ACK_NO_EXIST, "No such playlist")
         for (entry in parseM3uEntries(f)) {
-            out.append("file: ").append(entry.raw).append('\n')
+            out.append("file: ").append(sanitizeSmbUri(entry.raw)).append('\n')
             if (withInfo) {
                 var title: String? = null
                 var artist = ""
@@ -1660,7 +1735,7 @@ class MpdServer(private val context: Context) {
         // smb:// URIs from the `playlist:` lines that writeSmbLsInfo emits, and the
         // protocol says those are loaded with `load` (replace queue), not `add`.
         if (isSmbPath(name)) {
-            val uri = decSmbUri(name.trim().removePrefix("/"))
+            val uri = enrichSmbUri(decSmbUri(name.trim().removePrefix("/")))
             val file = try { SmbFile(uri, SmbContext.getContextForUri(uri)) }
                 catch (e: Exception) { throw MpdAck(ACK_NO_EXIST, e.message ?: "No such playlist") }
             if (!file.exists() || !file.isFile() || !PlaylistParser.isPlaylistName(file.name)) {
@@ -1681,8 +1756,9 @@ class MpdServer(private val context: Context) {
      */
     private fun parseSmbPlaylist(file: SmbFile): List<MediaItem> = try {
         file.getInputStream().use { PlaylistParser.parsePlaylistStream(file.name, it, file.parent) }
+            .let(::filterLocalItems)
     } catch (e: Exception) {
-        Log.w(TAG, "SMB playlist parse failed: ${file.path}", e)
+        Log.w(TAG, "SMB playlist parse failed: ${sanitizeSmbUri(file.path)}", e)
         emptyList()
     }
 
@@ -1693,8 +1769,8 @@ class MpdServer(private val context: Context) {
         f.writeText(buildString {
             append("#EXTM3U\n")
             for (uri in items) {
-                // store absolute path for file:// uris
-                val line = if (uri.startsWith("file://")) Uri.decode(uri.removePrefix("file://")) else uri
+                // store absolute path for file:// uris; never persist SMB credentials
+                val line = if (uri.startsWith("file://")) Uri.decode(uri.removePrefix("file://")) else sanitizeSmbUri(uri)
                 append(line).append('\n')
             }
         })
@@ -1710,11 +1786,9 @@ class MpdServer(private val context: Context) {
         if (u.startsWith("content://")) return listOf(genericItem(u))
         // try stored playlist name first
         findPlaylist(u)?.let { return parsePlaylistFile(it) }
-        val f = try { resolveLocalPath(u) } catch (e: MpdAck) {
-            // fallback: maybe absolute path not under roots but still exists (e.g. /storage/emulated/0/...)
-            val alt = File(Uri.decode(u))
-            if (alt.exists()) alt else throw e
-        }
+        // Strict containment: no "it exists so it must be allowed" fallback —
+        // that let a remote client address any file the app can read.
+        val f = resolveLocalPath(u)
         if (!f.exists()) throw MpdAck(ACK_NO_EXIST, "No such file or directory")
         return when {
             f.isDirectory -> collectDir(f)
@@ -1754,7 +1828,7 @@ class MpdServer(private val context: Context) {
             SacdSupport.buildTrackMediaItems(access, SacdSupport.AREA_STEREO, null, smbFile.path)
                 .getOrDefault(emptyList())
         } catch (e: Exception) {
-            Log.w(TAG, "SACD ISO expand failed: ${smbFile.path}", e)
+            Log.w(TAG, "SACD ISO expand failed: ${sanitizeSmbUri(smbFile.path)}", e)
             emptyList()
         } finally {
             access.close()
@@ -1769,7 +1843,7 @@ class MpdServer(private val context: Context) {
      */
     private fun expandSmbUri(smbUri: String): List<MediaItem> {
         try {
-            val trimmed = smbUri.trim()
+            val trimmed = enrichSmbUri(smbUri)
             val file = SmbFile(trimmed, SmbContext.getContextForUri(trimmed))
             if (!file.exists()) throw MpdAck(ACK_NO_EXIST, "No such file or directory")
             if (!file.isDirectory()) {
@@ -1843,6 +1917,13 @@ class MpdServer(private val context: Context) {
 
     private fun mpdPath(mediaId: String): String = when {
         mediaId.startsWith("file://") -> Uri.decode(mediaId.removePrefix("file://"))
+        mediaId.startsWith("sacd:") -> {
+            // Keep the sacd: track identity but strip credentials from the source
+            // URI embedded in the mediaId.
+            val smbAt = mediaId.indexOf("smb://")
+            if (smbAt < 0) mediaId else mediaId.substring(0, smbAt) + sanitizeSmbUri(mediaId.substring(smbAt))
+        }
+        isSmbPath(mediaId) -> sanitizeSmbUri(mediaId)
         else -> mediaId
     }
 
@@ -2016,10 +2097,11 @@ class MpdServer(private val context: Context) {
     }
 
     private fun parseM3uFile(f: File): List<MediaItem> {
+        val roots = storageRootPaths()
         val out = mutableListOf<MediaItem>()
         for (entry in parseM3uEntries(f)) {
             val file = File(entry.path)
-            if (file.isFile && MpdLibrary.isAudioFile(file.name)) {
+            if (file.isFile && MpdLibrary.isAudioFile(file.name) && isUnderRoots(canonicalPath(file), roots)) {
                 val lib = library.lookup(file.absolutePath)
                 out.add(fileToMediaItem(file, lib))
             } else if (entry.path.startsWith("http")) out.add(streamItem(entry.path, entry.title))
@@ -2040,13 +2122,14 @@ class MpdServer(private val context: Context) {
                 }
             }
             val n = props["numberofentries"]?.toIntOrNull() ?: 0
+            val roots = storageRootPaths()
             for (i in 1..n) {
                 val file = props["file$i"] ?: continue
                 val stationTitle = props["title$i"]
                 val norm = file.replace('\\', '/')
                 val resolved = if (norm.startsWith("/") || norm.contains("://")) norm else File(f.parentFile, norm).absolutePath
                 val fileObj = File(resolved)
-                if (fileObj.exists() && MpdLibrary.isAudioFile(fileObj.name)) out.add(fileToMediaItem(fileObj, library.lookup(fileObj.absolutePath)))
+                if (fileObj.isFile && MpdLibrary.isAudioFile(fileObj.name) && isUnderRoots(canonicalPath(fileObj), roots)) out.add(fileToMediaItem(fileObj, library.lookup(fileObj.absolutePath)))
                 else if (resolved.startsWith("http")) out.add(streamItem(resolved, stationTitle))
             }
         } catch (_: Exception) {}
@@ -2056,8 +2139,25 @@ class MpdServer(private val context: Context) {
     /** One clipped item per CUE track, via the parser shared with the TV UI. */
     private fun parseCueFile(f: File): List<MediaItem> = try {
         FileInputStream(f).use { PlaylistParser.parseCueFromStream(it, f.parentFile?.absolutePath) }
+            .let(::filterLocalItems)
     } catch (e: Exception) {
         Log.w(TAG, "cue read failed: ${f.path}", e); emptyList()
+    }
+
+    /**
+     * Drops local file:// items whose path resolves outside the browsable storage
+     * roots. Playlist entries are client-controlled (a `../` path in an .m3u/.cue),
+     * so the same containment rule as [resolveLocalPath] must apply to them.
+     */
+    private fun filterLocalItems(items: List<MediaItem>): List<MediaItem> {
+        val roots = storageRootPaths()
+        return items.filter { item ->
+            val uri = item.localConfiguration?.uri ?: return@filter true
+            when (uri.scheme?.lowercase()) {
+                null, "file" -> uri.path?.let { isUnderRoots(canonicalPath(File(it)), roots) } == true
+                else -> true
+            }
+        }
     }
 
     /**

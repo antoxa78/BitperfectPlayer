@@ -96,6 +96,7 @@ class NowPlayingActivity : BaseActivity() {
     private lateinit var btnRepeat: ImageButton
     private lateinit var btnDacReset: ImageButton
     private var isSeekBarTracking = false
+    private var progressUpdateRunnable: Runnable? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -173,19 +174,37 @@ class NowPlayingActivity : BaseActivity() {
     private fun setupSeekBar() {
         seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                // Only update the time label here. Seeking is done exclusively in
-                // onStopTrackingTouch to avoid a double-seek on D-pad input, where
-                // onProgressChanged fires before onStartTrackingTouch (BUG-13).
-                if (fromUser) textCurrentTime.text = formatTime(progress.toLong())
+                if (!fromUser) return
+                textCurrentTime.text = formatTime(progress.toLong())
+                // D-pad/arrow keys change a SeekBar's progress through its key
+                // handler without ever calling onStart/onStopTrackingTouch, so the
+                // only chance to apply a remote seek is here. A touch drag sets
+                // isSeekBarTracking in onStartTrackingTouch and is applied once on
+                // release in onStopTrackingTouch instead.
+                if (!isSeekBarTracking) seekFromUser(progress.toLong())
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {
-                isSeekBarTracking = true; handler.removeCallbacksAndMessages(null)
+                isSeekBarTracking = true
+                // Pause the position poller so it does not fight the drag; it is
+                // restarted in onStopTrackingTouch. Only the progress runnable is
+                // removed — removeCallbacksAndMessages(null) also cancelled
+                // unrelated one-shot posts (DAC reset retry, deferred UI refresh).
+                progressUpdateRunnable?.let { handler.removeCallbacks(it) }
             }
             override fun onStopTrackingTouch(sb: SeekBar?) {
-                mediaController?.seekTo(sb?.progress?.toLong() ?: 0L)
-                isSeekBarTracking = false; startProgressUpdate()
+                isSeekBarTracking = false
+                seekFromUser(sb?.progress?.toLong() ?: 0L)
+                startProgressUpdate()
             }
         })
+    }
+
+    /** Applies a user seek for seekable items; live streams have no real position. */
+    private fun seekFromUser(positionMs: Long) {
+        val c = mediaController ?: return
+        val dur = c.duration
+        if (dur <= 0L || dur == Long.MAX_VALUE || dur == C.TIME_UNSET) return
+        c.seekTo(positionMs.coerceIn(0L, dur))
     }
 
     // ── Buttons ───────────────────────────────────────────────────────────────
@@ -805,8 +824,8 @@ class NowPlayingActivity : BaseActivity() {
     private fun startProgressUpdate() {
         // Cancel any existing loop before starting a new one so there is never
         // more than one concurrent progress-update Runnable (BUG-10).
-        handler.removeCallbacksAndMessages(null)
-        handler.post(object : Runnable {
+        progressUpdateRunnable?.let { handler.removeCallbacks(it) }
+        val runnable = object : Runnable {
             override fun run() {
                 val c = mediaController ?: return
                 val pos = c.currentPosition; val dur = c.duration
@@ -822,7 +841,9 @@ class NowPlayingActivity : BaseActivity() {
 
                 handler.postDelayed(this, PROGRESS_TICK_MS)
             }
-        })
+        }
+        progressUpdateRunnable = runnable
+        handler.post(runnable)
     }
 
     private fun formatTime(ms: Long): String { val s = ms / 1000; return "%d:%02d".format(s / 60, s % 60) }
