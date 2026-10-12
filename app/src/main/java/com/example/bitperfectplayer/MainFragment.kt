@@ -35,7 +35,6 @@ class MainFragment : BrowseSupportFragment() {
     private val KEY_RECENT = "recent_files"
     private val KEY_MUSIC_FOLDERS = "music_folders"
     private val KEY_AUTO_SCAN = "auto_scan"
-    private val KEY_COLOR_SCHEME = "color_scheme"
     private val KEY_WAVEFORM_TYPE = "waveform_type"
     private val KEY_AUDIO_OUTPUT_MODE = "audio_output_mode"
     private val KEY_USBDEVFS_DRIVER  = "usbdevfs_driver"
@@ -90,7 +89,7 @@ class MainFragment : BrowseSupportFragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        view.setBackgroundColor(0xFF000000.toInt())
+        view.background = ColorThemes.browseBackground(ColorThemes.current(requireContext()))
         setupUIElements()
         loadRows()
         setupEventListeners()
@@ -194,11 +193,22 @@ class MainFragment : BrowseSupportFragment() {
         title = "Bitperfect Player"
         headersState = HEADERS_ENABLED
         isHeadersTransitionOnBackEnabled = true
-        // Sidebar brand color: use the theme accent color as sidebar background,
-        // but for light/white schemes the sidebar must stay dark so white header
-        // text remains readable.
+        // Sidebar brand color: a dark, accent-tinted tone of the current theme, so the
+        // white header text stays readable on every scheme (see ColorThemes.sidebar).
         brandColor = getSidebarColor(requireContext())
+        // Sidebar headers with a per-section icon and an accent pill on the focused one.
+        setHeaderPresenterSelector(object : PresenterSelector() {
+            private val presenter = IconHeaderItemPresenter()
+            override fun getPresenter(item: Any?): Presenter = presenter
+        })
     }
+
+    /** Logo + "BitPerfect PLAYER" wordmark instead of Leanback's plain title text. */
+    override fun onInflateTitleView(
+        inflater: LayoutInflater,
+        parent: android.view.ViewGroup?,
+        savedInstanceState: Bundle?,
+    ): View = BrandTitleView(parent?.context ?: requireContext())
 
     fun refreshRows(targetRowId: Long = -1L, selectedColumn: Int = -1) {
         if (::rowsAdapter.isInitialized) {
@@ -232,7 +242,9 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun loadRows() {
-        rowsAdapter = ArrayObjectAdapter(ListRowPresenter())
+        // Medium zoom on the focused card (as before) plus the focus dimmer, which darkens the
+        // rows you are not in so the active row stands out.
+        rowsAdapter = ArrayObjectAdapter(ListRowPresenter(FocusHighlight.ZOOM_FACTOR_MEDIUM, true))
         val cardPresenter = CardPresenter { item ->
             if (item.mediaId.startsWith("smb://")) {
                 handleSmbSelection(item.mediaId)
@@ -2459,43 +2471,45 @@ class MainFragment : BrowseSupportFragment() {
             .show()
     }
 
-    private fun getColorSchemeName(): String {
-        val schemes = arrayOf("Neon Green", "Electric Blue", "Amber Gold", "Deep Purple", "Hot Pink", "Pure Black with Grey", "Pure Black with Red", "Pure Black with Green", "Pure Black with White")
-        val index = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-            .getInt(KEY_COLOR_SCHEME, 0)
-        return if (index in schemes.indices) schemes[index] else schemes[0]
-    }
-
-    private fun getColorSchemeColor(): Int {
-        val colors = intArrayOf(
-            0xFF00E676.toInt(), // Neon Green
-            0xFF2979FF.toInt(), // Electric Blue
-            0xFFFFC400.toInt(), // Amber Gold
-            0xFF7C4DFF.toInt(), // Deep Purple
-            0xFFFF4081.toInt(), // Hot Pink
-            0xFF888888.toInt(), // Grey
-            0xFFFF5252.toInt(), // Red
-            0xFF1B5E20.toInt(), // Dark Green (Material 900)
-            0xFFFFFFFF.toInt()  // White
-        )
-        val index = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-            .getInt(KEY_COLOR_SCHEME, 0)
-        return if (index in colors.indices) colors[index] else colors[0]
-    }
+    private fun getColorSchemeName(): String = ColorThemes.current(requireContext()).name
 
     private fun showColorSchemeDialog() {
-        val schemeNames = arrayOf("Neon Green", "Electric Blue", "Amber Gold", "Deep Purple", "Hot Pink", "Pure Black with Grey", "Pure Black with Red", "Pure Black with Green", "Pure Black with White")
-        val items = schemeNames.map { DialogOptionItem(it, R.drawable.ic_palette) }
-        val adapter = DialogOptionAdapter(requireContext(), items)
-        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        val ctx = requireContext()
+        val currentId = ColorThemes.currentId(ctx)
+        val themes = ColorThemes.PICKER_ORDER.map { ColorThemes.byId(it) }
+        val items = themes.map { theme ->
+            DialogOptionItem(
+                theme.name,
+                R.drawable.ic_palette,
+                iconDrawable = ColorThemes.swatch(ctx, theme, selected = theme.id == currentId),
+            )
+        }
+        val adapter = DialogOptionAdapter(ctx, items)
+        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Player Color Scheme")
             .setAdapter(adapter) { _, which ->
-                requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    .edit().putInt(KEY_COLOR_SCHEME, which).apply()
-                refreshWithCurrentFocus()
+                val theme = themes[which]
+                if (theme.id != currentId) {
+                    ColorThemes.select(ctx, theme.id)
+                    applyColorTheme()
+                    refreshWithCurrentFocus()
+                }
             }
             .setNegativeButton("Back", null)
+            .create()
+            .apply {
+                // Open with the active theme in view rather than at the top of a long list.
+                setOnShowListener { listView?.setSelection(themes.indexOfFirst { it.id == currentId }.coerceAtLeast(0)) }
+            }
             .show()
+    }
+
+    /** Re-applies the theme surfaces that are not rebuilt with the rows (sidebar, background). */
+    private fun applyColorTheme() {
+        val theme = ColorThemes.current(requireContext())
+        brandColor = theme.sidebar
+        view?.background = ColorThemes.browseBackground(theme)
+        (titleView as? BrandTitleView)?.applyTheme(theme)
     }
 
     private val audioOutputNames = arrayOf(
@@ -2538,7 +2552,9 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun showAudioOutputDialog() {
-        val items = audioOutputNames.map { DialogOptionItem(it, R.drawable.ic_speaker) }
+        val items = audioOutputNames.mapIndexed { i, name ->
+            DialogOptionItem(name, PlaybackService.audioOutputIconRes(audioOutputModes[i]))
+        }
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Audio Output")
@@ -2642,7 +2658,12 @@ class MainFragment : BrowseSupportFragment() {
         }
     }
 
-    data class DialogOptionItem(val label: String, val iconRes: Int)
+    data class DialogOptionItem(
+        val label: String,
+        val iconRes: Int,
+        /** Drawn as-is instead of [iconRes] tinted with the theme colour (e.g. theme swatches). */
+        val iconDrawable: android.graphics.drawable.Drawable? = null,
+    )
 
     class DialogOptionAdapter(context: Context, items: List<DialogOptionItem>) :
         android.widget.ArrayAdapter<DialogOptionItem>(context, R.layout.list_item_browse, items) {
@@ -2651,8 +2672,12 @@ class MainFragment : BrowseSupportFragment() {
             val item = getItem(position) ?: return view
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.label
             val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
-            icon.setImageResource(item.iconRes)
-            icon.drawable?.mutate()?.setTint(getThemeColor(context))
+            if (item.iconDrawable != null) {
+                icon.setImageDrawable(item.iconDrawable)
+            } else {
+                icon.setImageResource(item.iconRes)
+                icon.drawable?.mutate()?.setTint(getThemeColor(context))
+            }
             return view
         }
     }
@@ -3276,42 +3301,10 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     companion object {
-        fun getSidebarColor(context: Context): Int {
-            val index = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
-                .getInt("color_scheme", 0)
-            // For Pure Black schemes (indices 5-8) the sidebar stays pure black (#1a1a1a)
-            // so that white/light header text remains readable against a dark background.
-            // For all other schemes we tint the sidebar with the accent color as before.
-            return when (index) {
-                5, 6, 7, 8 -> 0xFF1A1A1A.toInt() // Pure Black variants → dark sidebar
-                else -> {
-                    val colors = intArrayOf(
-                        0xFF00E676.toInt(), // Neon Green
-                        0xFF2979FF.toInt(), // Electric Blue
-                        0xFFFFC400.toInt(), // Amber Gold
-                        0xFF7C4DFF.toInt(), // Deep Purple
-                        0xFFFF4081.toInt(), // Hot Pink
-                    )
-                    if (index in colors.indices) colors[index] else colors[0]
-                }
-            }
-        }
+        /** Leanback headers sidebar colour for the current theme (always dark, accent-tinted). */
+        fun getSidebarColor(context: Context): Int = ColorThemes.current(context).sidebar
 
-        fun getThemeColor(context: Context): Int {
-            val colors = intArrayOf(
-                0xFF00E676.toInt(), // Neon Green
-                0xFF2979FF.toInt(), // Electric Blue
-                0xFFFFC400.toInt(), // Amber Gold
-                0xFF7C4DFF.toInt(), // Deep Purple
-                0xFFFF4081.toInt(), // Hot Pink
-                0xFF888888.toInt(), // Grey
-                0xFFFF5252.toInt(), // Red
-                0xFF1B5E20.toInt(), // Dark Green
-                0xFFFFFFFF.toInt()  // White
-            )
-            val index = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
-                .getInt("color_scheme", 0)
-            return if (index in colors.indices) colors[index] else colors[0]
-        }
+        /** Accent colour of the current theme. */
+        fun getThemeColor(context: Context): Int = ColorThemes.current(context).accent
     }
 }

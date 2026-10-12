@@ -178,13 +178,7 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    private fun getThemeColor(): Int {
-        val index = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
-        return if (index in CardPresenter.THEME_COLORS.indices)
-            CardPresenter.THEME_COLORS[index]
-        else
-            CardPresenter.THEME_COLORS[0]
-    }
+    private fun getThemeColor(): Int = ColorThemes.current(this).accent
 
     // ---------------------------------------------------------------------------
     // Playlist management

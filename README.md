@@ -2,6 +2,16 @@
 
 A high-fidelity music player designed specifically for Nvidia Shield Android TV, focusing on bit-perfect audio delivery and seamless integration with both local and network storage.
 
+## Support
+
+Enjoying the app? A small donation is greatly appreciated and helps keep the project going:
+
+<p align="center">
+  <a href="https://www.paypal.me/antoxab1978" target="_blank">
+    <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal" />
+  </a>
+</p>
+
 ## Features
 
 *   **Bit-Perfect Audio**: Bypasses system mixers where possible to ensure high-resolution audio (FLAC, WAV, etc.) reaches your DAC as intended.

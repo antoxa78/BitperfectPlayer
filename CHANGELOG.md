@@ -1,6 +1,18 @@
 # Changelog
 
-## 3.1.0-beta14 - 2026-10-05
+## 3.1.1 - 2026-10-12
+
+### Added
+
+- **Now Playing screen redesign:** an ambient backdrop — a tiny, upscaled copy of the album art so it reads as a soft colour wash — sits behind the UI with a theme-tinted gradient scrim that keeps the cover's colours visible behind the art and darkens towards the text and controls. The text area gets a framed album cover, the info line becomes rounded pills (neutral for station/genre, accent-tinted for codec/bitrate/sample rate), and the transport buttons are theme-coloured discs with a white focus ring on play/pause.
+- **The player colour themes live in one place (`ColorThemes`) and every screen derives its surfaces from them.** The original eight schemes keep their ids and meanings, and the palette grows to 21 themes, including new tinted bases (Ocean Teal, Sunset Orange, Arctic Frost, Tube Amp Glow, Midnight Indigo, Crimson Velvet, Lime Pulse, Rose Gold, Cyber Cyan) and new "Pure Black" OLED schemes (Blue, Amber, Purple). Cards, the sidebar, the menu chrome and Now Playing all follow the selected theme, so a new theme is a single entry.
+- **Audio Output mode buttons show an icon per mode** (USB driver / bit-perfect Android / standard), shared between the Settings card and the Now Playing DAC button through `PlaybackService` so both always display the same glyph.
+
+### Changed
+
+- **Menu chrome: the Leanback title is replaced by a branded logo + wordmark** whose second half is drawn in the theme accent, and each sidebar section header gets an icon (Now Playing, Actions, Library, Shares, Settings, Recently Played, Playlists, Exit) with an accent pill behind the focused one.
+- **Cards get a theme-tinted icon tile and brightened info area**, so each card reads as one surface; the info area warms toward the accent when the card has focus.
+- **Waveform bars (Mirrored Bars, Single Bars, Bars with level hold) are narrower** — half their slot width, centred — leaving more space between bars; the dot-based waveforms are unchanged.
 
 ### Fixed
 

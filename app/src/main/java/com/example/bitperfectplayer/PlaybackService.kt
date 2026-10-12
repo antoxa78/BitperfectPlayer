@@ -177,6 +177,18 @@ class PlaybackService : MediaSessionService() {
             return if (stored == 0) AUDIO_OUTPUT_BITPERFECT_ANDROID else stored
         }
 
+        /** Icon for an audio output mode — shared by Settings → Audio Output and the
+         *  Now Playing DAC button so both always show the same glyph per mode. */
+        fun audioOutputIconRes(mode: Int): Int = when (mode) {
+            AUDIO_OUTPUT_USBDEVFS         -> R.drawable.ic_output_usb_driver
+            AUDIO_OUTPUT_STANDARD_ANDROID -> R.drawable.ic_output_standard
+            else                          -> R.drawable.ic_output_bitperfect_android
+        }
+
+        /** Icon for the output mode currently in effect. */
+        fun currentAudioOutputIconRes(context: Context): Int =
+            audioOutputIconRes(effectiveAudioOutputMode(context))
+
         fun isDopSelected(context: Context): Boolean =
             context.getSharedPreferences(PREFS_APP, Context.MODE_PRIVATE)
                 .getString(KEY_DSD_OUTPUT, DSD_OUTPUT_PCM) == DSD_OUTPUT_DOP

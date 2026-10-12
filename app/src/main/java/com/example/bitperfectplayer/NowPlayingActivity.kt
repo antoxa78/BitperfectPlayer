@@ -42,24 +42,21 @@ class NowPlayingActivity : BaseActivity() {
 
     companion object {
         private const val PREFS_APP          = "AppSettings"
-        private const val KEY_COLOR_SCHEME   = "color_scheme"
         private const val KEY_WAVEFORM_TYPE  = "waveform_type"
-        private const val PURE_BLACK_INDEX   = 5
-        private const val BG_DARK            = 0xFF121212.toInt()
-        private const val BG_PURE_BLACK      = 0xFF000000.toInt()
         private const val PROGRESS_TICK_MS   = 1_000L
         private const val METADATA_DELAY_1   = 1_000L
         private const val METADATA_DELAY_2   = 3_000L
         private const val DAC_RESET_SERVICE_RETRY_MS = 200L
+        private const val ART_FADE_MS        = 350L
+        private const val BACKDROP_FADE_MS   = 600L
+        /** Opacity of the blurred cover behind the UI (under the theme scrim). */
+        private const val BACKDROP_ALPHA     = 0.85f
 
         private val CLEANUP_REGEX = Regex("(?i)(\\s*\\(.*?remaster.*?\\)|\\s*\\[.*?explicit.*?\\]|\\s*\\(.*?live.*?\\)|\\s*\\(.*?feat.*?\\)|\\s*-\\s*single|\\s*-\\s*ep)")
         private val FOLDER_ART_NAMES = arrayOf("folder.jpg", "cover.jpg", "album.jpg", "folder.png", "cover.png", "album.png", "front.jpg")
 
-        val THEME_COLORS = intArrayOf(
-            0xFF00E676.toInt(), 0xFF2979FF.toInt(), 0xFFFFC400.toInt(),
-            0xFF7C4DFF.toInt(), 0xFFFF4081.toInt(), 0xFF888888.toInt(),
-            0xFFFF5252.toInt(), 0xFF1B5E20.toInt(), 0xFFFFFFFF.toInt(),
-        )
+        /** Accent colours of all themes, indexed by theme id (see [ColorThemes]). */
+        val THEME_COLORS: IntArray get() = ColorThemes.ALL.map { it.accent }.toIntArray()
     }
 
     private var mediaController: MediaController? = null
@@ -90,6 +87,11 @@ class NowPlayingActivity : BaseActivity() {
     private lateinit var textCurrentTime: TextView
     private lateinit var textTotalTime: TextView
     private lateinit var imgTrackIcon: ImageView
+    private lateinit var imgBackdrop: ImageView
+    private lateinit var backdropScrim: android.view.View
+    private lateinit var artFrame: android.view.View
+    /** Cover currently shown (null while the placeholder is up), for re-theming the backdrop. */
+    private var currentArt: Bitmap? = null
     private lateinit var seekBar: SeekBar
     private lateinit var btnPlayPause: ImageButton
     private lateinit var btnShuffle: ImageButton
@@ -122,6 +124,15 @@ class NowPlayingActivity : BaseActivity() {
         }, MoreExecutors.directExecutor())
     }
 
+    override fun onResume() {
+        super.onResume()
+        // The colour theme or output mode may have changed in Settings while this screen was hidden.
+        if (::btnDacReset.isInitialized) {
+            applyColorTheme()
+            updateDacButton()
+        }
+    }
+
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         // Remove the player listener before releasing the controller so it cannot
@@ -150,25 +161,43 @@ class NowPlayingActivity : BaseActivity() {
         btnShuffle       = findViewById(R.id.btn_shuffle)
         btnRepeat        = findViewById(R.id.btn_repeat)
         btnDacReset      = findViewById(R.id.btn_dac_reset)
+        imgBackdrop      = findViewById(R.id.img_backdrop)
+        backdropScrim    = findViewById(R.id.view_backdrop_scrim)
+        artFrame         = findViewById(R.id.art_frame)
+
+        // Rounded cover: the frame's rounded background is its outline, clip the art to it.
+        artFrame.clipToOutline = true
+        // Android 12+: a real blur on top of the down-scaled backdrop smooths out any banding.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val r = 28f * resources.displayMetrics.density
+            imgBackdrop.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(r, r, android.graphics.Shader.TileMode.CLAMP))
+        }
 
         // Ensure compound drawables are visible and tinted
         setupCompoundDrawables()
     }
 
+    /**
+     * The title stands on its own (largest type); artist and album get small leading icons,
+     * sized to their text and tinted with a soft version of the theme accent.
+     */
     private fun setupCompoundDrawables() {
-        val colorPrimary = ContextCompat.getColor(this, R.color.text_primary)
-        val colorSecondary = ContextCompat.getColor(this, R.color.text_secondary)
-        val colorArtist = Color.parseColor("#CCFFFFFF")
+        val theme = ColorThemes.current(this)
+        val iconTint = androidx.core.graphics.ColorUtils.blendARGB(0xFFBBBBBB.toInt(), theme.accent, 0.55f)
 
-        fun setTintedDrawable(tv: TextView, drawableRes: Int, color: Int) {
-            val drawable = ContextCompat.getDrawable(this, drawableRes)?.mutate()
-            drawable?.setTint(color)
-            tv.setCompoundDrawablesWithIntrinsicBounds(drawable, null, null, null)
+        fun setTintedDrawable(tv: TextView, drawableRes: Int?, color: Int) {
+            val drawable = drawableRes?.let { ContextCompat.getDrawable(this, it)?.mutate() }
+            drawable?.let {
+                val size = (tv.textSize * 1.05f).toInt()
+                it.setBounds(0, 0, size, size)
+                it.setTint(color)
+            }
+            tv.setCompoundDrawablesRelative(drawable, null, null, null)
         }
 
-        setTintedDrawable(textTitle, R.drawable.ic_audio, colorPrimary)
-        setTintedDrawable(textArtist, R.drawable.ic_artist, colorArtist)
-        setTintedDrawable(textAlbum, R.drawable.ic_album_art, colorSecondary)
+        setTintedDrawable(textTitle, null, 0)
+        setTintedDrawable(textArtist, R.drawable.ic_artist, iconTint)
+        setTintedDrawable(textAlbum, R.drawable.ic_album_art, iconTint)
     }
 
     private fun setupSeekBar() {
@@ -331,8 +360,19 @@ class NowPlayingActivity : BaseActivity() {
             .show()
     }
 
-    /** Updates DAC button: applies theme color tint and dims when no DAC is present. */
+    /** Drawable currently shown on the DAC button, so frequent refreshes don't re-inflate it. */
+    private var dacButtonIconRes = 0
+
+    /**
+     * Updates DAC button: shows the icon of the active audio output mode, applies
+     * theme color tint and dims when no DAC is present.
+     */
     private fun updateDacButton() {
+        val iconRes = PlaybackService.currentAudioOutputIconRes(this)
+        if (iconRes != dacButtonIconRes) {
+            btnDacReset.setImageResource(iconRes)
+            dacButtonIconRes = iconRes
+        }
         val dacPresent = PlaybackService.findUsbAudioDevice(this) != null
         val color = getThemeColor()
         btnDacReset.imageTintList = android.content.res.ColorStateList.valueOf(color)
@@ -346,7 +386,7 @@ class NowPlayingActivity : BaseActivity() {
         animatedWaveform.setPlaying(controller.isPlaying)
         animatedWaveform.setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM_TYPE, 0))
         animatedWaveform.setColor(getThemeColor())
-        updateControlButtonsTint()
+        applyColorTheme()
 
         // Store the listener so it can be removed in onDestroy (BUG-11).
         val listener = object : Player.Listener {
@@ -476,28 +516,51 @@ class NowPlayingActivity : BaseActivity() {
 
     // ── UI updates ────────────────────────────────────────────────────────────
 
-    private fun updateControlButtonsTint() {
-        val tc = getThemeColor()
-        // Default (rest) state uses the full theme colour; pressed/focused states
-        // get a darkened semi-transparent variant. The previous code had
-        // Color.TRANSPARENT as the rest state, making buttons invisible (BUG-14).
-        val tl = android.content.res.ColorStateList(
-            arrayOf(intArrayOf(android.R.attr.state_pressed), intArrayOf(android.R.attr.state_focused), intArrayOf()),
-            intArrayOf((tc and 0x00FFFFFF) or 0x66000000, (tc and 0x00FFFFFF) or 0x44000000, tc)
-        )
+    /** Theme id whose surfaces are currently applied, so frequent UI refreshes stay cheap. */
+    private var appliedThemeId = -1
+
+    /**
+     * Applies the colour theme: accent-wash background gradient, transport-button focus
+     * halos, the solid accent play/pause disc, seek bar and waveform. No-op when unchanged.
+     */
+    private fun applyColorTheme() {
+        val theme = ColorThemes.current(this)
+        if (theme.id == appliedThemeId) return
+        appliedThemeId = theme.id
+
+        window.decorView.setBackgroundColor(theme.backgroundDeep)
+        findViewById<android.view.View>(R.id.now_playing_root)?.background =
+            ColorThemes.nowPlayingBackground(theme)
+
         listOf(R.id.btn_shuffle, R.id.btn_prev, R.id.btn_play_pause, R.id.btn_next,
                R.id.btn_repeat, R.id.btn_playlist, R.id.btn_dac_reset)
-            .forEach { id -> findViewById<ImageButton>(id)?.backgroundTintList = tl }
+            .forEach { id ->
+                findViewById<ImageButton>(id)?.apply {
+                    backgroundTintList = null
+                    background = ColorThemes.controlButtonBackground(
+                        this@NowPlayingActivity, theme, filled = id == R.id.btn_play_pause)
+                }
+            }
+        btnPlayPause.imageTintList = android.content.res.ColorStateList.valueOf(theme.onAccent)
+
+        seekBar.progressTintList = android.content.res.ColorStateList.valueOf(theme.accent)
+        seekBar.thumbTintList = android.content.res.ColorStateList.valueOf(theme.accent)
+        seekBar.progressBackgroundTintList = android.content.res.ColorStateList.valueOf(0x40FFFFFF)
+
+        animatedWaveform.setColor(theme.accent)
+        backdropScrim.background = ColorThemes.nowPlayingScrim(theme)
+        setupCompoundDrawables()
+        // Re-tint the placeholder, or re-decide the backdrop (Pure Black themes have none).
+        currentArt?.let { showBackdrop(it) } ?: showArtPlaceholder()
+        updateShuffleRepeatUI()
+        updateDacButton()
     }
 
     @OptIn(UnstableApi::class)
     private fun updateUI() {
         val controller = mediaController ?: return
 
-        val colorIndex = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
-        val bgColor = if (colorIndex >= PURE_BLACK_INDEX) BG_PURE_BLACK else BG_DARK
-        window.decorView.setBackgroundColor(bgColor)
-        findViewById<android.widget.LinearLayout>(R.id.now_playing_root)?.setBackgroundColor(bgColor)
+        applyColorTheme()
 
         val metadata  = controller.mediaMetadata
         val mediaItem = controller.currentMediaItem
@@ -531,7 +594,8 @@ class NowPlayingActivity : BaseActivity() {
         if (!finalAlbum.isNullOrEmpty()) { textAlbum.text = finalAlbum; textAlbum.visibility = android.view.View.VISIBLE }
         else textAlbum.visibility = android.view.View.INVISIBLE
 
-        textPlaylistPos.text = "${controller.currentMediaItemIndex + 1} / ${controller.mediaItemCount}"
+        textPlaylistPos.text =
+            if (controller.mediaItemCount > 0) "TRACK ${controller.currentMediaItemIndex + 1} OF ${controller.mediaItemCount}" else ""
 
         val uri = mediaItem?.mediaId ?: ""
         loadAlbumArt(uri, dispArtist, metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString(), dispTrack)
@@ -547,14 +611,18 @@ class NowPlayingActivity : BaseActivity() {
                 if (format != null) break
             }
         }
-        val infoList = mutableListOf<String>()
+        val metaList = mutableListOf<String>()
         val icyName = station ?: albumArtist
-        if (!icyName.isNullOrBlank() && icyName != artist && icyName != dispArtist && icyName != dispTrack) infoList.add(icyName)
-        if (!genre.isNullOrBlank() && genre != icyName && genre != dispArtist && genre != dispTrack) infoList.add(genre)
-        format?.let { infoList.addAll(formatInfoParts(it)) }
+        if (!icyName.isNullOrBlank() && icyName != artist && icyName != dispArtist && icyName != dispTrack) metaList.add(icyName)
+        if (!genre.isNullOrBlank() && genre != icyName && genre != dispArtist && genre != dispTrack) metaList.add(genre)
+        val formatList = format?.let { formatInfoParts(it) } ?: emptyList()
 
-        if (infoList.isNotEmpty()) { textBitrate.text = infoList.joinToString(" | "); textBitrate.setTextColor(Color.WHITE) }
-        else {
+        if (metaList.isNotEmpty() || formatList.isNotEmpty()) {
+            // Pills: neutral for station/genre, accent-tinted for the audio format.
+            textBitrate.ellipsize = null
+            textBitrate.text = NowPlayingStyle.chips(metaList, formatList, ColorThemes.current(this), resources.displayMetrics.density)
+        } else {
+            textBitrate.ellipsize = android.text.TextUtils.TruncateAt.END
             textBitrate.setTextColor(0xFF888888.toInt())
             textBitrate.text = when (controller.playbackState) {
                 Player.STATE_BUFFERING -> "Buffering…"; Player.STATE_IDLE -> "Idle"
@@ -593,17 +661,13 @@ class NowPlayingActivity : BaseActivity() {
         if (artworkData != null && artworkData.isNotEmpty()) {
             val bmp = BitmapFactory.decodeByteArray(artworkData, 0, artworkData.size)
             if (bmp != null) {
-                imgTrackIcon.scaleType = ImageView.ScaleType.CENTER_CROP
-                imgTrackIcon.setImageBitmap(bmp)
-                imgTrackIcon.clearColorFilter()
+                showArt(bmp)
                 return
             }
         }
 
         // Placeholder while loading
-        imgTrackIcon.scaleType = ImageView.ScaleType.FIT_CENTER
-        imgTrackIcon.setImageResource(R.drawable.ic_audio)
-        imgTrackIcon.setColorFilter(getThemeColor())
+        showArtPlaceholder()
 
         if (artist.isBlank() || artist.equals("Unknown Artist", ignoreCase = true)) return
 
@@ -626,17 +690,56 @@ class NowPlayingActivity : BaseActivity() {
 
             runOnUiThread {
                 if (capturedKey != lastArtKey) return@runOnUiThread   // track changed while fetching
-                if (bitmap != null) {
-                    imgTrackIcon.scaleType = ImageView.ScaleType.CENTER_CROP
-                    imgTrackIcon.setImageBitmap(bitmap)
-                    imgTrackIcon.clearColorFilter()
-                } else {
-                    imgTrackIcon.scaleType = ImageView.ScaleType.FIT_CENTER
-                    imgTrackIcon.setImageResource(R.drawable.ic_audio)
-                    imgTrackIcon.setColorFilter(getThemeColor())
-                }
+                if (bitmap != null) showArt(bitmap) else showArtPlaceholder()
             }
         }.start()
+    }
+
+    /** Shows a cover: fades it in and paints the blurred backdrop from it. */
+    private fun showArt(bmp: Bitmap) {
+        currentArt = bmp
+        imgTrackIcon.background = null
+        imgTrackIcon.setPadding(0, 0, 0, 0)
+        imgTrackIcon.scaleType = ImageView.ScaleType.CENTER_CROP
+        imgTrackIcon.clearColorFilter()
+        imgTrackIcon.setImageBitmap(bmp)
+        imgTrackIcon.alpha = 0f
+        imgTrackIcon.animate().alpha(1f).setDuration(ART_FADE_MS).start()
+        showBackdrop(bmp)
+    }
+
+    /** No cover: a theme-tinted tile with a note icon, and no backdrop. */
+    private fun showArtPlaceholder() {
+        currentArt = null
+        val theme = ColorThemes.current(this)
+        val pad = (84 * resources.displayMetrics.density).toInt()
+        imgTrackIcon.animate().cancel()
+        imgTrackIcon.alpha = 1f
+        imgTrackIcon.background = ColorThemes.cardImageBackground(theme)
+        imgTrackIcon.setPadding(pad, pad, pad, pad)
+        imgTrackIcon.scaleType = ImageView.ScaleType.FIT_CENTER
+        imgTrackIcon.setImageResource(R.drawable.ic_audio)
+        imgTrackIcon.setColorFilter(theme.accent)
+        hideBackdrop()
+    }
+
+    /** Full-screen blurred cover under a scrim; skipped on Pure Black (OLED) themes. */
+    private fun showBackdrop(bmp: Bitmap) {
+        if (ColorThemes.current(this).pureBlack) { hideBackdrop(); return }
+        val ambient = try { NowPlayingStyle.ambientBitmap(bmp) } catch (e: Exception) { null }
+        if (ambient == null) { hideBackdrop(); return }
+        imgBackdrop.setImageBitmap(ambient)
+        backdropScrim.visibility = android.view.View.VISIBLE
+        imgBackdrop.visibility = android.view.View.VISIBLE
+        imgBackdrop.animate().alpha(BACKDROP_ALPHA).setDuration(BACKDROP_FADE_MS).start()
+    }
+
+    private fun hideBackdrop() {
+        imgBackdrop.animate().cancel()
+        imgBackdrop.alpha = 0f
+        imgBackdrop.visibility = android.view.View.GONE
+        imgBackdrop.setImageDrawable(null)
+        backdropScrim.visibility = android.view.View.GONE
     }
 
     private fun sanitizeForSearch(text: String): String {
@@ -811,12 +914,20 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun updateShuffleRepeatUI() {
         val c = mediaController ?: return
-        btnShuffle.alpha = if (c.shuffleModeEnabled) 1.0f else 0.5f
-        when (c.repeatMode) {
-            Player.REPEAT_MODE_OFF -> { btnRepeat.setImageResource(R.drawable.ic_repeat);     btnRepeat.alpha = 0.5f }
-            Player.REPEAT_MODE_ALL -> { btnRepeat.setImageResource(R.drawable.ic_repeat);     btnRepeat.alpha = 1.0f }
-            Player.REPEAT_MODE_ONE -> { btnRepeat.setImageResource(R.drawable.ic_repeat_one); btnRepeat.alpha = 1.0f }
+        // On = accent colour at full opacity, off = dimmed white, so the state reads at a glance.
+        val accent = android.content.res.ColorStateList.valueOf(getThemeColor())
+        val off = android.content.res.ColorStateList.valueOf(Color.WHITE)
+        fun style(button: ImageButton, on: Boolean) {
+            button.imageTintList = if (on) accent else off
+            button.alpha = if (on) 1.0f else 0.55f
         }
+        style(btnShuffle, c.shuffleModeEnabled)
+        when (c.repeatMode) {
+            Player.REPEAT_MODE_OFF -> btnRepeat.setImageResource(R.drawable.ic_repeat)
+            Player.REPEAT_MODE_ALL -> btnRepeat.setImageResource(R.drawable.ic_repeat)
+            Player.REPEAT_MODE_ONE -> btnRepeat.setImageResource(R.drawable.ic_repeat_one)
+        }
+        style(btnRepeat, c.repeatMode != Player.REPEAT_MODE_OFF)
     }
 
     // ── Progress bar ──────────────────────────────────────────────────────────
@@ -868,11 +979,16 @@ class NowPlayingActivity : BaseActivity() {
         f.label?.takeIf { it.startsWith("DSD") }?.let { p.add(it) }
         if (f.bitrate != Format.NO_VALUE && f.bitrate > 0) p.add("${f.bitrate / 1000} kbps")
         val sr = displaySampleRate(f)
-        if (sr > 0) p.add("$sr Hz")
+        if (sr > 0) p.add(formatSampleRate(sr))
         val bd = when (f.pcmEncoding) { C.ENCODING_PCM_16BIT -> "16-bit"; C.ENCODING_PCM_24BIT -> "24-bit"; C.ENCODING_PCM_32BIT -> "32-bit"; C.ENCODING_PCM_FLOAT -> "Float"; else -> "" }
         if (bd.isNotEmpty()) p.add(bd)
         return p
     }
+    /** 44100 → "44.1 kHz", 96000 → "96 kHz". */
+    private fun formatSampleRate(hz: Int): String =
+        if (hz % 1000 == 0) "${hz / 1000} kHz"
+        else "%.1f kHz".format(java.util.Locale.US, hz / 1000.0)
+
     @OptIn(UnstableApi::class)
     private fun buildFormatInfo(f: Format): String? = formatInfoParts(f).takeIf { it.isNotEmpty() }?.joinToString(" | ")
 
@@ -1079,8 +1195,5 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso",".wv").any { name.lowercase().endsWith(it) }
 
-    private fun getThemeColor(): Int {
-        val idx = getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_COLOR_SCHEME, 0)
-        return if (idx in THEME_COLORS.indices) THEME_COLORS[idx] else THEME_COLORS[0]
-    }
+    private fun getThemeColor(): Int = ColorThemes.current(this).accent
 }
