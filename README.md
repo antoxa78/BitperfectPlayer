@@ -38,6 +38,20 @@ Enjoying the app? A small donation is greatly appreciated and helps keep the pro
 *   **Now Playing**: Access the "Now Playing" row at the top to see high-res audio details and control playback.
 *   **Exit**: Use the dedicated "Exit" button in the main menu to completely release audio resources and close the app.
 
+## Remote Control
+
+Bitperfect Player embeds an MPD-protocol server (default port `6600`, configurable in settings), so you can drive playback from another device on your network. The companion **[Bitperfect Remote](https://github.com/antoxa78/Bitperfect-Remote)** app is a modern Android remote built with Kotlin and Jetpack Compose that connects to this built-in server (or to any standard MPD server) and gives you:
+
+*   **Full Playback Control**: Play, pause, stop, next/previous, seek bar with real-time progress.
+*   **Volume & Modes**: Volume slider plus repeat, single, shuffle, and consume toggles.
+*   **Live Audio Info**: Real-time bitrate, sample rate, bit depth, and channel display.
+*   **Music Browser**: Browse your library by folder and file, then add or play items directly.
+*   **Queue Management**: View, reorder, clear, and manage the current playback queue.
+*   **Album Art**: Built-in artwork fetching and display.
+*   **Theming**: Dark / light / system themes with multiple accent colors.
+
+Download the remote from its [Releases](https://github.com/antoxa78/Bitperfect-Remote/releases) page.
+
 ## Development
 
 Built using Kotlin, AndroidX Media3 (ExoPlayer), and Leanback.
