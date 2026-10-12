@@ -1,5 +1,7 @@
 # Bitperfect Player
 
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://www.paypal.me/antoxab1978)
+
 A high-fidelity music player designed specifically for Nvidia Shield Android TV, focusing on bit-perfect audio delivery and seamless integration with both local and network storage.
 
 ## Support
