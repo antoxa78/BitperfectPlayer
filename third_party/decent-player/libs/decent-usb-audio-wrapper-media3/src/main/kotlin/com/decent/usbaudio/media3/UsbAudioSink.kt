@@ -428,9 +428,19 @@ class UsbAudioSink(
                 usbStartMediaTimeNeedsInit = false
                 // Save window offset once per track (not reset by flush/seek).
                 // windowOffset = ExoPlayer timeline position of track start (position 0).
-                // On fresh start: initialPlayerPosition=0 → offset = pts (correct).
-                // On restore at 158s: initialPlayerPosition=158s → offset = pts - 158s (correct).
+                // On fresh start: playerPosition=0 → offset = pts (correct).
+                // On restore at 158s: playerPosition=158s → offset = pts - 158s (correct).
                 if (windowOffsetUs < 0) {
+                    // Anchor to the player position where playback (re)starts, not
+                    // the last media-item transition: after a pause the idle
+                    // hand-back recreates the engine mid-track, while the player
+                    // resumes at the paused position (P). The resume position is
+                    // captured on the main thread in onPlayWhenReadyChanged(true) —
+                    // the playback thread must never read the player (wrong-thread
+                    // exception), and the transition-time value would be stale (0),
+                    // making the fresh engine seek to presentationTimeUs - 0 = 0:
+                    // the file restarts from the beginning while the seek bar shows
+                    // the true position.
                     windowOffsetUs = presentationTimeUs - initialPlayerPositionUs
                 }
                 Log.i(TAG, "startMediaTimeUs=$usbStartMediaTimeUs windowOffset=$windowOffsetUs initialPos=${initialPlayerPositionUs / 1000}ms")
@@ -1150,9 +1160,11 @@ class UsbAudioSink(
         integrationListener = null
     }
 
-    /** Player position (us) captured in onMediaItemTransition. Used to calculate
-     *  the correct window offset on restore (first handleBuffer pts is at the
-     *  restored position, not at 0). */
+    /** Player position (us) at the last play start. Captured on the main thread
+     *  in [PlayerIntegrationListener.onMediaItemTransition] and refreshed in
+     *  onPlayWhenReadyChanged(true); anchors the engine's window offset to where
+     *  playback (re)started — on a mid-track resume after an idle hand-back that
+     *  rebuilt the engine, this is the resumed position, not the track start. */
     @Volatile
     private var initialPlayerPositionUs: Long = 0L
 
@@ -1196,6 +1208,15 @@ class UsbAudioSink(
         override fun onRepeatModeChanged(repeatMode: Int) = updateQueuedNext()
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            // A (re)start plays from the player's current position — including a
+            // resume after an idle hand-back that destroyed and rebuilt the engine
+            // mid-track. Capture that position here on the main thread (reading the
+            // player from the playback thread is a wrong-thread IllegalStateException),
+            // so a rebuilt engine anchors its window offset to the resumed position
+            // instead of the stale transition-time track start (0).
+            if (playWhenReady) {
+                initialPlayerPositionUs = (attachedPlayer?.currentPosition ?: 0L) * 1000L
+            }
             // A user pause that lands while a gapless advance is in flight: the
             // sink ignored ExoPlayer's seek-induced pause(), so honour this one.
             if (!playWhenReady && gaplessAdvanceInFlight) {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.2 - 2026-10-12
+
+### Fixed
+
+- **FLAC resume after a pause restarted the track from the beginning (Bit-perfect USB-driver mode, local files):** pausing handed the USB DAC back, which stopped and destroyed the native FLAC decode engine; on resume a fresh engine (positioned at file offset 0) was anchored to the player position captured at the *media-item transition* — 0 for a mid-track resume, since no transition fires — so it seeked itself to `presentationTimeUs - windowOffset = 0` and audio restarted from the file start while the seek bar and time stamp kept showing the true position. The engine's window offset is now anchored to the player position at the moment playback (re)starts, captured on the main thread in `onPlayWhenReadyChanged`: a rebuilt engine seeks to the resumed position (verified on-device: pause at 82.8 s → resume seeks to sample 3,653,596 = 82.8 s).
+- **Resuming that same path crashed the player with "Player is accessed on the wrong thread":** the first attempt read `ExoPlayer.getCurrentPosition()` from the sink's `handleBuffer()`, which runs on the playback thread. The anchor is now captured in the main-thread play/resume callback instead (the field stays `@Volatile` for the playback thread to read).
+
 ## 3.1.1 - 2026-10-12
 
 ### Added
