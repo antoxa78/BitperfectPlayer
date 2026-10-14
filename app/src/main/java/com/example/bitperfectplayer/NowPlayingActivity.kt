@@ -48,6 +48,10 @@ class NowPlayingActivity : BaseActivity() {
         private const val METADATA_DELAY_2   = 3_000L
         private const val DAC_RESET_SERVICE_RETRY_MS = 200L
         private const val ART_FADE_MS        = 350L
+        /** Focus zoom of the transport buttons; play/pause is already the largest. */
+        private const val BUTTON_FOCUS_SCALE = 1.15f
+        private const val PLAY_FOCUS_SCALE   = 1.08f
+        private const val FOCUS_ZOOM_MS      = 150L
         private const val BACKDROP_FADE_MS   = 600L
         /** Opacity of the blurred cover behind the UI (under the theme scrim). */
         private const val BACKDROP_ALPHA     = 0.85f
@@ -263,6 +267,28 @@ class NowPlayingActivity : BaseActivity() {
         // DAC reset button — tap to reset, long-press for device info
         btnDacReset.setOnClickListener { triggerDacReset() }
         btnDacReset.setOnLongClickListener { showDacInfo(); true }
+
+        // "Off" look until the controller connects and updateShuffleRepeatUI/updateDacButton run.
+        btnShuffle.imageAlpha = 0x8C
+        btnRepeat.imageAlpha = 0x8C
+        btnDacReset.imageAlpha = 0x4D
+
+        // The focused button grows slightly (as Leanback cards do), on top of its focus ring,
+        // so it is easy to find from across the room on every theme.
+        val zoom = android.view.View.OnFocusChangeListener { v, hasFocus ->
+            val scale = when {
+                !hasFocus -> 1f
+                v.id == R.id.btn_play_pause -> PLAY_FOCUS_SCALE
+                else -> BUTTON_FOCUS_SCALE
+            }
+            v.animate().scaleX(scale).scaleY(scale)
+                .setDuration(FOCUS_ZOOM_MS)
+                .setInterpolator(android.view.animation.DecelerateInterpolator())
+                .start()
+        }
+        listOf(R.id.btn_shuffle, R.id.btn_prev, R.id.btn_play_pause, R.id.btn_next,
+               R.id.btn_repeat, R.id.btn_playlist, R.id.btn_dac_reset)
+            .forEach { findViewById<ImageButton>(it)?.onFocusChangeListener = zoom }
     }
 
     /** Resets the audio sink via PlaybackService, with visual feedback. */
@@ -300,9 +326,9 @@ class NowPlayingActivity : BaseActivity() {
 
     /** Pulses the DAC button so every tap has visible feedback. */
     private fun blinkDacButton() {
-        val targetAlpha = btnDacReset.alpha
+        // "No DAC" is shown by dimming the icon (imageAlpha), so the view itself rests at 1.
         btnDacReset.animate().alpha(0.2f).setDuration(120).withEndAction {
-            btnDacReset.animate().alpha(targetAlpha).setDuration(280).start()
+            btnDacReset.animate().alpha(1f).setDuration(280).start()
         }.start()
     }
 
@@ -376,7 +402,9 @@ class NowPlayingActivity : BaseActivity() {
         val dacPresent = PlaybackService.findUsbAudioDevice(this) != null
         val color = getThemeColor()
         btnDacReset.imageTintList = android.content.res.ColorStateList.valueOf(color)
-        btnDacReset.alpha = if (dacPresent) 1.0f else 0.3f
+        // Dim the icon only: dimming the whole view (alpha) also faded its focus halo,
+        // making focus on this button hard to see.
+        btnDacReset.imageAlpha = if (dacPresent) 255 else 0x4D
     }
 
     // ── Controller / playback ─────────────────────────────────────────────────
@@ -915,11 +943,13 @@ class NowPlayingActivity : BaseActivity() {
     private fun updateShuffleRepeatUI() {
         val c = mediaController ?: return
         // On = accent colour at full opacity, off = dimmed white, so the state reads at a glance.
+        // Only the icon is dimmed (imageAlpha): fading the whole view also faded the focus
+        // halo, so focus on an "off" button was barely visible.
         val accent = android.content.res.ColorStateList.valueOf(getThemeColor())
         val off = android.content.res.ColorStateList.valueOf(Color.WHITE)
         fun style(button: ImageButton, on: Boolean) {
             button.imageTintList = if (on) accent else off
-            button.alpha = if (on) 1.0f else 0.55f
+            button.imageAlpha = if (on) 255 else 0x8C
         }
         style(btnShuffle, c.shuffleModeEnabled)
         when (c.repeatMode) {

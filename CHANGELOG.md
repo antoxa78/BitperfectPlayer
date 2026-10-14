@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.1.3 - 2026-10-14
+
+### Fixed
+
+- **Focus on the play/pause button was invisible on "Pure Black with White":** the button is a solid accent disc with a white focus ring on its edge, and that theme's accent is #F5F5F5, so the ring disappeared into the disc. The ring is now drawn outside the disc, with a 3dp transparent gap between them, so it stands against the dark background on every theme. The button grows from 72dp to 76dp so the disc stays about the same size inside the ring.
+- **Sidebar section names were cut off ("Local Music Library", "Network Shares (SMB)"):** Leanback's 270dp sidebar left only ~128dp for a label beside its icon. The sidebar is now 330dp wide (`lb_browse_headers_width`), and the rows start 60dp further right to match (`lb_browse_rows_margin_start` 238 → 298dp). The header pill's padding is slightly tighter and stays clear of the sidebar's 12dp fade edge. A label that still doesn't fit (for example with a larger system font size) now shrinks one step at a time down to 13sp before it is ellipsized.
+
+### Changed
+
+- **Now Playing transport buttons:** the focused button now zooms in (×1.15, or ×1.08 for play/pause) on top of its focus ring. Shuffle and repeat when off, and the DAC button with no DAC connected, now dim only their icon. Before, the whole button was dimmed, focus halo included, so focus on those buttons was hard to see.
+- **Main-screen cards:** the corner radius is now 8dp instead of Leanback's 2dp, and the focused card gets an accent-coloured ring on top of the zoom and the tinted info area.
+
 ## 3.1.2 - 2026-10-12
 
 ### Fixed

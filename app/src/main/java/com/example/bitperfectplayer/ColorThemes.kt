@@ -9,6 +9,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
+import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.StateListDrawable
 import androidx.core.graphics.ColorUtils
 import kotlin.math.min
@@ -168,26 +169,38 @@ internal object ColorThemes {
     /**
      * Round transport-button background: transparent at rest, an accent halo with a ring when
      * focused, a stronger fill when pressed. [filled] makes the solid accent disc used for the
-     * play/pause button, which gets a white focus ring instead so focus stays visible on it.
+     * play/pause button.
+     *
+     * The play/pause focus ring is drawn *outside* the disc, separated from it by a transparent
+     * gap that shows the screen behind. A white ring on the disc's own edge vanished whenever
+     * the accent was light — on "Pure Black with White" (accent #F5F5F5) focus on play/pause
+     * was invisible. With the gap the ring always stands against the dark background.
      */
     fun controlButtonBackground(context: Context, theme: Theme, filled: Boolean): Drawable {
         val dp = context.resources.displayMetrics.density
         val inset = (3 * dp).toInt()
         val ring = (2 * dp).toInt().coerceAtLeast(1)
-        fun oval(fill: Int, stroke: Int? = null, strokeWidth: Int = ring) = InsetDrawable(
-            GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(fill)
-                if (stroke != null) setStroke(strokeWidth, stroke)
-            },
-            inset,
-        )
+        fun ovalShape(fill: Int, stroke: Int? = null, strokeWidth: Int = ring) = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(fill)
+            if (stroke != null) setStroke(strokeWidth, stroke)
+        }
+        fun oval(fill: Int, stroke: Int? = null, strokeWidth: Int = ring) =
+            InsetDrawable(ovalShape(fill, stroke, strokeWidth), inset)
         return StateListDrawable().apply {
             if (filled) {
-                val pressed = blend(theme.accent, Color.BLACK, 0.25f)
-                addState(intArrayOf(android.R.attr.state_pressed), oval(pressed, Color.WHITE, ring + ring / 2))
-                addState(intArrayOf(android.R.attr.state_focused), oval(theme.accent, Color.WHITE, ring + ring / 2))
-                addState(intArrayOf(), oval(theme.accent))
+                val ringInset = (1 * dp).toInt()
+                val ringWidth = (2.5f * dp).toInt().coerceAtLeast(2)
+                // The disc's edge sits a 3dp gap inside the ring's inner edge.
+                val discInset = ringInset + ringWidth + (3 * dp).toInt()
+                fun disc(fill: Int) = InsetDrawable(ovalShape(fill), discInset)
+                fun ringed(fill: Int) = LayerDrawable(arrayOf<Drawable>(
+                    InsetDrawable(ovalShape(Color.TRANSPARENT, Color.WHITE, ringWidth), ringInset),
+                    disc(fill),
+                ))
+                addState(intArrayOf(android.R.attr.state_pressed), ringed(blend(theme.accent, Color.BLACK, 0.25f)))
+                addState(intArrayOf(android.R.attr.state_focused), ringed(theme.accent))
+                addState(intArrayOf(), disc(theme.accent))
             } else {
                 addState(intArrayOf(android.R.attr.state_pressed),
                     oval(theme.withAlpha(theme.accent, 0x66), theme.accent))
@@ -195,6 +208,21 @@ internal object ColorThemes {
                     oval(theme.withAlpha(theme.accent, 0x38), theme.accent))
                 addState(intArrayOf(), oval(Color.TRANSPARENT))
             }
+        }
+    }
+
+    /**
+     * Foreground of a focused menu card: a rounded accent ring, so the focused card stands out
+     * on every theme rather than relying on the zoom and the info-area tint alone.
+     * [radiusPx] matches the card's rounded clip (see MainFragment's row presenter).
+     */
+    fun cardFocusRing(context: Context, theme: Theme, radiusPx: Float): Drawable {
+        val dp = context.resources.displayMetrics.density
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = radiusPx
+            setColor(Color.TRANSPARENT)
+            setStroke((2.5f * dp).toInt().coerceAtLeast(2), theme.accent)
         }
     }
 

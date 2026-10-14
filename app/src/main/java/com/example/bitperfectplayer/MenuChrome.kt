@@ -135,21 +135,22 @@ class IconHeaderItemPresenter : RowHeaderPresenter() {
         val pill = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14f), dp(9f), dp(14f), dp(9f))
+            setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
         }
         val icon = ImageView(context).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        val label = TextView(context).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+        val label = FitTextView(context, maxSp = 18f, minSp = 13f).apply {
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             setTextColor(Color.WHITE)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
-        pill.addView(icon, LinearLayout.LayoutParams(root.dp(24f), root.dp(24f)).apply { marginEnd = root.dp(14f) })
+        pill.addView(icon, LinearLayout.LayoutParams(root.dp(24f), root.dp(24f)).apply { marginEnd = root.dp(12f) })
         pill.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // The 12dp end margin keeps the pill clear of Leanback's 12dp fade edge on the
+        // sidebar's right side, which would otherwise fade out the end of long labels.
         root.addView(pill, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { setMargins(0, root.dp(2f), root.dp(12f), root.dp(2f)) })
@@ -162,6 +163,9 @@ class IconHeaderItemPresenter : RowHeaderPresenter() {
         val theme = ColorThemes.current(holder.view.context)
         holder.theme = theme
         holder.label.text = header?.name
+        // A fixed-width TextView may skip re-measuring on setText; FitTextView picks its
+        // size in onMeasure, so a recycled header must measure again for its new label.
+        holder.label.requestLayout()
         holder.view.contentDescription = header?.name
         holder.icon.setImageResource(iconFor(header))
         holder.iconTint = if (header?.id == EXIT_HEADER_ID) EXIT_TINT else theme.accent
@@ -196,6 +200,38 @@ class IconHeaderItemPresenter : RowHeaderPresenter() {
         6L -> R.drawable.ic_playlist         // Playlists
         EXIT_HEADER_ID -> R.drawable.ic_exit // Exit
         else -> R.drawable.ic_audio
+    }
+
+    /**
+     * Single-line label that steps its text size down from [maxSp] towards [minSp] until the
+     * text fits its width, and only ellipsizes below that. The sidebar is sized so every
+     * header fits at [maxSp]; this covers a larger system font scale or a longer label.
+     * (Platform autosizing is avoided: with a wrap_content height and recycled header views
+     * it can stay shrunk after a long label is replaced by a short one.)
+     */
+    private class FitTextView(context: Context, maxSp: Float, minSp: Float) : TextView(context) {
+        private val maxPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, maxSp, resources.displayMetrics)
+        private val minPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, minSp, resources.displayMetrics)
+        private val stepPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 1f, resources.displayMetrics)
+        private val probe = android.graphics.Paint()
+
+        init { setTextSize(TypedValue.COMPLEX_UNIT_PX, maxPx) }
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            if (MeasureSpec.getMode(widthMeasureSpec) != MeasureSpec.UNSPECIFIED) {
+                val available = MeasureSpec.getSize(widthMeasureSpec) - totalPaddingLeft - totalPaddingRight
+                val label = text?.toString().orEmpty()
+                probe.set(paint)
+                var size = maxPx
+                probe.textSize = size
+                while (size > minPx && probe.measureText(label) > available) {
+                    size = (size - stepPx).coerceAtLeast(minPx)
+                    probe.textSize = size
+                }
+                if (size != textSize) setTextSize(TypedValue.COMPLEX_UNIT_PX, size)
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+        }
     }
 
     private companion object {

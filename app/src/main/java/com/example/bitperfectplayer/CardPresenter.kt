@@ -24,6 +24,9 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
         private const val ICON_BACKDROP = true
 
         fun themeColorFor(context: Context): Int = ColorThemes.current(context).accent
+
+        /** Corner radius of the cards: the row presenter's clip and the focus ring share it. */
+        fun cornerRadiusPx(context: Context): Float = 8f * context.resources.displayMetrics.density
     }
 
     override fun onCreateViewHolder(parent: ViewGroup): ViewHolder {
@@ -101,6 +104,10 @@ class CardPresenter(private val onLongClickListener: ((MediaItem) -> Unit)? = nu
         val theme = cardView.getTag(R.id.card_theme_tag) as? ColorThemes.Theme
             ?: ColorThemes.current(cardView.context)
         cardView.setInfoAreaBackgroundColor(if (selected) theme.cardInfoFocused else theme.cardInfo)
+        // Accent ring around the focused card, on top of Leanback's zoom and dimmer.
+        cardView.foreground = if (selected)
+            ColorThemes.cardFocusRing(cardView.context, theme, cornerRadiusPx(cardView.context))
+        else null
     }
 
     private fun resolveIconRes(context: Context, mediaItem: MediaItem): Int {

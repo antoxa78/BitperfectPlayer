@@ -243,8 +243,14 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun loadRows() {
         // Medium zoom on the focused card (as before) plus the focus dimmer, which darkens the
-        // rows you are not in so the active row stands out.
-        rowsAdapter = ArrayObjectAdapter(ListRowPresenter(FocusHighlight.ZOOM_FACTOR_MEDIUM, true))
+        // rows you are not in so the active row stands out. Cards are clipped to a softer
+        // rounded rectangle than Leanback's 2dp default; CardPresenter draws its focus ring
+        // with the same radius.
+        val cardRadiusPx = CardPresenter.cornerRadiusPx(requireContext()).toInt()
+        rowsAdapter = ArrayObjectAdapter(object : ListRowPresenter(FocusHighlight.ZOOM_FACTOR_MEDIUM, true) {
+            override fun createShadowOverlayOptions(): androidx.leanback.widget.ShadowOverlayHelper.Options =
+                androidx.leanback.widget.ShadowOverlayHelper.Options().roundedCornerRadius(cardRadiusPx)
+        })
         val cardPresenter = CardPresenter { item ->
             if (item.mediaId.startsWith("smb://")) {
                 handleSmbSelection(item.mediaId)
