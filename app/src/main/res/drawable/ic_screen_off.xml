@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "television-off" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M0.5,2.77 L1.78,1.5 L21,20.72 L19.73,22 L16.73,19 L16,19 L16,21 L8,21 L8,19 L3,19 C1.895,19,1,18.105,1,17 L1,5 C1,4.5,1.17,4.07,1.46,3.73 Z M21,17 L21,5 L7.82,5 L5.82,3 L21,3 C22.105,3,23,3.895,23,5 L23,17 C23,17.85,22.45,18.59,21.7,18.87 L19.82,17 Z M3,17 L14.73,17 L3,5.27 Z" />
+</vector>

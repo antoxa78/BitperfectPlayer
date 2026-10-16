@@ -2,6 +2,7 @@ package com.example.bitperfectplayer
 
 import android.app.AlertDialog
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -12,6 +13,8 @@ import androidx.activity.OnBackPressedCallback
 import androidx.leanback.app.BrowseSupportFragment
 import androidx.leanback.app.RowsSupportFragment
 import androidx.leanback.widget.*
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import jcifs.smb.SmbFile
@@ -32,16 +35,28 @@ class MainFragment : BrowseSupportFragment() {
     private val KEY_RECENT = "recent_files"
     private val KEY_MUSIC_FOLDERS = "music_folders"
     private val KEY_AUTO_SCAN = "auto_scan"
-    private val KEY_COLOR_SCHEME = "color_scheme"
     private val KEY_WAVEFORM_TYPE = "waveform_type"
+    private val KEY_AUDIO_OUTPUT_MODE = "audio_output_mode"
+    private val KEY_USBDEVFS_DRIVER  = "usbdevfs_driver"
+    private val AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
+    private val AUDIO_OUTPUT_USBDEVFS           = 2
+    private val AUDIO_OUTPUT_STANDARD_ANDROID   = 3
     private val KEY_NETWORK_BUFFER = "network_buffer"
     private val KEY_AUTO_RECONNECT = "auto_reconnect"
     private var hasAttemptedResume = false
     private var lastSelectedRowId = -1L
     private var lastSelectedColumn = 0
+    // Stored so it can be removed from the controller in onDestroyView (BUG-1).
+    private var playerListener: androidx.media3.common.Player.Listener? = null
+    // Incremented each time updatePlaylistRow() runs so background scan threads
+    // can detect that a newer scan has superseded them and discard their results,
+    // preventing stale items from leaking into a freshly-cleared adapter (BUG-3).
+    @Volatile private var playlistScanGeneration = 0
     private lateinit var settingsAdapter: ArrayObjectAdapter
     // Index of the "USB DAC" card inside settingsAdapter — must match the add() order below
     private val SETTINGS_USB_DAC_INDEX = 7
+    // Index of the "Debug Log" card inside settingsAdapter — also must match the add() order below
+    private val SETTINGS_DEBUG_LOG_INDEX = 12
 
     private val usbStateReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
@@ -63,9 +78,20 @@ class MainFragment : BrowseSupportFragment() {
         // System.setProperty() has no effect in jcifs-ng and has been removed.
     }
 
+    override fun onDestroyView() {
+        // Remove the player listener to prevent callbacks firing on a detached
+        // fragment (which would crash via requireContext()) and to avoid leaking
+        // this fragment instance through the controller reference (BUG-1).
+        playerListener?.let { l ->
+            (activity as? MainActivity)?.getController()?.removeListener(l)
+        }
+        playerListener = null
+        super.onDestroyView()
+    }
+
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        view.setBackgroundColor(0xFF000000.toInt())
+        view.background = ColorThemes.browseBackground(ColorThemes.current(requireContext()))
         setupUIElements()
         loadRows()
         setupEventListeners()
@@ -92,11 +118,40 @@ class MainFragment : BrowseSupportFragment() {
                             .setTitle("Exit")
                             .setMessage("Are you sure you want to exit?")
                             .setPositiveButton("Yes") { _, _ ->
-                                activity?.stopService(
-                                    android.content.Intent(requireContext(), PlaybackService::class.java)
-                                )
-                                activity?.finishAffinity()
-                                System.exit(0)
+                                // Persist the position synchronously before the
+                                // process dies, same as the menu Exit action.
+                                PlaybackService.instance?.saveCurrentPositionSync()
+                                val prefsX = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                                val keepLan = prefsX.getBoolean("mpd_enabled", true) &&
+                                    prefsX.getBoolean("mpd_autostart", false)
+                                if (keepLan) {
+                                    // Stop playback but leave PlaybackService (and its
+                                    // MPD server) running in the foreground so MALP
+                                    // keeps working.
+                                    PlaybackService.instance?.stopPlaybackKeepLanControl()
+                                    activity?.finishAffinity()
+                                } else {
+                                    // Request the DAC release before killing the process.
+                                    // releaseUsbForIdle() only starts a USBDEVFS_RESET soft-
+                                    // replug on a background thread — the kernel can take
+                                    // several seconds to re-probe the USB sound card
+                                    // afterward (the same window applyOutputModeAudioReset()
+                                    // already waits out). A short fixed delay before
+                                    // System.exit(0) was not enough for that race; wait for
+                                    // the (bounded) release instead, or the usbdevfs driver's
+                                    // exclusive USB claim stays in place, silencing every
+                                    // other app on that DAC until it is replugged.
+                                    activity?.stopService(
+                                        android.content.Intent(requireContext(), PlaybackService::class.java)
+                                    )
+                                    activity?.finishAffinity()
+                                    val service = PlaybackService.instance
+                                    if (service != null) {
+                                        service.prepareForProcessExit { System.exit(0) }
+                                    } else {
+                                        System.exit(0)
+                                    }
+                                }
                             }
                             .setNegativeButton("No", null)
                             .show()
@@ -140,9 +195,22 @@ class MainFragment : BrowseSupportFragment() {
         title = "Bitperfect Player"
         headersState = HEADERS_ENABLED
         isHeadersTransitionOnBackEnabled = true
-        // Sidebar brand color follows the current color scheme
-        brandColor = getThemeColor(requireContext())
+        // Sidebar brand color: a dark, accent-tinted tone of the current theme, so the
+        // white header text stays readable on every scheme (see ColorThemes.sidebar).
+        brandColor = getSidebarColor(requireContext())
+        // Sidebar headers with a per-section icon and an accent pill on the focused one.
+        setHeaderPresenterSelector(object : PresenterSelector() {
+            private val presenter = IconHeaderItemPresenter()
+            override fun getPresenter(item: Any?): Presenter = presenter
+        })
     }
+
+    /** Logo + "BitPerfect PLAYER" wordmark instead of Leanback's plain title text. */
+    override fun onInflateTitleView(
+        inflater: LayoutInflater,
+        parent: android.view.ViewGroup?,
+        savedInstanceState: Bundle?,
+    ): View = BrandTitleView(parent?.context ?: requireContext())
 
     fun refreshRows(targetRowId: Long = -1L, selectedColumn: Int = -1) {
         if (::rowsAdapter.isInitialized) {
@@ -176,7 +244,15 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun loadRows() {
-        rowsAdapter = ArrayObjectAdapter(ListRowPresenter())
+        // Medium zoom on the focused card (as before) plus the focus dimmer, which darkens the
+        // rows you are not in so the active row stands out. Cards are clipped to a softer
+        // rounded rectangle than Leanback's 2dp default; CardPresenter draws its focus ring
+        // with the same radius.
+        val cardRadiusPx = CardPresenter.cornerRadiusPx(requireContext()).toInt()
+        rowsAdapter = ArrayObjectAdapter(object : ListRowPresenter(FocusHighlight.ZOOM_FACTOR_MEDIUM, true) {
+            override fun createShadowOverlayOptions(): androidx.leanback.widget.ShadowOverlayHelper.Options =
+                androidx.leanback.widget.ShadowOverlayHelper.Options().roundedCornerRadius(cardRadiusPx)
+        })
         val cardPresenter = CardPresenter { item ->
             if (item.mediaId.startsWith("smb://")) {
                 handleSmbSelection(item.mediaId)
@@ -238,6 +314,11 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("Waveform Type", "Current: ${getWaveformTypeName()}"))
         settingsAdapter.add(createActionItem("Player Color Scheme", "Current: ${getColorSchemeName()}"))
         settingsAdapter.add(createActionItem("USB DAC", getUsbDacStatus()))
+        settingsAdapter.add(createActionItem("Audio Output", getAudioOutputSubtitle()))
+        settingsAdapter.add(createActionItem("LAN Player Control", getLanControlSubtitle()))
+        settingsAdapter.add(createActionItem("DSD Output", getDsdOutputSubtitle()))
+        settingsAdapter.add(createActionItem("Debug Log", getDebugLogSubtitle()))
+        settingsAdapter.add(createActionItem("USB Reset On Release", getUsbResetSubtitle()))
         settingsAdapter.add(createActionItem("About", "Version and build info"))
         val settingsHeader = HeaderItem(4, "Settings")
         rowsAdapter.add(ListRow(settingsHeader, settingsAdapter))
@@ -263,12 +344,14 @@ class MainFragment : BrowseSupportFragment() {
                 val user = obj.optString("user", "")
                 val pass = obj.optString("pass", "")
                 
+                // Encode share name and credentials for a valid SMB URL
+                val encShare = Uri.encode(share)
                 val uri = if (user.isNotEmpty()) {
                     val encUser = Uri.encode(user)
                     val encPass = Uri.encode(pass)
-                    "smb://$encUser:$encPass@$ip/$share/"
+                    "smb://$encUser:$encPass@$ip/$encShare/"
                 } else {
-                    "smb://$ip/$share/"
+                    "smb://$ip/$encShare/"
                 }
                 adapter.add(createMediaItem("$share on $ip", "Network Share", uri))
             }
@@ -289,7 +372,7 @@ class MainFragment : BrowseSupportFragment() {
                 put("pass", pass)
             }
             jsonArray.put(newObj)
-            prefs.edit().putString(KEY_SHARES, jsonArray.toString()).apply()
+            prefs.edit { putString(KEY_SHARES, jsonArray.toString()) }
             refreshWithCurrentFocus()
         } catch (e: Exception) {
             e.printStackTrace()
@@ -311,7 +394,7 @@ class MainFragment : BrowseSupportFragment() {
 
         val dialog = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Add SMB Share")
-            .setIcon(R.drawable.ic_network)
+            .setIcon(R.drawable.ic_add_network)
             .setView(view)
             .create()
 
@@ -399,7 +482,7 @@ class MainFragment : BrowseSupportFragment() {
                     .toTypedArray()
 
                 val shareItems = shareNames.map { name ->
-                    BrowseItem(name, "", R.drawable.ic_network, true)
+                    BrowseItem(name, "", R.drawable.ic_network_music, true)
                 }
 
                 activity.runOnUiThread {
@@ -451,9 +534,16 @@ class MainFragment : BrowseSupportFragment() {
         val controller = activity?.getController()
         
         val currentItem = controller?.currentMediaItem
-        val title = currentItem?.mediaMetadata?.title?.toString() ?: "Nothing Playing"
-        val subtitle = currentItem?.mediaMetadata?.artist?.toString() ?: ""
         val isPlaying = controller?.isPlaying == true
+
+        var title = "Nothing Playing"
+        var subtitle = ""
+        if (currentItem != null) {
+            // Same track/artist resolution as the full-screen Now Playing activity.
+            val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+            title = info.track
+            subtitle = info.artist
+        }
 
         val nowPlayingId = if (isPlaying) "action:NOW_PLAYING:$title" else "action:NOW_PAUSED:$title"
         controlsAdapter.add(
@@ -468,8 +558,13 @@ class MainFragment : BrowseSupportFragment() {
                 .build()
         )
 
-        // Add Resume Last Played if enabled and not currently playing anything else
-        if (isResumeEnabled() && (controller == null || controller.mediaItemCount == 0)) {
+        // Add Resume Last Played if enabled and nothing is actively playing.
+        // Show the card both when the queue is empty (fresh session / service killed)
+        // and when items exist but are not playing (paused or playlist ended).
+        val resumeVisible = isResumeEnabled() && (controller == null ||
+                controller.mediaItemCount == 0 ||
+                (!controller.isPlaying && controller.playbackState != androidx.media3.common.Player.STATE_BUFFERING))
+        if (resumeVisible) {
             val settings = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             val lastUri = settings.getString("last_played_uri", null)
             if (lastUri != null) {
@@ -482,9 +577,12 @@ class MainFragment : BrowseSupportFragment() {
     private fun updatePlaylistRow() {
         if (!::playlistAdapter.isInitialized) return
         playlistAdapter.clear()
-        
+        // Bump the generation so any in-flight background threads from a previous
+        // call see the change and drop their results (BUG-3).
+        val myGeneration = ++playlistScanGeneration
+
         val context = context ?: return
-        
+
         // Scan Local Folders for Playlists
         val settings = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val foldersJson = settings.getString(KEY_MUSIC_FOLDERS, "[]")
@@ -494,24 +592,27 @@ class MainFragment : BrowseSupportFragment() {
                 val obj = jsonArray.getJSONObject(i)
                 val uriStr = obj.getString("uri")
                 if (uriStr.startsWith("content://")) {
-                    findPlaylistsLocal(uriStr)
+                    findPlaylistsLocal(uriStr, myGeneration)
                 } else if (uriStr.startsWith("file://")) {
-                    val path = Uri.parse(uriStr).path
-                    if (path != null) findPlaylistsFile(path)
+                    val path = uriStr.toUri().path
+                    if (path != null) findPlaylistsFile(path, myGeneration)
                 }
             }
         } catch (e: Exception) {}
     }
 
-    private fun findPlaylistsFile(path: String) {
+    private fun findPlaylistsFile(path: String, generation: Int) {
         Thread {
             try {
                 val root = java.io.File(path)
                 fun scanRecursive(file: java.io.File) {
+                    if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     if (file.isDirectory) {
                         file.listFiles()?.forEach { scanRecursive(it) }
-                    } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) {
+                    } else if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue")) {
                         activity?.runOnUiThread {
+                            if (playlistScanGeneration != generation) return@runOnUiThread
+                            if (!isAdded) return@runOnUiThread
                             playlistAdapter.add(createMediaItem(file.name, "Local Playlist", Uri.fromFile(file).toString()))
                         }
                     }
@@ -523,14 +624,16 @@ class MainFragment : BrowseSupportFragment() {
         }.start()
     }
 
-    private fun findPlaylistsLocal(uriString: String) {
+    private fun findPlaylistsLocal(uriString: String, generation: Int) {
         val context = context ?: return
-        val rootUri = Uri.parse(uriString)
+        val rootUri = uriString.toUri()
         Thread {
             try {
                 fun scanRecursive(uri: Uri) {
+                    if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
-                    val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
+                    val authority = uri.authority ?: return
+                    val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, treeId)
                     val docId = try { android.provider.DocumentsContract.getDocumentId(uri) } catch (e: Exception) { treeId }
                     val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
                     val projection = arrayOf(
@@ -550,8 +653,10 @@ class MainFragment : BrowseSupportFragment() {
                             
                             if (mime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
                                 scanRecursive(childUri)
-                            } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) {
+                            } else if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls") || name.lowercase().endsWith(".cue")) {
                                 activity?.runOnUiThread {
+                                    if (playlistScanGeneration != generation) return@runOnUiThread
+                                    if (!isAdded) return@runOnUiThread
                                     playlistAdapter.add(createMediaItem(name, "Local Playlist", childUri.toString()))
                                 }
                             }
@@ -565,19 +670,22 @@ class MainFragment : BrowseSupportFragment() {
         }.start()
     }
 
-    private fun findPlaylistsSmb(uri: String) {
+    private fun findPlaylistsSmb(uri: String, generation: Int) {
         Thread {
             try {
                 fun scanRecursive(smbUri: String) {
+                    if (playlistScanGeneration != generation) return   // BUG-3: stale scan
                     val dir = SmbFile(smbUri, SmbContext.getContextForUri(smbUri))
                     val files = try { dir.listFiles() } catch (e: Exception) { null } ?: emptyArray()
                     for (f in files) {
                         if (f.isDirectory) {
                             scanRecursive(f.path)
-                        } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8") || f.name.lowercase().endsWith(".pls")) {
+                        } else if (f.name.lowercase().endsWith(".m3u") || f.name.lowercase().endsWith(".m3u8") || f.name.lowercase().endsWith(".pls") || f.name.lowercase().endsWith(".cue")) {
                             val name = f.name
                             val path = f.path
                             activity?.runOnUiThread {
+                                if (playlistScanGeneration != generation) return@runOnUiThread
+                                if (!isAdded) return@runOnUiThread
                                 playlistAdapter.add(createMediaItem(name, "SMB Playlist", path))
                             }
                         }
@@ -595,20 +703,52 @@ class MainFragment : BrowseSupportFragment() {
         val checkController = object : Runnable {
             override fun run() {
                 val controller = activity?.getController()
-                if (controller != null) {
-                    controller.addListener(object : androidx.media3.common.Player.Listener {
+                if (controller != null && controller.isConnected) {
+                    // Store the listener so it can be removed in onDestroyView (BUG-1).
+                    val listener = object : androidx.media3.common.Player.Listener {
                         override fun onEvents(player: androidx.media3.common.Player, events: androidx.media3.common.Player.Events) {
                             updateControlsRow()
                             updatePlaylistRow()
                         }
-                    })
+                    }
+                    playerListener = listener
+                    controller.addListener(listener)
                     updateControlsRow()
                     updatePlaylistRow()
 
-                    // Auto-resume if enabled and nothing is playing
-                    if (isResumeEnabled() && controller.mediaItemCount == 0 && !hasAttemptedResume) {
-                        hasAttemptedResume = true
-                        resumeLastPlayed()
+                    // Auto-resume if enabled and playback is not already active.
+                    // Two cases:
+                    //  1. No items in queue (service was killed / fresh session) → full
+                    //     restore from persisted prefs.
+                    //  2. Items exist but player is paused in STATE_READY (service
+                    //     survived a HOME press) → just resume in-place.
+                    if (isResumeEnabled() && !hasAttemptedResume) {
+                        when {
+                            controller.mediaItemCount == 0 -> {
+                                hasAttemptedResume = true
+                                resumeLastPlayed()
+                            }
+                            // Items already queued but not playing — resume in
+                            // place. STATE_BUFFERING is included so a stream that
+                            // is re-buffering after the app relaunches still gets
+                            // resumed instead of being left dead in the queue.
+                            controller.playbackState == androidx.media3.common.Player.STATE_IDLE -> {
+                                // Items queued but the player is idle (e.g. the
+                                // radio station errored and the service's
+                                // reconnect attempts ended there). Give it a
+                                // fresh prepare+play instead of leaving it dead.
+                                hasAttemptedResume = true
+                                controller.prepare()
+                                controller.play()
+                                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+                            }
+                            !controller.isPlaying &&
+                            controller.playbackState != androidx.media3.common.Player.STATE_ENDED -> {
+                                hasAttemptedResume = true
+                                controller.play()
+                                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+                            }
+                        }
                     }
                 } else {
                     view?.postDelayed(this, 500)
@@ -630,20 +770,41 @@ class MainFragment : BrowseSupportFragment() {
             .build()
     }
 
-    private fun createMediaItem(title: String, artist: String, uri: String): MediaItem {
+    private fun createMediaItem(
+        title: String,
+        artist: String,
+        uri: String,
+        mediaId: String? = null,
+        startMs: Long = 0,
+        endMs: Long = androidx.media3.common.C.TIME_UNSET,
+        trackNumber: Int? = null,
+        discNumber: Int? = null
+    ): MediaItem {
         val metadataBuilder = MediaMetadata.Builder()
             .setTitle(title)
+            .setTrackNumber(trackNumber)
+            .setDiscNumber(discNumber)
         
         if (artist.isNotEmpty()) {
             metadataBuilder.setArtist(artist)
         }
 
-        return MediaItem.Builder()
-            .setMediaId(uri)
-            .setUri(Uri.parse(uri))
+        val builder = MediaItem.Builder()
+            .setMediaId(mediaId ?: uri)
+            .setUri(uri.toUri())
             .setMimeType(getMimeType(uri))
             .setMediaMetadata(metadataBuilder.build())
-            .build()
+
+        if (startMs > 0 || endMs != androidx.media3.common.C.TIME_UNSET) {
+            val clip = MediaItem.ClippingConfiguration.Builder()
+                .setStartPositionMs(startMs)
+            if (endMs != androidx.media3.common.C.TIME_UNSET) {
+                clip.setEndPositionMs(endMs)
+            }
+            builder.setClippingConfiguration(clip.build())
+        }
+
+        return builder.build()
     }
 
     private fun getMimeType(uri: String): String? {
@@ -654,6 +815,7 @@ class MainFragment : BrowseSupportFragment() {
             lower.endsWith(".wav") -> androidx.media3.common.MimeTypes.AUDIO_WAV
             lower.endsWith(".m4a") || lower.endsWith(".aac") -> androidx.media3.common.MimeTypes.AUDIO_AAC
             lower.endsWith(".ogg") -> androidx.media3.common.MimeTypes.AUDIO_OGG
+            lower.endsWith(".ape") -> "audio/x-ape"
             else -> null
         }
     }
@@ -670,7 +832,7 @@ class MainFragment : BrowseSupportFragment() {
                     } else if (item.mediaId.startsWith("content://")) {
                         addLocalToPlaylist(item.mediaId, item.mediaMetadata.title.toString(), replace = true)
                     } else if (item.mediaId.startsWith("file://")) {
-                        val file = java.io.File(Uri.parse(item.mediaId).path ?: "")
+                        val file = java.io.File(item.mediaId.toUri().path ?: "")
                         addFilesToPlaylist(file, replace = true)
                     }
                 } else if (item.mediaId.startsWith("smb://")) {
@@ -682,7 +844,7 @@ class MainFragment : BrowseSupportFragment() {
                     }
                 } else if (item.mediaId.startsWith("content://") || item.mediaId.startsWith("file://")) {
                     if (item.mediaId.startsWith("file://")) {
-                        browseFileStorage(Uri.parse(item.mediaId).path ?: "")
+                        browseFileStorage(item.mediaId.toUri().path ?: "")
                     } else {
                         browseLocalDirectory(item.mediaId)
                     }
@@ -752,7 +914,7 @@ class MainFragment : BrowseSupportFragment() {
                 val browseItems = sortedFiles.map { 
                     val isDir = it.isDirectory()
                     val icon = if (isDir) R.drawable.ic_folder 
-                              else if (it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8") || it.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist
+                              else if (it.name.lowercase().endsWith(".m3u") || it.name.lowercase().endsWith(".m3u8") || it.name.lowercase().endsWith(".pls") || it.name.lowercase().endsWith(".cue")) R.drawable.ic_playlist
                               else R.drawable.ic_audio
                     BrowseItem(it.name, it.path, icon, isDir)
                 }
@@ -775,9 +937,10 @@ class MainFragment : BrowseSupportFragment() {
                         addSmbToPlaylist(dir, replace = true)
                     }, { // Long click
                         which -> handleSmbSelection(browseItems[which].path)
-                    }, { // onBack
+                    }, { // onBack: up one folder; at the share root, just close
+                        val depth = dir.path.removePrefix("smb://").split('/').count { it.isNotEmpty() }
                         val parent = dir.parent
-                        if (parent != null) {
+                        if (depth > 2 && parent != null) {   // host + share = the share root
                             browseSmbDirectory(parent)
                         }
                     })
@@ -797,16 +960,18 @@ class MainFragment : BrowseSupportFragment() {
         }.start()
     }
 
-    private fun browseLocalDirectory(uriString: String) {
+    /** [history] = the folders above this one, outermost first, so Back can go up (SAF has no parent URI). */
+    private fun browseLocalDirectory(uriString: String, history: List<String> = emptyList()) {
         val context = activity ?: return
-        val uri = Uri.parse(uriString)
+        val uri = uriString.toUri()
         val loadingToast = Toast.makeText(context, "Scanning folder...", Toast.LENGTH_SHORT)
         loadingToast.show()
 
         Thread {
             try {
                 val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
-                val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
+                val authority = uri.authority ?: return@Thread
+                val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, treeId)
                 val docId = try {
                     android.provider.DocumentsContract.getDocumentId(uri)
                 } catch (e: Exception) {
@@ -838,12 +1003,12 @@ class MainFragment : BrowseSupportFragment() {
                             // Filter thumbnails and hidden folders
                             if (name.startsWith(".") || name.contains("thumbnail", ignoreCase = true)) continue
                             
-                            // Only add if it contains music/playlists or subfolders
+                            // Only add if it contains music/playlists/cues or subfolders
                             if (hasPlayableContent(context, treeUri, id)) {
                                 items.add(BrowseItem(name, android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, id).toString(), R.drawable.ic_folder, true))
                             }
                         } else if (isPlayable(name)) {
-                            val icon = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
+                            val icon = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls") || name.lowercase().endsWith(".cue")) R.drawable.ic_playlist else R.drawable.ic_audio
                             items.add(BrowseItem(name, android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, id).toString(), icon, false))
                         }
                     }
@@ -861,15 +1026,15 @@ class MainFragment : BrowseSupportFragment() {
 
                     showBrowserDialog("Browse Folder", BrowseAdapter(context, sortedItems), { which ->
                         val item = sortedItems[which]
-                        if (item.isDirectory) browseLocalDirectory(item.path) else handleLocalSelection(item.path, item.name)
+                        if (item.isDirectory) browseLocalDirectory(item.path, history + uriString) else handleLocalSelection(item.path, item.name)
                     }, { // Add All
                         addLocalToPlaylist(uriString, "Current Folder", replace = false)
                     }, { // Replace
                         addLocalToPlaylist(uriString, "Current Folder", replace = true)
                     }, { // Long click
                         which -> handleLocalSelection(sortedItems[which].path, sortedItems[which].name)
-                    }, { // onBack
-                        // For local SAF, we don't easily have the parent URI here, but we can dismiss
+                    }, { // onBack: up one folder; at the folder the user picked, just close
+                        if (history.isNotEmpty()) browseLocalDirectory(history.last(), history.dropLast(1))
                     })
                 }
             } catch (e: Exception) {
@@ -949,6 +1114,14 @@ class MainFragment : BrowseSupportFragment() {
             }
         }
 
+        if (onBack != null) {
+            // Remote/phone Back goes up one level, like the dialog's Back button. Back
+            // cancels the dialog on every API level (incl. predictive back on 16+, where
+            // key listeners never see KEYCODE_BACK); the buttons dismiss(), not cancel().
+            dialog.setCanceledOnTouchOutside(false)
+            dialog.setOnCancelListener { onBack() }
+        }
+
         dialog.show()
     }
 
@@ -956,7 +1129,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val items = listOf(
             DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-            DialogOptionItem("Replace current playlist", R.drawable.ic_repeat)
+            DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
         )
         val adapter = DialogOptionAdapter(context, items)
         
@@ -964,7 +1137,7 @@ class MainFragment : BrowseSupportFragment() {
             .setTitle(name)
             .setAdapter(adapter) { _, which ->
                 if (uriString.startsWith("file://")) {
-                    val file = java.io.File(Uri.parse(uriString).path ?: "")
+                    val file = java.io.File(uriString.toUri().path ?: "")
                     addFilesToPlaylist(file, which == 1)
                 } else {
                     addLocalToPlaylist(uriString, name, which == 1)
@@ -978,7 +1151,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val mainActivity = activity as? MainActivity
         val controller = mainActivity?.getController() ?: return
-        val rootUri = Uri.parse(uriString)
+        val rootUri = uriString.toUri()
 
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
@@ -987,7 +1160,8 @@ class MainFragment : BrowseSupportFragment() {
                 if (isDir) {
                     try {
                         val treeId = android.provider.DocumentsContract.getTreeDocumentId(uri)
-                        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(uri.authority!!, treeId)
+                        val authority = uri.authority ?: return
+                        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, treeId)
                         val docId = try {
                             android.provider.DocumentsContract.getDocumentId(uri)
                         } catch (e: Exception) {
@@ -999,22 +1173,32 @@ class MainFragment : BrowseSupportFragment() {
                             android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                             android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
                         )
+                        // (uri, isDir, name) — collected first so the folder is walked in
+                        // file-name order; the provider's cursor order is unspecified.
+                        val children = mutableListOf<Triple<Uri, Boolean, String>>()
                         context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
                             val idCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                             val nameCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                             val mimeCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE)
                             while (cursor.moveToNext()) {
                                 val childId = cursor.getString(idCol)
-                                val childName = cursor.getString(nameCol)
+                                val childName = cursor.getString(nameCol) ?: continue
                                 val childMime = cursor.getString(mimeCol)
                                 val childUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
-                                scanRecursive(childUri, childMime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR, childName)
+                                children.add(Triple(childUri, childMime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR, childName))
                             }
                         }
+                        val (dirs, files) = NaturalOrder.sortChildren(children, { it.second }, { it.third })
+                            .partition { it.second }
+                        val folderStart = itemsToAdd.size
+                        files.forEach { (childUri, _, childName) -> scanRecursive(childUri, false, childName) }
+                        if (files.none { NaturalOrder.isListFile(it.third) }) NaturalOrder.applyTagOrder(itemsToAdd, folderStart)
+                        dirs.forEach { (childUri, _, childName) -> scanRecursive(childUri, true, childName) }
                     } catch (e: Exception) {
                         // Fallback if buildChildDocumentsUriUsingTree fails (might not be a tree URI)
                         if (isPlayable(displayName)) {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     }
                 } else if (isPlayable(displayName)) {
@@ -1025,7 +1209,17 @@ class MainFragment : BrowseSupportFragment() {
                         if (parsed.isNotEmpty()) {
                             itemsToAdd.addAll(parsed)
                         } else {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
+                        }
+                    } else if (lower.endsWith(".cue")) {
+                        val basePath = uri.toString().substringBeforeLast("%2F")
+                        val parsed = mainActivity.parseCue(uri) // parseCue doesn't take basePath in MainFragment currently, let's check
+                        if (parsed.isNotEmpty()) {
+                            itemsToAdd.addAll(parsed)
+                        } else {
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     } else if (lower.endsWith(".pls")) {
                         val basePath = uri.toString().substringBeforeLast("%2F")
@@ -1033,10 +1227,12 @@ class MainFragment : BrowseSupportFragment() {
                         if (parsed.isNotEmpty()) {
                             itemsToAdd.addAll(parsed)
                         } else {
-                            itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString()))
                         }
                     } else {
-                        itemsToAdd.add(createMediaItem(displayName, "", uri.toString()))
+                        val meta = MetadataUtils.getMetadata(context, uri)
+                        itemsToAdd.add(createMediaItem(meta.title ?: displayName, meta.artist ?: "", uri.toString(), trackNumber = meta.trackNumber, discNumber = meta.discNumber))
                     }
                 }
             }
@@ -1054,7 +1250,16 @@ class MainFragment : BrowseSupportFragment() {
                 if (parsed.isNotEmpty()) {
                     itemsToAdd.addAll(parsed)
                 } else {
-                    itemsToAdd.add(createMediaItem(name, "", rootUri.toString()))
+                    val meta = MetadataUtils.getMetadata(context, rootUri)
+                    itemsToAdd.add(createMediaItem(meta.title ?: name, meta.artist ?: "", rootUri.toString()))
+                }
+            } else if (lowerName.endsWith(".cue")) {
+                val parsed = mainActivity.parseCue(rootUri)
+                if (parsed.isNotEmpty()) {
+                    itemsToAdd.addAll(parsed)
+                } else {
+                    val meta = MetadataUtils.getMetadata(context, rootUri)
+                    itemsToAdd.add(createMediaItem(meta.title ?: name, meta.artist ?: "", rootUri.toString()))
                 }
             } else if (lowerName.endsWith(".pls")) {
                 val basePath = rootUri.toString().substringBeforeLast("%2F")
@@ -1072,17 +1277,17 @@ class MainFragment : BrowseSupportFragment() {
 
             activity?.runOnUiThread {
                 if (itemsToAdd.isNotEmpty()) {
-                    val sortedItems = if (name.lowercase().endsWith(".m3u") || name.lowercase().endsWith(".m3u8") || name.lowercase().endsWith(".pls")) {
-                        itemsToAdd
-                    } else {
-                        // Sort items by track number extracted from title, then by title
-                        itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
-                    }
-                    
+                    // Already in play order: folders are walked in natural file-name order,
+                    // and playlist / CUE / ISO entries keep their own order. Re-sorting by
+                    // title here put tagged tracks ("There is More to this World", no
+                    // number) in alphabetical order instead of track order.
+                    val sortedItems = itemsToAdd
+
                     if (replace) {
                         controller.setMediaItems(sortedItems)
                         controller.prepare()
                         controller.play()
+                        if (!isAdded) return@runOnUiThread   // BUG-2: guard against detached fragment
                         val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                         startActivity(intent)
                     } else {
@@ -1114,7 +1319,7 @@ class MainFragment : BrowseSupportFragment() {
 
                     val items = listOf(
                         DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-                        DialogOptionItem("Replace current playlist", R.drawable.ic_repeat)
+                        DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
                     )
                     val adapter = DialogOptionAdapter(context, items)
 
@@ -1145,17 +1350,45 @@ class MainFragment : BrowseSupportFragment() {
             try {
                 val mainActivity = activity as? MainActivity
                 val itemsToAdd = mutableListOf<MediaItem>()
-                val isPlaylistFile = !file.isDirectory() && isPlayable(file.name) &&
-                    (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls"))
                 
+                // Ensure we use a context with credentials if needed for recursion
+                val credentialContext = SmbContext.getContextForUri(file.path)
+
                 fun scanRecursive(f: SmbFile) {
                     if (f.isDirectory()) {
-                        f.listFiles()?.forEach { scanRecursive(it) }
+                        // jcifs directory names end in '/', which avoids a round trip per child
+                        f.listFiles()?.let { kids ->
+                            NaturalOrder.sortChildren(kids.asList(), { it.name.endsWith("/") }, { it.name })
+                                .forEach { scanRecursive(it) }
+                        }
                     } else if (isPlayable(f.name)) {
                         val lower = f.name.lowercase()
-                        if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
+                        if (lower.endsWith(".iso")) {
+                            try {
+                                val sacdAccess = SmbSacdRandomAccess(SmbFile(f.path, credentialContext))
+                                val sacdResult = SacdSupport.buildTrackMediaItems(
+                                    sacdAccess, SacdSupport.AREA_STEREO, null, f.path
+                                )
+                                sacdAccess.close()
+                                sacdResult.onSuccess { android.util.Log.i("SacdAdd", "smb iso ${f.path} -> ${it.size} items") }
+                                sacdResult.onFailure { android.util.Log.w("SacdAdd", "smb iso ${f.path} failed", it) }
+                                sacdResult.getOrNull()?.let { itemsToAdd.addAll(it) }
+                            } catch (e: Exception) {
+                                android.util.Log.w("SacdAdd", "smb iso ${f.path} threw", e)
+                                e.printStackTrace()
+                            }
+                        } else if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                             f.getInputStream().use { 
                                 val parsed = mainActivity?.parseM3uFromStream(it, f.parent) ?: emptyList()
+                                if (parsed.isNotEmpty()) {
+                                    itemsToAdd.addAll(parsed)
+                                } else {
+                                    itemsToAdd.add(createMediaItem(f.name, "", f.path))
+                                }
+                            }
+                        } else if (lower.endsWith(".cue")) {
+                            f.getInputStream().use {
+                                val parsed = mainActivity?.parseCueFromStream(it, f.parent) ?: emptyList()
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
@@ -1177,8 +1410,6 @@ class MainFragment : BrowseSupportFragment() {
                     }
                 }
 
-                // Ensure we use a context with credentials if needed for recursion
-                val credentialContext = SmbContext.getContextForUri(file.path)
                 val rootFile = SmbFile(file.path, credentialContext)
                 scanRecursive(rootFile)
 
@@ -1186,19 +1417,16 @@ class MainFragment : BrowseSupportFragment() {
                     if (activity?.isFinishing == true) return@runOnUiThread
                     loadingToast.cancel()
                     if (itemsToAdd.isNotEmpty()) {
-                        val sortedItems = if (isPlaylistFile) {
-                            itemsToAdd
-                        } else {
-                            // Sort items by track number extracted from title, then by title
-                            itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
-                        }
-                        
+                        // Already in play order (natural file-name walk; playlist/CUE/ISO order kept)
+                        val sortedItems = itemsToAdd
+
                         val controller = mainActivity?.getController()
                         if (controller != null) {
                             if (replace) {
                                 controller.setMediaItems(sortedItems)
                                 controller.prepare()
                                 controller.play()
+                                if (!isAdded) return@runOnUiThread   // BUG-2
                                 val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                                 startActivity(intent)
                             } else {
@@ -1233,7 +1461,7 @@ class MainFragment : BrowseSupportFragment() {
                     .setPositiveButton("Settings") { _, _ ->
                         try {
                             val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                            intent.data = Uri.parse("package:${context.packageName}")
+                            intent.data = "package:${context.packageName}".toUri()
                             startActivity(intent)
                         } catch (e: Exception) {
                             val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
@@ -1332,7 +1560,7 @@ class MainFragment : BrowseSupportFragment() {
                 .setPositiveButton("Settings") { _, _ ->
                     try {
                         val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                        intent.data = Uri.parse("package:${context.packageName}")
+                        intent.data = "package:${context.packageName}".toUri()
                         startActivity(intent)
                     } catch (e: Exception) {
                         val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
@@ -1389,7 +1617,7 @@ class MainFragment : BrowseSupportFragment() {
                     if (file.isDirectory) {
                         items.add(BrowseItem(file.name, file.absolutePath, R.drawable.ic_folder, true))
                     } else if (!isSelectionMode && isPlayable(file.name)) {
-                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls")) R.drawable.ic_playlist else R.drawable.ic_audio
+                        val icon = if (file.name.lowercase().endsWith(".m3u") || file.name.lowercase().endsWith(".m3u8") || file.name.lowercase().endsWith(".pls") || file.name.lowercase().endsWith(".cue")) R.drawable.ic_playlist else R.drawable.ic_audio
                         items.add(BrowseItem(file.name, file.absolutePath, icon, false))
                     }
                 }
@@ -1404,7 +1632,9 @@ class MainFragment : BrowseSupportFragment() {
                     
                     val onBack: () -> Unit = {
                         val parent = currentDir.parentFile
-                        if (parent != null && parent.absolutePath != "/storage" && parent.absolutePath != "/") {
+                        val internalRoot = android.os.Environment.getExternalStorageDirectory().absolutePath
+                        if (parent != null && currentDir.absolutePath != internalRoot &&
+                            parent.absolutePath != "/storage" && parent.absolutePath != "/") {
                             browseFileStorage(parent.absolutePath, isSelectionMode)
                         }
                     }
@@ -1493,6 +1723,14 @@ class MainFragment : BrowseSupportFragment() {
             dialog.dismiss()
         }
 
+        if (onBack != null) {
+            // Remote/phone Back goes up one level, like the dialog's Back button. Back
+            // cancels the dialog on every API level (incl. predictive back on 16+, where
+            // key listeners never see KEYCODE_BACK); the buttons dismiss(), not cancel().
+            dialog.setCanceledOnTouchOutside(false)
+            dialog.setOnCancelListener { onBack() }
+        }
+
         dialog.show()
     }
 
@@ -1504,13 +1742,13 @@ class MainFragment : BrowseSupportFragment() {
         val items = if (isDir) {
             listOf(
                 DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-                DialogOptionItem("Replace current playlist", R.drawable.ic_repeat),
+                DialogOptionItem("Replace current playlist", R.drawable.ic_playlist),
                 DialogOptionItem("Add to Music Library", R.drawable.ic_folder_music)
             )
         } else {
             listOf(
                 DialogOptionItem("Add to current playlist", R.drawable.ic_queue_music),
-                DialogOptionItem("Replace current playlist", R.drawable.ic_repeat)
+                DialogOptionItem("Replace current playlist", R.drawable.ic_playlist)
             )
         }
         val adapter = DialogOptionAdapter(context, items)
@@ -1532,7 +1770,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = activity ?: return
         val items = listOf(
             DialogOptionItem("Add To Current Playlist", R.drawable.ic_queue_music),
-            DialogOptionItem("Replace Current Playlist", R.drawable.ic_repeat)
+            DialogOptionItem("Replace Current Playlist", R.drawable.ic_playlist)
         )
         val adapter = DialogOptionAdapter(context, items)
 
@@ -1540,7 +1778,7 @@ class MainFragment : BrowseSupportFragment() {
             .setTitle(name)
             .setAdapter(adapter) { _, which ->
                 if (uriString.startsWith("file://")) {
-                    val file = java.io.File(Uri.parse(uriString).path ?: "")
+                    val file = java.io.File(uriString.toUri().path ?: "")
                     addFilesToPlaylist(file, which == 1)
                 } else {
                     addLocalToPlaylist(uriString, name, which == 1)
@@ -1559,26 +1797,63 @@ class MainFragment : BrowseSupportFragment() {
 
         Thread {
             val itemsToAdd = mutableListOf<MediaItem>()
-            val isPlaylistFile = !root.isDirectory && isPlayable(root.name) &&
-                (root.name.lowercase().endsWith(".m3u") || root.name.lowercase().endsWith(".m3u8") || root.name.lowercase().endsWith(".pls"))
             
             fun scanRecursive(file: java.io.File) {
                 if (file.isDirectory) {
-                    file.listFiles()?.forEach { scanRecursive(it) }
+                    file.listFiles()?.let { kids ->
+                        val (dirs, files) = NaturalOrder.sortChildren(kids.asList(), { it.isDirectory }, { it.name })
+                            .partition { it.isDirectory }
+                        val folderStart = itemsToAdd.size
+                        files.forEach { scanRecursive(it) }
+                        if (files.none { NaturalOrder.isListFile(it.name) }) NaturalOrder.applyTagOrder(itemsToAdd, folderStart)
+                        dirs.forEach { scanRecursive(it) }
+                    }
                 } else if (isPlayable(file.name)) {
                     val lower = file.name.lowercase()
-                    if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
+                    if (lower.endsWith(".iso")) {
+                        try {
+                            val sacdAccess = LocalSacdRandomAccess(file)
+                            val sacdResult = SacdSupport.buildTrackMediaItems(
+                                sacdAccess, SacdSupport.AREA_STEREO, null, Uri.fromFile(file).toString()
+                            )
+                            sacdAccess.close()
+                            sacdResult.getOrNull()?.let { itemsToAdd.addAll(it) }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    } else if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) {
                         try {
                             java.io.FileInputStream(file).use { stream ->
                                 val parsed = mainActivity?.parseM3uFromStream(stream, file.parent) ?: emptyList()
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
-                                    itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                                    val uri = Uri.fromFile(file)
+                                    val meta = MetadataUtils.getMetadata(context, uri)
+                                    itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                                 }
                             }
                         } catch (e: Exception) {
-                            itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                            val uri = Uri.fromFile(file)
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
+                        }
+                    } else if (lower.endsWith(".cue")) {
+                        try {
+                            java.io.FileInputStream(file).use { stream ->
+                                val parsed = mainActivity?.parseCueFromStream(stream, file.parent) ?: emptyList()
+                                if (parsed.isNotEmpty()) {
+                                    itemsToAdd.addAll(parsed)
+                                } else {
+                                    val uri = Uri.fromFile(file)
+                                    val meta = MetadataUtils.getMetadata(context, uri)
+                                    itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
+                                }
+                            }
+                        } catch (e: Exception) {
+                            val uri = Uri.fromFile(file)
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                         }
                     } else if (lower.endsWith(".pls")) {
                         try {
@@ -1587,15 +1862,20 @@ class MainFragment : BrowseSupportFragment() {
                                 if (parsed.isNotEmpty()) {
                                     itemsToAdd.addAll(parsed)
                                 } else {
-                                    itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                                    val uri = Uri.fromFile(file)
+                                    val meta = MetadataUtils.getMetadata(context, uri)
+                                    itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                                 }
                             }
                         } catch (e: Exception) {
-                            itemsToAdd.add(createMediaItem(file.name, "Local Storage", Uri.fromFile(file).toString()))
+                            val uri = Uri.fromFile(file)
+                            val meta = MetadataUtils.getMetadata(context, uri)
+                            itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString()))
                         }
                     } else {
-                        val uri = Uri.fromFile(file).toString()
-                        itemsToAdd.add(createMediaItem(file.name, "Local Storage", uri))
+                        val uri = Uri.fromFile(file)
+                        val meta = MetadataUtils.getMetadata(context, uri)
+                        itemsToAdd.add(createMediaItem(meta.title ?: file.name, meta.artist ?: "", uri.toString(), trackNumber = meta.trackNumber, discNumber = meta.discNumber))
                     }
                 }
             }
@@ -1605,16 +1885,14 @@ class MainFragment : BrowseSupportFragment() {
             activity?.runOnUiThread {
                 loadingToast.cancel()
                 if (itemsToAdd.isNotEmpty()) {
-                    val sortedItems = if (isPlaylistFile) {
-                        itemsToAdd
-                    } else {
-                        itemsToAdd.sortedWith(compareBy({ extractTrackNumber(it.mediaMetadata.title.toString()) }, { it.mediaMetadata.title.toString().lowercase() }))
-                    }
-                    
+                    // Already in play order (natural file-name walk; playlist/CUE/ISO order kept)
+                    val sortedItems = itemsToAdd
+
                     if (replace) {
                         controller.setMediaItems(sortedItems)
                         controller.prepare()
                         controller.play()
+                        if (!isAdded) return@runOnUiThread   // BUG-2
                         val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
                         startActivity(intent)
                     } else {
@@ -1629,15 +1907,8 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isPlayable(filename: String): Boolean {
-        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls")
+        val extensions = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".m3u", ".m3u8", ".pls", ".cue", ".ape", ".iso", ".dsf", ".dff", ".wv")
         return extensions.any { filename.lowercase().endsWith(it) }
-    }
-
-    private fun extractTrackNumber(title: String): Int {
-        val cleanTitle = title.trim()
-        val regex = Regex("^(\\d+)")
-        val match = regex.find(cleanTitle)
-        return match?.value?.toInt() ?: Int.MAX_VALUE
     }
 
     private fun hasPlayableContent(context: Context, treeUri: Uri, docId: String): Boolean {
@@ -1683,7 +1954,6 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun showUsbDacDialog() {
         val context = requireContext()
-        val svc = PlaybackService.instance
         // UsbManager check = live device presence (correct after power-off)
         val usbDac = PlaybackService.findUsbAudioDevice(context)
         // AudioManager check = audio capabilities (sample rates, bit depths, channel counts)
@@ -1737,20 +2007,464 @@ class MainFragment : BrowseSupportFragment() {
             "No USB DAC detected.\n\nConnect a USB DAC — it will be detected\nautomatically on startup or when plugged in.\n\nIf your DAC was just connected, try\n'Reset Audio Sink' to trigger negotiation."
         }
 
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val resetOn = prefs.getBoolean("usb_reset_on_release", true)
+        val items = listOf(
+            DialogOptionItem("Reset Audio Sink", R.drawable.ic_dac),
+            DialogOptionItem(
+                if (resetOn) "USB Reset On Release: Enabled"
+                else "USB Reset On Release: Disabled",
+                R.drawable.ic_dac
+            )
+        )
         AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("USB DAC")
             .setIcon(R.drawable.ic_dac)
             .setMessage(msg)
-            .setPositiveButton("OK", null)
-            .setNeutralButton("Reset Audio Sink") { _, _ ->
-                if (svc != null) {
-                    Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
-                    svc.checkAndResetUsbAudio(reason = "manual from settings")
-                    refreshWithCurrentFocus()
-                } else {
-                    Toast.makeText(context, "Playback service not running", Toast.LENGTH_SHORT).show()
+            .setAdapter(DialogOptionAdapter(context, items)) { _, which ->
+                when (which) {
+                    0 -> {
+                        // Start the service if Android TV killed it while the UI was
+                        // closed; retry once since onCreate() lands on the main looper.
+                        val s = PlaybackService.ensureRunning(context)
+                        if (s != null) {
+                            Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
+                            s.checkAndResetUsbAudio(reason = "manual from settings")
+                            refreshWithCurrentFocus()
+                        } else {
+                            Toast.makeText(context, "Starting playback service…", Toast.LENGTH_SHORT).show()
+                            view?.postDelayed({
+                                val retried = PlaybackService.instance
+                                if (retried != null) {
+                                    Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
+                                    retried.checkAndResetUsbAudio(reason = "manual from settings")
+                                    refreshWithCurrentFocus()
+                                } else {
+                                    Toast.makeText(context, "Playback service not running", Toast.LENGTH_SHORT).show()
+                                }
+                            }, 200)
+                        }
+                    }
+                    1 -> {
+                        val next = !resetOn
+                        prefs.edit { putBoolean("usb_reset_on_release", next) }
+                        // The flag is read when the player is built, so rebuild it for
+                        // the change to take effect.
+                        PlaybackService.instance?.applyOutputModeAudioReset()
+                        Toast.makeText(
+                            context,
+                            if (next) "DAC will be soft-replugged on release"
+                            else "DAC released without a USB reset — other apps keep the device",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        refreshWithCurrentFocus()
+                        showUsbDacDialog()
+                    }
                 }
             }
+            .setNegativeButton("Back", null)
+            .show()
+    }
+
+    // ── LAN Player Control ──────────────────────────────────────────────
+    private fun isMpdEnabled(): Boolean =
+        requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean("mpd_enabled", true)
+
+    private fun getMpdPort(): Int =
+        requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getInt("mpd_port", 6600)
+
+    private fun getLanControlSubtitle(): String {
+        val enabled = try { isMpdEnabled() } catch (_: Exception) { true }
+        val port = try { getMpdPort() } catch (_: Exception) { 6600 }
+        val running = PlaybackService.instance?.isMpdRunning() == true
+        val clients = PlaybackService.instance?.getClientCount() ?: 0
+        val pwdSet = try {
+            requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                .getString("mpd_password", "")?.isNotBlank() == true
+        } catch (_: Exception) { false }
+        val lock = if (pwdSet) " 🔒" else ""
+        return when {
+            !enabled -> "Disabled"
+            running -> "Enabled :$port$lock — ${getLocalIp()}:$port" + if (clients > 0) " ($clients)" else ""
+            else -> "Enabled :$port$lock — starting…"
+        }
+    }
+
+    private fun getLocalIp(): String {
+        return try {
+            val ifaces = java.net.NetworkInterface.getNetworkInterfaces()
+            var fallback: String? = null
+            while (ifaces.hasMoreElements()) {
+                val ni = ifaces.nextElement()
+                if (!ni.isUp || ni.isLoopback) continue
+                val addrs = ni.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (addr.isLoopbackAddress) continue
+                    val host = addr.hostAddress ?: continue
+                    if (host.contains(":")) continue // skip IPv6
+                    if (host.startsWith("192.168.") || host.startsWith("10.") || host.startsWith("172.")) return host
+                    if (fallback == null) fallback = host
+                }
+            }
+            fallback ?: "—"
+        } catch (_: Exception) { "—" }
+    }
+
+    private fun updateLanControlCard() {
+        if (!::settingsAdapter.isInitialized) return
+        // LAN index is 9 when inserted after USB DAC (7) and Audio Output (8)
+        val lanIndex = 9
+        if (lanIndex < settingsAdapter.size()) {
+            settingsAdapter.replace(lanIndex, createActionItem("LAN Player Control", getLanControlSubtitle()))
+        }
+    }
+
+    private fun showLanControlDialog() {
+        val context = requireContext()
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        var enabled = prefs.getBoolean("mpd_enabled", true)
+        val port = prefs.getInt("mpd_port", 6600)
+        var currentPassword = prefs.getString("mpd_password", "") ?: ""
+        val ip = getLocalIp()
+        val running = PlaybackService.instance?.isMpdRunning() == true
+
+        val dialogView = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 16)
+        }
+
+        fun buildInfoText(pwd: String, isEnabled: Boolean, curPort: Int = port): String = buildString {
+            val clients = PlaybackService.instance?.getClientCount() ?: 0
+            val runText = if (!isEnabled) "Disabled" else if (running) "Running ($clients client${if (clients != 1) "s" else ""})" else "Starting…"
+            append("MPD server for MALP / YMuse / any MPD client\n\n")
+            append("Status: $runText\n")
+            append("Address: $ip:$curPort\n")
+            if (pwd.isNotBlank()) append("Password: set (🔒)\n") else append("Password: none\n")
+        }
+
+        val infoView = android.widget.TextView(context).apply {
+            text = buildInfoText(currentPassword, enabled)
+            textSize = 13f
+            setLineSpacing(4f, 1f)
+        }
+        dialogView.addView(infoView)
+
+        val switchRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 16, 0, 16)
+        }
+        val switchLabel = android.widget.TextView(context).apply {
+            text = "Enable LAN control"
+            textSize = 15f
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val enableSwitch = android.widget.Switch(context).apply {
+            isChecked = enabled
+            isFocusable = true
+        }
+        switchRow.addView(switchLabel)
+        switchRow.addView(enableSwitch)
+        dialogView.addView(switchRow)
+
+        // Password row
+        val pwdRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(0, 8, 0, 8)
+        }
+        val pwdLabel = android.widget.TextView(context).apply {
+            text = "Password (leave empty for none):"
+            textSize = 13f
+            setPadding(0, 0, 0, 8)
+        }
+        val pwdInput = android.widget.EditText(context).apply {
+            setText(currentPassword)
+            hint = "e.g. 1234"
+            // Plain text inputType so show/hide toggle is reliable on TV.
+            // NOTE: isSingleLine must come BEFORE transformationMethod — setSingleLine()
+            // internally applies SingleLineTransformationMethod (plain text) and would
+            // otherwise wipe the password masking on every dialog open.
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isSingleLine = true
+            transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+            setPadding(16, 12, 16, 12)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF2A2A2A.toInt())
+                cornerRadius = 8f
+                setStroke(1, 0xFF555555.toInt())
+            }
+            setTextColor(0xFFFFFFFF.toInt())
+            setHintTextColor(0xFF888888.toInt())
+        }
+        val showPwdRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 8, 0, 0)
+            isFocusable = false
+            descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
+        }
+        val showPwdLabel = android.widget.TextView(context).apply {
+            text = "Show password"
+            textSize = 13f
+            setTextColor(0xFFCCCCCC.toInt())
+            isFocusable = false
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val showPwdCheck = android.widget.Switch(context).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isChecked = false
+        }
+        showPwdRow.addView(showPwdLabel)
+        showPwdRow.addView(showPwdCheck)
+        pwdRow.addView(pwdLabel)
+        pwdRow.addView(pwdInput)
+        pwdRow.addView(showPwdRow)
+        dialogView.addView(pwdRow)
+
+        // Port row
+        val portRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 8, 0, 8)
+        }
+        val portLabel = android.widget.TextView(context).apply {
+            text = "Port:"
+            textSize = 13f
+            setPadding(0, 0, 16, 0)
+        }
+        val portInput = android.widget.EditText(context).apply {
+            setText(port.toString())
+            hint = "6600"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isSingleLine = true
+            setPadding(16, 10, 16, 10)
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF2A2A2A.toInt())
+                cornerRadius = 8f
+                setStroke(1, 0xFF555555.toInt())
+            }
+            setTextColor(0xFFFFFFFF.toInt())
+            setHintTextColor(0xFF888888.toInt())
+        }
+        portRow.addView(portLabel)
+        portRow.addView(portInput)
+        dialogView.addView(portRow)
+
+        // Autostart row
+        var autostartEnabled = prefs.getBoolean("mpd_autostart", false)
+        val autostartRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 12, 0, 4)
+        }
+        val autostartLabel = android.widget.TextView(context).apply {
+            text = "Autostart on boot"
+            textSize = 13f
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val autostartSwitch = android.widget.Switch(context).apply {
+            isChecked = autostartEnabled
+            isFocusable = true
+            isFocusableInTouchMode = true
+        }
+        autostartRow.addView(autostartLabel)
+        autostartRow.addView(autostartSwitch)
+        dialogView.addView(autostartRow)
+
+        // Ensure focus navigation works on TV (D-pad)
+        pwdInput.isFocusable = true
+        pwdInput.isFocusableInTouchMode = true
+        portInput.isFocusable = true
+        portInput.isFocusableInTouchMode = true
+        // Make container not steal focus
+        dialogView.isFocusable = false
+        dialogView.descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
+        // Fix focus order: pwd -> showPwd -> port -> autostart
+        pwdInput.nextFocusDownId = showPwdCheck.id
+        showPwdCheck.nextFocusDownId = portInput.id
+        portInput.nextFocusDownId = autostartSwitch.id
+        // Assign IDs if needed for focus chain
+        if (pwdInput.id == android.view.View.NO_ID) pwdInput.id = android.view.View.generateViewId()
+        if (showPwdCheck.id == android.view.View.NO_ID) showPwdCheck.id = android.view.View.generateViewId()
+        if (portInput.id == android.view.View.NO_ID) portInput.id = android.view.View.generateViewId()
+        if (autostartSwitch.id == android.view.View.NO_ID) autostartSwitch.id = android.view.View.generateViewId()
+        // Re-apply after IDs generated
+        pwdInput.nextFocusDownId = showPwdCheck.id
+        showPwdCheck.nextFocusDownId = portInput.id
+        portInput.nextFocusDownId = autostartSwitch.id
+
+        val dialog = AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("LAN Player Control")
+            .setIcon(R.drawable.ic_lan_control)
+            .setView(dialogView)
+            .setPositiveButton("OK", null)
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Restart server", null)
+            .create()
+
+        dialog.setOnShowListener {
+            // Show keyboard when password field gains focus (TV + phone)
+            dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+            // Defensive: ensure masking state matches the switch on every (re)open
+            pwdInput.transformationMethod = if (showPwdCheck.isChecked) null
+                else android.text.method.PasswordTransformationMethod.getInstance()
+            pwdInput.requestFocus()
+            try {
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                imm.showSoftInput(pwdInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            } catch (_: Exception) {}
+            pwdInput.setOnClickListener {
+                try {
+                    val imm2 = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                    imm2.showSoftInput(pwdInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                } catch (_: Exception) {}
+            }
+            pwdInput.setOnFocusChangeListener { v, hasFocus ->
+                if (hasFocus) {
+                    try {
+                        val imm3 = context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                        imm3.showSoftInput(v, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                    } catch (_: Exception) {}
+                }
+            }
+
+            val okBtn = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            val restartBtn = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+
+            fun refreshInfo() {
+                val curPort = portInput.text.toString().toIntOrNull() ?: port
+                infoView.text = buildInfoText(pwdInput.text.toString(), enabled, curPort)
+            }
+
+            enableSwitch.setOnCheckedChangeListener { _, checked ->
+                enabled = checked
+                refreshInfo()
+            }
+            autostartSwitch.setOnCheckedChangeListener { _, checked ->
+                autostartEnabled = checked
+            }
+            showPwdCheck.setOnCheckedChangeListener { _, checked ->
+                val selStart = pwdInput.selectionStart
+                val selEnd = pwdInput.selectionEnd
+                // Only toggle transformation — keep inputType as password to avoid keyboard reset on TV
+                pwdInput.transformationMethod = if (checked) null else android.text.method.PasswordTransformationMethod.getInstance()
+                // Keep cursor and ensure password stays hidden/shown
+                pwdInput.setSelection(selStart.coerceAtLeast(0), selEnd.coerceAtLeast(0))
+            }
+            pwdInput.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) { refreshInfo() }
+            })
+            portInput.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) { refreshInfo() }
+            })
+
+            okBtn.setOnClickListener {
+                val newPwd = pwdInput.text.toString().trim()
+                val newPort = portInput.text.toString().toIntOrNull()
+                if (newPort == null || newPort !in 1024..65535) {
+                    Toast.makeText(context, "Port must be 1024-65535", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                val oldEnabled = prefs.getBoolean("mpd_enabled", true)
+                val oldPwd = prefs.getString("mpd_password", "") ?: ""
+                val oldPort = prefs.getInt("mpd_port", 6600)
+                val oldAutostart = prefs.getBoolean("mpd_autostart", false)
+                val changed = oldEnabled != enabled || oldPwd != newPwd || oldPort != newPort || oldAutostart != autostartEnabled
+                prefs.edit {
+                    putBoolean("mpd_enabled", enabled)
+                    putString("mpd_password", newPwd)
+                    putInt("mpd_port", newPort)
+                    putBoolean("mpd_autostart", autostartEnabled)
+                }
+                if (changed) {
+                    PlaybackService.instance?.updateMpdServer()
+                    val msg = when {
+                        !enabled -> "MPD disabled"
+                        newPwd.isNotBlank() -> "MPD :$newPort 🔒"
+                        else -> "MPD :$newPort"
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                }
+                updateLanControlCard()
+                dialog.dismiss()
+            }
+            restartBtn.setOnClickListener {
+                val newPwd = pwdInput.text.toString().trim()
+                val newPort = portInput.text.toString().toIntOrNull() ?: port
+                if (newPort !in 1024..65535) {
+                    Toast.makeText(context, "Port must be 1024-65535", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                prefs.edit {
+                    putBoolean("mpd_enabled", true)
+                    putString("mpd_password", newPwd)
+                    putInt("mpd_port", newPort)
+                    putBoolean("mpd_autostart", autostartEnabled)
+                }
+                PlaybackService.instance?.updateMpdServer()
+                Toast.makeText(context, "Restarting MPD :$newPort …", Toast.LENGTH_SHORT).show()
+                updateLanControlCard()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun getDsdOutputSubtitle(): String {
+        val context = requireContext()
+        return when {
+            !PlaybackService.isDopSelected(context) -> "Convert to PCM (any DAC)"
+            PlaybackService.isDopOutputActive(context) -> "DoP — native DSD on the DAC"
+            else -> "DoP (inactive: needs USB driver mode + USB DAC)"
+        }
+    }
+
+    /**
+     * DSD (SACD ISO, DSF, DFF) can be converted to PCM in the app — works with
+     * every DAC — or sent as DoP, which a DoP-capable DAC decodes as native DSD.
+     * DoP is only used in "Bit-perfect (USB driver)" mode, the one output path
+     * that delivers the samples bit-exactly; elsewhere PCM conversion is used.
+     */
+    private fun showDsdOutputDialog() {
+        val context = requireContext()
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val options = arrayOf(
+            "Convert to PCM (176.4 / 192 kHz, works with any DAC)",
+            "DoP — DSD over PCM (DAC must support DoP)"
+        )
+        val current = if (PlaybackService.isDopSelected(context)) 1 else 0
+        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("DSD Output")
+            .setSingleChoiceItems(options, current) { dialog, which ->
+                prefs.edit().putString(
+                    PlaybackService.KEY_DSD_OUTPUT,
+                    if (which == 1) PlaybackService.DSD_OUTPUT_DOP else PlaybackService.DSD_OUTPUT_PCM
+                ).apply()
+                // A new choice gets a fresh chance at DoP after an earlier fallback to PCM.
+                PlaybackService.clearDopSuppression()
+                dialog.dismiss()
+                val note = if (which == 1 && !PlaybackService.isDopOutputActive(context)) {
+                    "DoP is used only in Bit-perfect (USB driver) mode with a USB DAC attached — until then DSD is converted to PCM."
+                } else {
+                    "Applies from the next DSD track."
+                }
+                Toast.makeText(context, note, Toast.LENGTH_LONG).show()
+                refreshWithCurrentFocus()
+            }
+            .setNegativeButton("Cancel", null)
             .show()
     }
 
@@ -1766,7 +2480,7 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun isResumeEnabled() = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        .getBoolean(KEY_RESUME, false)
+        .getBoolean(KEY_RESUME, true)
 
     private fun isRecentEnabled() = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         .getBoolean(KEY_RECENT, true)
@@ -1796,40 +2510,106 @@ class MainFragment : BrowseSupportFragment() {
             .show()
     }
 
-    private fun getColorSchemeName(): String {
-        val schemes = arrayOf("Neon Green", "Electric Blue", "Amber Gold", "Deep Purple", "Hot Pink", "Pure Black with Grey", "Pure Black with Red", "Pure Black with Green", "Pure Black with White")
-        val index = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-            .getInt(KEY_COLOR_SCHEME, 0)
-        return if (index in schemes.indices) schemes[index] else schemes[0]
-    }
-
-    private fun getColorSchemeColor(): Int {
-        val colors = intArrayOf(
-            0xFF00E676.toInt(), // Neon Green
-            0xFF2979FF.toInt(), // Electric Blue
-            0xFFFFC400.toInt(), // Amber Gold
-            0xFF7C4DFF.toInt(), // Deep Purple
-            0xFFFF4081.toInt(), // Hot Pink
-            0xFF888888.toInt(), // Grey
-            0xFFFF5252.toInt(), // Red
-            0xFF1B5E20.toInt(), // Dark Green (Material 900)
-            0xFFFFFFFF.toInt()  // White
-        )
-        val index = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-            .getInt(KEY_COLOR_SCHEME, 0)
-        return if (index in colors.indices) colors[index] else colors[0]
-    }
+    private fun getColorSchemeName(): String = ColorThemes.current(requireContext()).name
 
     private fun showColorSchemeDialog() {
-        val schemeNames = arrayOf("Neon Green", "Electric Blue", "Amber Gold", "Deep Purple", "Hot Pink", "Pure Black with Grey", "Pure Black with Red", "Pure Black with Green", "Pure Black with White")
-        val items = schemeNames.map { DialogOptionItem(it, R.drawable.ic_palette) }
-        val adapter = DialogOptionAdapter(requireContext(), items)
-        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        val ctx = requireContext()
+        val currentId = ColorThemes.currentId(ctx)
+        val themes = ColorThemes.PICKER_ORDER.map { ColorThemes.byId(it) }
+        val items = themes.map { theme ->
+            DialogOptionItem(
+                theme.name,
+                R.drawable.ic_palette,
+                iconDrawable = ColorThemes.swatch(ctx, theme, selected = theme.id == currentId),
+            )
+        }
+        val adapter = DialogOptionAdapter(ctx, items)
+        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Player Color Scheme")
             .setAdapter(adapter) { _, which ->
-                requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    .edit().putInt(KEY_COLOR_SCHEME, which).apply()
-                refreshWithCurrentFocus()
+                val theme = themes[which]
+                if (theme.id != currentId) {
+                    ColorThemes.select(ctx, theme.id)
+                    applyColorTheme()
+                    refreshWithCurrentFocus()
+                }
+            }
+            .setNegativeButton("Back", null)
+            .create()
+            .apply {
+                // Open with the active theme in view rather than at the top of a long list.
+                setOnShowListener { listView?.setSelection(themes.indexOfFirst { it.id == currentId }.coerceAtLeast(0)) }
+            }
+            .show()
+    }
+
+    /** Re-applies the theme surfaces that are not rebuilt with the rows (sidebar, background). */
+    private fun applyColorTheme() {
+        val theme = ColorThemes.current(requireContext())
+        brandColor = theme.sidebar
+        view?.background = ColorThemes.browseBackground(theme)
+        (titleView as? BrandTitleView)?.applyTheme(theme)
+    }
+
+    private val audioOutputNames = arrayOf(
+        "Bit-perfect via Android",  // AUDIO_OUTPUT_BITPERFECT_ANDROID = 1
+        "Bit-perfect (USB driver)", // AUDIO_OUTPUT_USBDEVFS = 2
+        "Standard Android Output"  // AUDIO_OUTPUT_STANDARD_ANDROID = 3
+    )
+    private val audioOutputModes = intArrayOf(1, 2, 3)
+
+    /**
+     * Effective audio-output mode, mirroring PlaybackService.getAudioOutputMode():
+     * migrates the legacy usbdevfs_driver boolean on first read and treats the
+     * removed mode 0 ("Default (Android audio)") as bit-perfect via Android, so
+     * the settings subtitle always agrees with the service.
+     */
+    private fun getAudioOutputMode(prefs: SharedPreferences): Int {
+        if (!prefs.contains(KEY_AUDIO_OUTPUT_MODE)) {
+            val mapped = if (prefs.getBoolean(KEY_USBDEVFS_DRIVER, true)) {
+                AUDIO_OUTPUT_USBDEVFS
+            } else {
+                AUDIO_OUTPUT_BITPERFECT_ANDROID
+            }
+            prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, mapped).apply()
+            return mapped
+        }
+        val stored = prefs.getInt(KEY_AUDIO_OUTPUT_MODE, AUDIO_OUTPUT_USBDEVFS)
+        val mapped = if (stored == 0) AUDIO_OUTPUT_BITPERFECT_ANDROID else stored
+        if (mapped != stored) {
+            prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, mapped).apply()
+        }
+        return mapped
+    }
+
+    private fun getAudioOutputSubtitle(): String {
+        val mode = getAudioOutputMode(
+            requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        )
+        val index = audioOutputModes.indexOf(mode)
+        return if (index >= 0) audioOutputNames[index] else audioOutputNames[1]
+    }
+
+    private fun showAudioOutputDialog() {
+        val items = audioOutputNames.mapIndexed { i, name ->
+            DialogOptionItem(name, PlaybackService.audioOutputIconRes(audioOutputModes[i]))
+        }
+        val adapter = DialogOptionAdapter(requireContext(), items)
+        AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Select Audio Output")
+            .setAdapter(adapter) { _, which ->
+                val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                val selected = audioOutputModes[which]
+                // Re-selecting the active mode must not tear the DAC down and rebuild
+                // the player for nothing (BUG-22).
+                if (selected != getAudioOutputMode(prefs)) {
+                    prefs.edit().putInt(KEY_AUDIO_OUTPUT_MODE, selected).apply()
+                    refreshWithCurrentFocus()
+                    // Applying a new output mode means rebuilding the audio sink so the
+                    // chosen path (system / Android bit-perfect / usbdevfs driver) becomes
+                    // live. This also releases a still-claimed DAC from the previous mode.
+                    PlaybackService.instance?.applyOutputModeAudioReset()
+                }
             }
             .setNegativeButton("Back", null)
             .show()
@@ -1850,8 +2630,8 @@ class MainFragment : BrowseSupportFragment() {
     private fun showScreensaverSettings() {
         val items = listOf(
             DialogOptionItem("Screensaver On", R.drawable.ic_screensaver),
-            DialogOptionItem("Turn The Screen Off", R.drawable.ic_screensaver),
-            DialogOptionItem("Never", R.drawable.ic_screensaver)
+            DialogOptionItem("Turn The Screen Off", R.drawable.ic_screen_off),
+            DialogOptionItem("Never", R.drawable.ic_block)
         )
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
@@ -1888,15 +2668,17 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun toggleResumePlayback() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val current = prefs.getBoolean(KEY_RESUME, false)
-        prefs.edit().putBoolean(KEY_RESUME, !current).apply()
+        // Use the same default (true) as isResumeEnabled() so a missing pref is
+        // treated consistently rather than toggling in the wrong direction (BUG-5).
+        val current = prefs.getBoolean(KEY_RESUME, true)
+        prefs.edit { putBoolean(KEY_RESUME, !current) }
         refreshWithCurrentFocus()
     }
 
     private fun toggleRecentFiles() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_RECENT, true)
-        prefs.edit().putBoolean(KEY_RECENT, !current).apply()
+        prefs.edit { putBoolean(KEY_RECENT, !current) }
         refreshWithCurrentFocus()
     }
 
@@ -1906,7 +2688,7 @@ class MainFragment : BrowseSupportFragment() {
         android.widget.ArrayAdapter<BrowseItem>(context, R.layout.list_item_browse, items) {
         override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.list_item_browse, parent, false)
-            val item = getItem(position)!!
+            val item = getItem(position) ?: return view
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.name
             val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
             icon.setImageResource(item.icon)
@@ -1915,17 +2697,26 @@ class MainFragment : BrowseSupportFragment() {
         }
     }
 
-    data class DialogOptionItem(val label: String, val iconRes: Int)
+    data class DialogOptionItem(
+        val label: String,
+        val iconRes: Int,
+        /** Drawn as-is instead of [iconRes] tinted with the theme colour (e.g. theme swatches). */
+        val iconDrawable: android.graphics.drawable.Drawable? = null,
+    )
 
     class DialogOptionAdapter(context: Context, items: List<DialogOptionItem>) :
         android.widget.ArrayAdapter<DialogOptionItem>(context, R.layout.list_item_browse, items) {
         override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.list_item_browse, parent, false)
-            val item = getItem(position)!!
+            val item = getItem(position) ?: return view
             view.findViewById<android.widget.TextView>(R.id.item_text).text = item.label
             val icon = view.findViewById<android.widget.ImageView>(R.id.item_icon)
-            icon.setImageResource(item.iconRes)
-            icon.drawable?.mutate()?.setTint(getThemeColor(context))
+            if (item.iconDrawable != null) {
+                icon.setImageDrawable(item.iconDrawable)
+            } else {
+                icon.setImageResource(item.iconRes)
+                icon.drawable?.mutate()?.setTint(getThemeColor(context))
+            }
             return view
         }
     }
@@ -1990,12 +2781,12 @@ class MainFragment : BrowseSupportFragment() {
             val newObj = JSONObject().apply {
                 put("uri", uri)
                 put("isLocal", isLocal)
-                val rawName = Uri.parse(uri).lastPathSegment ?: uri
+                val rawName = uri.toUri().lastPathSegment ?: uri
                 val cleanName = if (rawName.contains(":")) rawName.substringAfterLast(":") else rawName
                 put("name", cleanName)
             }
             jsonArray.put(newObj)
-            prefs.edit().putString(KEY_MUSIC_FOLDERS, jsonArray.toString()).apply()
+            prefs.edit { putString(KEY_MUSIC_FOLDERS, jsonArray.toString()) }
             refreshWithCurrentFocus()
             Toast.makeText(requireContext(), "Folder added", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -2165,14 +2956,17 @@ class MainFragment : BrowseSupportFragment() {
             val smbFolders = JSONArray(smbJson)
             for (i in 0 until smbFolders.length()) {
                 val obj = smbFolders.getJSONObject(i)
+                val ip = obj.getString("ip")
+                val share = obj.getString("share")
+                val encShare = Uri.encode(share)
                 val folderObj = JSONObject().apply {
-                    put("uri", "smb://${obj.getString("ip")}/${obj.getString("share")}/")
+                    put("uri", "smb://$ip/$encShare/")
                     put("isLocal", false)
                     put("isSmb", true)
                     put("index", i)
                 }
                 folderObjects.add(folderObj)
-                browseItems.add(BrowseItem("[SMB] ${obj.getString("share")} on ${obj.getString("ip")}", folderObj.getString("uri"), R.drawable.ic_network, true))
+                browseItems.add(BrowseItem("[SMB] $share on $ip", folderObj.getString("uri"), R.drawable.ic_network_music, true))
             }
         } catch (e: Exception) {}
 
@@ -2208,7 +3002,7 @@ class MainFragment : BrowseSupportFragment() {
             for (i in 0 until jsonArray.length()) {
                 if (i != index) newArray.put(jsonArray.get(i))
             }
-            prefs.edit().putString(KEY_SHARES, newArray.toString()).apply()
+            prefs.edit { putString(KEY_SHARES, newArray.toString()) }
         } else {
             val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             val jsonArray = JSONArray(prefs.getString(KEY_MUSIC_FOLDERS, "[]"))
@@ -2219,7 +3013,7 @@ class MainFragment : BrowseSupportFragment() {
                     newArray.put(jsonArray.get(i))
                 }
             }
-            prefs.edit().putString(KEY_MUSIC_FOLDERS, newArray.toString()).apply()
+            prefs.edit { putString(KEY_MUSIC_FOLDERS, newArray.toString()) }
         }
         refreshWithCurrentFocus()
         Toast.makeText(requireContext(), "Folder removed", Toast.LENGTH_SHORT).show()
@@ -2237,18 +3031,22 @@ class MainFragment : BrowseSupportFragment() {
             for (i in 0 until queueArray.length()) {
                 val entry = queueArray.optJSONObject(i)
                 if (entry != null) {
-                    val uri = entry.optString("mediaId", "")
+                    val mId = entry.optString("mediaId", "")
+                    val uri = entry.optString("uri", mId)
                     val title = entry.optString("title", "")
                     val artist = entry.optString("artist", "")
+                    val start = entry.optLong("start", 0)
+                    val end = entry.optLong("end", androidx.media3.common.C.TIME_UNSET)
+                    
                     if (uri.isNotEmpty()) {
-                        items.add(createMediaItem(title, artist, uri))
+                        items.add(createMediaItem(title, artist, uri, mId, start, end))
                     }
                 } else {
                     val uri = queueArray.getString(i)
                     val segment = if (uri.startsWith("smb://")) {
                         Uri.decode(uri.substringAfterLast("/").takeIf { it.isNotEmpty() } ?: uri)
                     } else {
-                        Uri.parse(uri).lastPathSegment ?: uri
+                        uri.toUri().lastPathSegment ?: uri
                     }
                     val title = segment.substringBeforeLast(".")
                     items.add(createMediaItem(title, "", uri))
@@ -2256,11 +3054,22 @@ class MainFragment : BrowseSupportFragment() {
             }
             
             if (items.isEmpty()) return
-            
+            val safeIndex = index.coerceIn(0, items.lastIndex)
+
+            // Live radio streams never have a meaningful position: a stale
+            // (unbounded, hours-long) persisted position would make ExoPlayer
+            // seek past the stream end and instantly end playback instead of
+            // resuming the station (BUG-19). Streams always restart at 0.
+            val streamItem = items[safeIndex].mediaId
+            val restorePos = if (streamItem.startsWith("http://") || streamItem.startsWith("https://")) 0L else pos
+
             val activity = activity as? MainActivity
             activity?.getController()?.let { controller ->
-                controller.setMediaItems(items, index, pos)
+                controller.setMediaItems(items, safeIndex, restorePos)
                 controller.prepare()
+                // Set this explicitly because restoring a playlist does not always
+                // inherit the service's previous playWhenReady state.
+                controller.playWhenReady = true
                 controller.play()
                 
                 val intent = android.content.Intent(requireContext(), NowPlayingActivity::class.java)
@@ -2273,7 +3082,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun clearRecentFiles() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        prefs.edit().putString("recent_list", "[]").apply()
+        prefs.edit { putString("recent_list", "[]") }
         refreshWithCurrentFocus()
         Toast.makeText(requireContext(), "Recent files cleared", Toast.LENGTH_SHORT).show()
     }
@@ -2286,7 +3095,7 @@ class MainFragment : BrowseSupportFragment() {
                 if (isEnabled) "Remember Recent Files: Enabled" else "Remember Recent Files: Disabled",
                 R.drawable.ic_history
             ),
-            DialogOptionItem("Clear Recent List", R.drawable.ic_history)
+            DialogOptionItem("Clear Recent List", R.drawable.ic_clear_history)
         )
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
@@ -2308,10 +3117,10 @@ class MainFragment : BrowseSupportFragment() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val autoScan = prefs.getBoolean(KEY_AUTO_SCAN, false)
         val items = listOf(
-            DialogOptionItem("Perform Library Scan Now", R.drawable.ic_sync),
+            DialogOptionItem("Perform Library Scan Now", R.drawable.ic_scan_library),
             DialogOptionItem(
                 if (autoScan) "Automatic Library Scan: Enabled" else "Automatic Library Scan: Disabled",
-                R.drawable.ic_history
+                R.drawable.ic_auto_scan
             )
         )
         val adapter = DialogOptionAdapter(requireContext(), items)
@@ -2333,7 +3142,7 @@ class MainFragment : BrowseSupportFragment() {
     private fun showScanConfirmationDialog() {
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Perform Scan")
-            .setIcon(R.drawable.ic_sync)
+            .setIcon(R.drawable.ic_scan_library)
             .setMessage("Scan all configured folders for new or deleted files?")
             .setPositiveButton("Yes") { _, _ -> performLibraryScan() }
             .setNegativeButton("No", null)
@@ -2343,7 +3152,7 @@ class MainFragment : BrowseSupportFragment() {
     private fun toggleAutoScan() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val current = prefs.getBoolean(KEY_AUTO_SCAN, false)
-        prefs.edit().putBoolean(KEY_AUTO_SCAN, !current).apply()
+        prefs.edit { putBoolean(KEY_AUTO_SCAN, !current) }
         refreshWithCurrentFocus()
     }
 
@@ -2354,7 +3163,7 @@ class MainFragment : BrowseSupportFragment() {
         val items = listOf(
             DialogOptionItem(
                 if (isEnabled) "Enhanced Network Buffer: Enabled" else "Enhanced Network Buffer: Disabled",
-                R.drawable.ic_network
+                R.drawable.ic_network_buffer
             ),
             DialogOptionItem(
                 if (isReconnectEnabled) "Auto Reconnect (Radio): Enabled" else "Auto Reconnect (Radio): Disabled",
@@ -2368,13 +3177,13 @@ class MainFragment : BrowseSupportFragment() {
                 when (which) {
                     0 -> {
                         val current = prefs.getBoolean(KEY_NETWORK_BUFFER, true)
-                        prefs.edit().putBoolean(KEY_NETWORK_BUFFER, !current).apply()
+                        prefs.edit { putBoolean(KEY_NETWORK_BUFFER, !current) }
                         showNetworkSettingsMenu()
                         refreshWithCurrentFocus()
                     }
                     1 -> {
                         val current = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
-                        prefs.edit().putBoolean(KEY_AUTO_RECONNECT, !current).apply()
+                        prefs.edit { putBoolean(KEY_AUTO_RECONNECT, !current) }
                         showNetworkSettingsMenu()
                         refreshWithCurrentFocus()
                     }
@@ -2392,6 +3201,139 @@ class MainFragment : BrowseSupportFragment() {
         Toast.makeText(requireContext(), "Library scan complete", Toast.LENGTH_SHORT).show()
     }
 
+    // ---------------------------------------------------------------------------
+    // USB reset on release (usbdevfs hand-back behaviour)
+    // ---------------------------------------------------------------------------
+
+    private fun getUsbResetSubtitle(): String {
+        val on = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean("usb_reset_on_release", true)
+        return if (on) "Enabled — DAC soft-replugged on hand-back"
+        else "Disabled — other apps keep the DAC"
+    }
+
+    /**
+     * Tap to flip whether the usbdevfs driver soft-replugs (USBDEVFS_RESET) the DAC
+     * when handing it back. The reset is what makes the kernel rebind the system
+     * USB-audio driver, but re-creating the ALSA card leaves some boxes unable to
+     * reach the DAC from any other app until a reboot — so it is switchable.
+     */
+    private fun toggleUsbResetOnRelease() {
+        val ctx = requireContext()
+        val prefs = ctx.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val next = !prefs.getBoolean("usb_reset_on_release", true)
+        prefs.edit { putBoolean("usb_reset_on_release", next) }
+        // Read when the player is built, so rebuild it for the change to apply.
+        PlaybackService.instance?.applyOutputModeAudioReset()
+        Toast.makeText(
+            ctx,
+            if (next) "DAC will be soft-replugged on release"
+            else "DAC released without a USB reset — other apps keep the device",
+            Toast.LENGTH_LONG
+        ).show()
+        refreshWithCurrentFocus()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Debug log (adb-free diagnostics)
+    // ---------------------------------------------------------------------------
+
+    private fun getDebugLogSubtitle(): String {
+        val ctx = requireContext()
+        if (!DebugLogServer.isEnabled(ctx)) return "Off — share over Wi-Fi"
+        val port = DebugLogServer.getPort().takeIf { it > 0 } ?: DebugLogServer.getConfiguredPort(ctx)
+        return "http://${getLocalIp()}:$port  (${DebugLog.lineCount()} lines)"
+    }
+
+    private fun updateDebugLogCard() {
+        if (!::settingsAdapter.isInitialized) return
+        if (SETTINGS_DEBUG_LOG_INDEX < settingsAdapter.size()) {
+            settingsAdapter.replace(SETTINGS_DEBUG_LOG_INDEX, createActionItem("Debug Log", getDebugLogSubtitle()))
+        }
+    }
+
+    /**
+     * Diagnostics for boxes where adb cannot run while the USB DAC is connected:
+     * turning on USB debugging switches the shared USB port to device mode and
+     * the DAC disappears. [DebugLog] captures the app's own logcat to a file on
+     * the box and [DebugLogServer] can serve it over Wi-Fi (or the file can be
+     * read on the TV / copied off it later).
+     */
+    private fun showDebugLogDialog() {
+        val ctx = requireContext()
+        val enabled = DebugLogServer.isEnabled(ctx)
+        val port = DebugLogServer.getPort().takeIf { it > 0 } ?: DebugLogServer.getConfiguredPort(ctx)
+        val url = "http://${getLocalIp()}:$port"
+        val file = DebugLog.logFile(ctx)?.absolutePath ?: "unavailable"
+
+        val message = buildString {
+            append("Captures this app's log to a file on the box, and can serve it over Wi-Fi.\n")
+            append("Useful when USB debugging is off (or disconnects the DAC), so adb is unavailable.\n\n")
+            append("Capturing: ${DebugLog.status()}\n")
+            append("Lines in memory: ${DebugLog.lineCount()}\n")
+            append("Log file: $file\n")
+            if (enabled) {
+                append("Sharing: ${if (DebugLogServer.isRunning()) "on" else "starting…"} — $url\n")
+                append("Also available: ${url}/log  ${url}/clear  ${url}/status\n")
+            } else {
+                append("Sharing: off\n")
+            }
+        }
+        val items = listOf(
+            DialogOptionItem(
+                if (enabled) "Share Over Wi-Fi: Enabled" else "Share Over Wi-Fi: Disabled",
+                R.drawable.ic_network_music
+            ),
+            DialogOptionItem("View Last 200 Lines", R.drawable.ic_history),
+            DialogOptionItem("Clear Log", R.drawable.ic_clear_history)
+        )
+        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Debug Log")
+            .setMessage(message)
+            .setAdapter(DialogOptionAdapter(ctx, items)) { _, which ->
+                when (which) {
+                    0 -> {
+                        val on = !DebugLogServer.isEnabled(ctx)
+                        DebugLogServer.setEnabled(ctx, on)
+                        Toast.makeText(
+                            ctx,
+                            if (on) "Log shared at $url" else "Log sharing off",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        updateDebugLogCard()
+                        showDebugLogDialog()
+                    }
+                    1 -> showDebugLogViewer()
+                    2 -> {
+                        DebugLog.clear()
+                        Toast.makeText(ctx, "Debug log cleared", Toast.LENGTH_SHORT).show()
+                        updateDebugLogCard()
+                        showDebugLogDialog()
+                    }
+                }
+            }
+            .setNegativeButton("Back", null)
+            .show()
+    }
+
+    private fun showDebugLogViewer() {
+        val ctx = requireContext()
+        val textView = android.widget.TextView(ctx).apply {
+            text = DebugLog.text(200).ifBlank { "(log is empty)" }
+            textSize = 10f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(0xFFDDDDDD.toInt())
+            setTextIsSelectable(true)
+            setPadding(24, 16, 24, 16)
+        }
+        val scroll = android.widget.ScrollView(ctx).apply { addView(textView) }
+        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Debug Log — Last 200 Lines")
+            .setView(scroll)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
     private fun showAboutDialog() {
         val versionName = try {
             requireContext().packageManager.getPackageInfo(requireContext().packageName, 0).versionName
@@ -2406,7 +3348,7 @@ class MainFragment : BrowseSupportFragment() {
         val context = requireContext()
         val logoSize = (96 * context.resources.displayMetrics.density).toInt()
         val logo = android.widget.ImageView(context).apply {
-            setImageResource(R.drawable.ic_launcher_foreground)
+            setImageResource(R.mipmap.ic_launcher)
             layoutParams = android.widget.LinearLayout.LayoutParams(logoSize, logoSize)
         }
         val textView = android.widget.TextView(context).apply {
@@ -2471,6 +3413,21 @@ class MainFragment : BrowseSupportFragment() {
             actionId == "action:USB DAC" -> {
                 showUsbDacDialog()
             }
+            actionId == "action:Audio Output" -> {
+                showAudioOutputDialog()
+            }
+            actionId == "action:LAN Player Control" -> {
+                showLanControlDialog()
+            }
+            actionId == "action:DSD Output" -> {
+                showDsdOutputDialog()
+            }
+            actionId == "action:Debug Log" -> {
+                showDebugLogDialog()
+            }
+            actionId == "action:USB Reset On Release" -> {
+                toggleUsbResetOnRelease()
+            }
             actionId == "action:About" -> {
                 showAboutDialog()
             }
@@ -2479,9 +3436,37 @@ class MainFragment : BrowseSupportFragment() {
                     .setTitle("Exit")
                     .setMessage("Are you sure you want to exit?")
                     .setPositiveButton("Yes") { _, _ ->
-                        activity?.stopService(android.content.Intent(requireContext(), PlaybackService::class.java))
-                        activity?.finishAffinity()
-                        System.exit(0)
+                        // Ask the service to save its state synchronously before we
+                        // kill the process, so the last playback position is not lost
+                        // (BUG-6: System.exit(0) previously raced with apply()).
+                        PlaybackService.instance?.saveCurrentPositionSync()
+                        val prefsX = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                        val keepLan = prefsX.getBoolean("mpd_enabled", true) &&
+                            prefsX.getBoolean("mpd_autostart", false)
+                        if (keepLan) {
+                            // Stop playback but leave PlaybackService (and its MPD
+                            // server) running in the foreground so MALP keeps working.
+                            PlaybackService.instance?.stopPlaybackKeepLanControl()
+                            activity?.finishAffinity()
+                        } else {
+                            // Request the DAC release before killing the process.
+                            // releaseUsbForIdle() only starts a USBDEVFS_RESET soft-replug
+                            // on a background thread — the kernel can take several seconds
+                            // to re-probe the USB sound card afterward (the same window
+                            // applyOutputModeAudioReset() already waits out). A short fixed
+                            // delay before System.exit(0) was not enough for that race;
+                            // wait for the (bounded) release instead, or the usbdevfs
+                            // driver's exclusive USB claim stays in place, silencing every
+                            // other app on that DAC until it is replugged.
+                            activity?.stopService(android.content.Intent(requireContext(), PlaybackService::class.java))
+                            activity?.finishAffinity()
+                            val service = PlaybackService.instance
+                            if (service != null) {
+                                service.prepareForProcessExit { System.exit(0) }
+                            } else {
+                                System.exit(0)
+                            }
+                        }
                     }
                     .setNegativeButton("No", null)
                     .show()
@@ -2494,21 +3479,10 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     companion object {
-        fun getThemeColor(context: Context): Int {
-            val colors = intArrayOf(
-                0xFF00E676.toInt(), // Neon Green
-                0xFF2979FF.toInt(), // Electric Blue
-                0xFFFFC400.toInt(), // Amber Gold
-                0xFF7C4DFF.toInt(), // Deep Purple
-                0xFFFF4081.toInt(), // Hot Pink
-                0xFF888888.toInt(), // Grey
-                0xFFFF5252.toInt(), // Red
-                0xFF1B5E20.toInt(), // Dark Green
-                0xFFFFFFFF.toInt()  // White
-            )
-            val index = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
-                .getInt("color_scheme", 0)
-            return if (index in colors.indices) colors[index] else colors[0]
-        }
+        /** Leanback headers sidebar colour for the current theme (always dark, accent-tinted). */
+        fun getSidebarColor(context: Context): Int = ColorThemes.current(context).sidebar
+
+        /** Accent colour of the current theme. */
+        fun getThemeColor(context: Context): Int = ColorThemes.current(context).accent
     }
 }

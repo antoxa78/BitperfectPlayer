@@ -1,9 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "folder-music" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M10,4H4c-1.1,0 -1.99,0.9 -1.99,2L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2zM15,11h3v2h-3v4c0,1.1 -0.9,2 -2,2s-2,-0.9 -2,-2 0.9,-2 2,-2c0.26,0 0.5,0.05 0.71,0.14V11z" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M22,8 L22,11 L16.5,11 L16.5,16.11 C14.66,16.53,13.26,18.09,13.04,20 L4,20 C2.895,20,2,19.105,2,18 L2,6 C2,4.89,2.89,4,4,4 L10,4 L12,6 L20,6 C21.105,6,22,6.895,22,8 M18.5,13 L18.5,18.21 C17.568,17.802,16.481,17.999,15.752,18.709 C15.024,19.42,14.798,20.501,15.182,21.443 C15.566,22.385,16.482,23.001,17.5,23 C18.881,23,20,21.881,20,20.5 L20,15 L22,15 L22,13 Z" />
 </vector>

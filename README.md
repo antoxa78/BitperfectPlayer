@@ -1,6 +1,18 @@
 # Bitperfect Player
 
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://www.paypal.me/antoxab1978)
+
 A high-fidelity music player designed specifically for Nvidia Shield Android TV, focusing on bit-perfect audio delivery and seamless integration with both local and network storage.
+
+## Support
+
+Enjoying the app? A small donation is greatly appreciated and helps keep the project going:
+
+<p align="center">
+  <a href="https://www.paypal.me/antoxab1978" target="_blank">
+    <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal" />
+  </a>
+</p>
 
 ## Features
 
@@ -28,6 +40,20 @@ A high-fidelity music player designed specifically for Nvidia Shield Android TV,
 *   **Now Playing**: Access the "Now Playing" row at the top to see high-res audio details and control playback.
 *   **Exit**: Use the dedicated "Exit" button in the main menu to completely release audio resources and close the app.
 
+## Remote Control
+
+Bitperfect Player embeds an MPD-protocol server (default port `6600`, configurable in settings), so you can drive playback from another device on your network. The companion **[Bitperfect Remote](https://github.com/antoxa78/Bitperfect-Remote)** app is a modern Android remote built with Kotlin and Jetpack Compose that connects to this built-in server (or to any standard MPD server) and gives you:
+
+*   **Full Playback Control**: Play, pause, stop, next/previous, seek bar with real-time progress.
+*   **Volume & Modes**: Volume slider plus repeat, single, shuffle, and consume toggles.
+*   **Live Audio Info**: Real-time bitrate, sample rate, bit depth, and channel display.
+*   **Music Browser**: Browse your library by folder and file, then add or play items directly.
+*   **Queue Management**: View, reorder, clear, and manage the current playback queue.
+*   **Album Art**: Built-in artwork fetching and display.
+*   **Theming**: Dark / light / system themes with multiple accent colors.
+
+Download the remote from its [Releases](https://github.com/antoxa78/Bitperfect-Remote/releases) page.
+
 ## Development
 
 Built using Kotlin, AndroidX Media3 (ExoPlayer), and Leanback.
@@ -38,4 +64,18 @@ Built using Kotlin, AndroidX Media3 (ExoPlayer), and Leanback.
 *   `eu.agno3.jcifs:jcifs-ng`
 
 ---
+
+## License
+
+BitperfectPlayer is licensed under the **GNU General Public License v3.0** (GPL-3.0). See [LICENSE](LICENSE) for the full text.
+
+The app incorporates third-party code that requires copyleft licensing:
+
+*   **sacd-ripper** (`libsacd`, `libcommon`, `libdstdec`) — GPL-2.0-or-later.
+*   **FFmpeg** (`dsd.c`/`dsd.h`, `libavutil`) — LGPL-2.1-or-later.
+*   **jcifs-ng** — LGPL-2.1 — SMB/CIFS networking.
+*   **AndroidX Media3** and **OkHttp** — Apache-2.0.
+*   **Bouncy Castle** — MIT.
+
+Full attribution is in [NOTICE](NOTICE).
 *Developed for audiophiles who want the best sound quality on their Stereo System.*
