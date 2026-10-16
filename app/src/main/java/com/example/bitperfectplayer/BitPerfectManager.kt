@@ -160,13 +160,29 @@ class BitPerfectManager(private val context: Context) {
                 Log.e(TAG, "Failed to set preferred mixer attributes", e)
             }
         } else {
-            Log.w(TAG, "No matching BIT_PERFECT mixer found for format: " +
-                    "${outputFormat.sampleRate}Hz, ${outputFormat.channelCount}ch, encoding=${outputFormat.encoding}. Supported mixers: " +
-                    supportedMixerAttributes.joinToString { "${it.format.sampleRate}Hz/${it.format.encoding}" })
+            // isFormatMatch() tests rate, channel count, encoding and channel mask,
+            // and the candidate must additionally be flagged
+            // MIXER_BEHAVIOR_BIT_PERFECT. Dumping every supported mixer overflowed
+            // logd's ~4 KB line limit (truncated mid-entry on a Xiaomi TV Box S 3rd
+            // Gen), so summarise instead: the count of bit-perfect mixers is the
+            // decisive number — 0 means this HAL cannot do bit-perfect at all, no
+            // matter what the requested format is.
+            val bitPerfect = supportedMixerAttributes.filter {
+                it.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT
+            }
+            Log.w(TAG, "No matching BIT_PERFECT mixer for ${formatText(outputFormat)} — " +
+                    "device offers ${bitPerfect.size} BIT_PERFECT mixer(s) of " +
+                    "${supportedMixerAttributes.size}" +
+                    if (bitPerfect.isEmpty()) "" else ": " + bitPerfect.joinToString { formatText(it.format) })
             // Clear if we had something set previously that doesn't match now
             clearPreferredMixerAttributesLocked(device)
         }
     }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun formatText(format: AudioFormat): String =
+        "${format.sampleRate}Hz/${format.channelCount}ch/encoding=${format.encoding}" +
+            "/mask=0x${Integer.toHexString(format.channelMask)}"
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun isFormatMatch(mixerFormat: AudioFormat, outputFormat: AudioFormat): Boolean {

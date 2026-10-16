@@ -19,6 +19,8 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import android.view.InputDevice
+import android.view.KeyEvent
 import java.io.File
 import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
@@ -92,6 +94,8 @@ class PlaybackService : MediaSessionService() {
         private const val KEY_RESUME_PLAYBACK  = "resume_playback"
         private const val KEY_RECENT_FILES     = "recent_files"
         private const val KEY_USBDEVFS_DRIVER  = "usbdevfs_driver"
+        /** Soft-replug the DAC (USBDEVFS_RESET) when handing it back. Default true. */
+        private const val KEY_USB_RESET_ON_RELEASE = "usb_reset_on_release"
         // Audio output method (Settings → Audio Output). Migrates from the old
         // boolean KEY_USBDEVFS_DRIVER on first read (true → USBDEVFS, false → BITPERFECT_ANDROID).
         private const val KEY_AUDIO_OUTPUT_MODE = "audio_output_mode"
@@ -852,7 +856,10 @@ class PlaybackService : MediaSessionService() {
         // track / set BIT_PERFECT mixer attributes on the DAC. Either way the
         // rebuilt player's AudioTrack in "Bit-perfect via Android" or "Standard
         // Android Output" mode ended up silent.
-        runCatching { old?.stop() }
+        runCatching {
+            Log.i(TAG, "stopPlayer from rebuildPlayerForOutputMode")
+            old?.stop()
+        }
         bitPerfectManager.clear()
         releaseUsbDriverDac()
 
@@ -1074,6 +1081,43 @@ class PlaybackService : MediaSessionService() {
      *
      * @return true when the kernel re-registering the sound card was actually observed.
      */
+    /**
+     * True when Android's audio HAL currently offers a USB output device **with real
+     * capabilities**.
+     *
+     * The device merely being present in the list is not proof of anything: the
+     * framework caches USB descriptors, so after a usbfs release the device shows up
+     * again well before the kernel driver has re-probed and the HAL has re-enumerated
+     * its formats. A non-empty `sampleRates` means the HAL actually queried the
+     * device, which is what other apps need in order to route audio to it.
+     */
+    private fun usbDacAvailableToSystem(): Boolean {
+        return try {
+            val manager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            manager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.any { device ->
+                (device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                    device.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                    device.type == AudioDeviceInfo.TYPE_USB_HEADSET) &&
+                    device.sampleRates.isNotEmpty()
+            } ?: false
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Whether the usbdevfs driver should soft-replug the DAC (USBDEVFS_RESET) when
+     * handing it back to the system. On by default — it is what makes the kernel
+     * rebind the system USB-audio driver. Off is available because the re-created
+     * ALSA card is not tracked by every box's audio framework, which can leave
+     * other apps with no sound until a reboot (see Settings → USB DAC).
+     */
+    fun usbResetOnRelease(context: Context): Boolean =
+        context.getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+            .getBoolean(KEY_USB_RESET_ON_RELEASE, true)
+
+    private fun usbResetOnRelease(): Boolean = usbResetOnRelease(this)
+
     private fun waitForUsbRebind(
         sink: com.decent.usbaudio.media3.UsbAudioSink,
         cardsBefore: Set<String>
@@ -1098,14 +1142,25 @@ class PlaybackService : MediaSessionService() {
                 if (sndCardsOrNull() == null) {
                     // /dev/snd genuinely not observable (permission/IO error, e.g.
                     // SELinux-blocked on some Android TV boxes) — /dev/snd polling
-                    // can never work here. Fall back to AudioDeviceCallback, which
-                    // observes the audio HAL/policy layer instead of the filesystem.
-                    Log.i(TAG, "waitForUsbRebind: /dev/snd not listable at all — waiting on AudioDeviceCallback instead")
-                    val remaining = deadline - SystemClock.uptimeMillis()
-                    val observed = watcher != null && (watcher.fired ||
-                        (remaining > 0 && watcher.latch.await(remaining, TimeUnit.MILLISECONDS)))
-                    Log.i(TAG, "waitForUsbRebind: AudioDeviceCallback wait finished, observed=$observed")
-                    return observed
+                    // can never work here. Fall back to the audio HAL/policy layer…
+                    // but do NOT trust AudioDeviceCallback alone: on this box it fires
+                    // a few milliseconds after the usbfs claims are dropped (i.e. when
+                    // the framework can see the *descriptor* again), long before the
+                    // kernel has re-probed and the HAL has re-enumerated the device.
+                    // Trusting that signal made Exit leave ~1.5 s later, mid-rebind.
+                    // So poll for the device to be genuinely available instead.
+                    Log.i(TAG, "waitForUsbRebind: /dev/snd not listable — verifying via AudioManager instead")
+                    while (SystemClock.uptimeMillis() < deadline) {
+                        if (usbDacAvailableToSystem()) {
+                            Log.i(TAG, "waitForUsbRebind: rebindVerified=true after " +
+                                "${USB_REBIND_MAX_WAIT_MS - (deadline - SystemClock.uptimeMillis())}ms")
+                            return true
+                        }
+                        if (!sleepQuietly(150)) return false
+                    }
+                    Log.w(TAG, "waitForUsbRebind: rebindVerified=false — the USB DAC is not " +
+                        "available to the system within ${USB_REBIND_MAX_WAIT_MS}ms")
+                    return false
                 }
                 Log.i(TAG, "waitForUsbRebind: /dev/snd listable but empty — polling for a card to appear")
                 // /dev/snd IS listable but currently has no controlC entry — the
@@ -1184,7 +1239,7 @@ class PlaybackService : MediaSessionService() {
                         // replug (USBDEVFS_RESET). Other apps can then use it.
                         Log.i(TAG, "Screen off — releasing idle audio track + DAC")
                         releaseUsbDriverDac()
-                        mediaSession?.player?.stop()
+                        stopPlayer("screen off")
                     }
                 }
                 Intent.ACTION_SCREEN_ON -> {
@@ -1204,7 +1259,7 @@ class PlaybackService : MediaSessionService() {
                         // also pins the DAC — release it so other apps get sound.
                         Log.i(TAG, "Screen on — releasing idle audio track")
                         releaseUsbDriverDac()
-                        mediaSession?.player?.stop()
+                        stopPlayer("screen on")
                     }
                 }
             }
@@ -1465,7 +1520,7 @@ class PlaybackService : MediaSessionService() {
         publishKeepAwake(false)
         restoreAttentiveSleep(this, "exit")
 
-        try { mediaSession?.player?.stop() } catch (_: Exception) {}
+        stopPlayer("prepareForProcessExit")
         bitPerfectManager.clear()
         releaseUsbDriverDac()
         // One verdict line per exit, after the hand-back has been requested, so it
@@ -1501,21 +1556,25 @@ class PlaybackService : MediaSessionService() {
             if (needsRebindWait) {
                 val rebound = waitForUsbRebind(sink, cardsBefore)
                 if (rebound) {
-                    // On-device evidence: reboundObserved=true fired only 150-350ms after
-                    // AudioDeviceCallback.onAudioDevicesAdded, yet other apps still had no
-                    // sound afterward. That event is not trusted this fast anywhere else in
-                    // this codebase — normal USB attach handling deliberately waits
-                    // USB_SETTLE_MS after the same "device added" signal before touching the
-                    // device, because the HAL/policy reports it before it is actually stable.
-                    // Exiting (killing the whole process, including any native driver
-                    // cleanup still finishing the handoff) within a few hundred ms of that
-                    // same raw signal was very likely premature. Give it the same settle
-                    // time used elsewhere before treating the rebind as durable.
-                    Log.i(TAG, "prepareForProcessExit: rebind observed — settling ${USB_SETTLE_MS}ms before exit")
+                    // On-device evidence: this signal can fire only a few hundred ms
+                    // after AudioDeviceCallback.onAudioDevicesAdded, yet other apps
+                    // still had no sound afterward. That event is not trusted this fast
+                    // anywhere else in this codebase — normal USB attach handling
+                    // deliberately waits USB_SETTLE_MS after the same "device added"
+                    // signal before touching the device, because the HAL/policy reports
+                    // it before it is actually stable. Exiting (killing the whole
+                    // process, including any native driver cleanup still finishing the
+                    // handoff) within a few hundred ms of that same raw signal was very
+                    // likely premature. Give it the same settle time used elsewhere
+                    // before treating the rebind as durable.
+                    Log.i(TAG, "prepareForProcessExit: rebind verified — settling ${USB_SETTLE_MS}ms before exit")
                     sleepQuietly(USB_SETTLE_MS)
+                } else {
+                    Log.w(TAG, "prepareForProcessExit: rebind NOT verified — the USB DAC is not " +
+                        "available to the system; other apps may need a replug")
                 }
                 Log.i(TAG, "prepareForProcessExit: wait finished after " +
-                    "${SystemClock.uptimeMillis() - startedAt}ms, reboundObserved=$rebound — exiting now")
+                    "${SystemClock.uptimeMillis() - startedAt}ms, rebindVerified=$rebound — exiting now")
                 // Captured from inside this (about to die) process, right before exit —
                 // the most direct evidence available, with no adb needed, of whether
                 // Android's audio policy still considers the USB DAC an available sink
@@ -1620,6 +1679,7 @@ class PlaybackService : MediaSessionService() {
 
         // Pause + stop releases the AudioTrack → HAL session is closed
         player.pause()
+        Log.i(TAG, "stopPlayer from resetAudioSink")
         player.stop()
 
         val restoreRunnable = Runnable {
@@ -1794,7 +1854,12 @@ class PlaybackService : MediaSessionService() {
                                 bitPerfectEnabled = true,
                                 // Keep the delegate's AudioTrack on the built-in speaker so a
                                 // stale mix rate never pins the DAC while the driver owns it.
-                                forceRouteToSpeaker = true
+                                forceRouteToSpeaker = true,
+                                // Whether to soft-replug (USBDEVFS_RESET) when handing the
+                                // DAC back. Default on; switchable because re-creating the
+                                // ALSA card leaves some boxes unable to reach the DAC from
+                                // any other app until a reboot.
+                                resetOnRelease = usbResetOnRelease()
                             ),
                             // Sync the delegate's guard with the driver's actual USB ownership:
                             // while the usbdevfs driver streams, BitPerfectAudioSink must not
@@ -1986,8 +2051,46 @@ class PlaybackService : MediaSessionService() {
         return true
     }
 
+    /** Identity of a session controller, for the diagnostics above. */
+    private fun describeController(controller: MediaSession.ControllerInfo): String =
+        "pkg=${controller.packageName} uid=${controller.uid} trusted=${controller.isTrusted} " +
+            "version=${controller.controllerVersion} " +
+            "legacy=${controller.packageName == MediaSession.ControllerInfo.LEGACY_CONTROLLER_PACKAGE_NAME} " +
+            "maxCommands=${controller.maxCommandsForMediaItems} hints=${controller.connectionHints.keySet()}"
+
+    /** Name for a `Player` command, used by the command/stop diagnostics below. */
+    private fun commandName(command: Int): String = when (command) {
+        Player.COMMAND_STOP -> "STOP"
+        Player.COMMAND_PLAY_PAUSE -> "PLAY_PAUSE"
+        Player.COMMAND_PREPARE -> "PREPARE"
+        Player.COMMAND_SEEK_TO_DEFAULT_POSITION -> "SEEK_TO_DEFAULT_POSITION"
+        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> "SEEK_TO_PREVIOUS_MEDIA_ITEM"
+        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> "SEEK_TO_NEXT_MEDIA_ITEM"
+        else -> "cmd=$command"
+    }
+
+    /** Name for a playback state, for the state-transition diagnostic. */
+    private fun stateName(state: Int): String = when (state) {
+        Player.STATE_IDLE -> "IDLE"
+        Player.STATE_BUFFERING -> "BUFFERING"
+        Player.STATE_READY -> "READY"
+        Player.STATE_ENDED -> "ENDED"
+        else -> "state=$state"
+    }
+
+    /**
+     * Diagnostic wrapper around ExoPlayer.stop(). The usbdevfs "plays about a
+     * second and then stops" report surfaced as a STATE_IDLE with no matching log
+     * line from any stop() call site in this service, so record which one it was.
+     */
+    private fun stopPlayer(caller: String) {
+        Log.i(TAG, "stopPlayer from $caller")
+        try { mediaSession?.player?.stop() } catch (e: Exception) { Log.w(TAG, "stopPlayer failed", e) }
+    }
+
     private val playerListener = object : Player.Listener {
         private var retryCount = 0
+        private var lastLoggedState = Player.STATE_IDLE
 
         override fun onEvents(player: Player, events: Player.Events) {
             // Media3 promotes/demotes its own media notification as playback
@@ -2138,7 +2241,7 @@ class PlaybackService : MediaSessionService() {
             if (immediate) releaseUsbDriverDac() else scheduleIdleHandBack(reason)
             updatePlaybackWakeLock()
             if (dacAttached) {
-                mediaSession?.player?.stop()
+                stopPlayer("releaseDacForInactivity")
                 // stop() fires STATE_IDLE, whose listener schedules a debounced
                 // hand-back; that must not follow the immediate release above.
                 if (immediate) cancelIdleHandBack("immediate system release")
@@ -2148,6 +2251,8 @@ class PlaybackService : MediaSessionService() {
         private var wasBuffering = false
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            Log.i(TAG, "playbackState ${stateName(lastLoggedState)} -> ${stateName(playbackState)}")
+            lastLoggedState = playbackState
             updatePlaybackWakeLock()
             // Entering BUFFERING/READY with a live, unsuppressed play intent
             // means we are (re)starting playback: a debounced pause/idle
@@ -2191,7 +2296,19 @@ class PlaybackService : MediaSessionService() {
                 // rebuilding it. The paths that must hand back now (exit,
                 // output-mode change) call releaseUsbDriverDac() directly, which
                 // cancels this.
-                scheduleIdleHandBack("STATE_${if (playbackState == Player.STATE_IDLE) "IDLE" else "ENDED"}")
+                //
+                // The debounce only earns its keep when something could resume. With
+                // an empty queue and no play intent there is nothing to ride out, and
+                // holding the DAC for another 1.2 s keeps the kernel driver detached
+                // from the device for that much longer — which is the state that
+                // silences every other app. Hand it back now in that case.
+                val player = mediaSession?.player
+                if (player != null && player.mediaItemCount == 0 && !player.playWhenReady) {
+                    Log.i(TAG, "Empty queue on ${if (playbackState == Player.STATE_IDLE) "IDLE" else "ENDED"} — releasing the DAC immediately")
+                    releaseUsbDriverDac()
+                } else {
+                    scheduleIdleHandBack("STATE_${if (playbackState == Player.STATE_IDLE) "IDLE" else "ENDED"}")
+                }
             }
 
             // Bit-perfect design note: a buffer underrun surfaces here as a plain
@@ -2301,6 +2418,59 @@ class PlaybackService : MediaSessionService() {
                         Futures.immediateFailedFuture(UnsupportedOperationException())
                     }
                 }
+
+                override fun onPostConnect(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ) {
+                    Log.d(TAG, "Controller connected: ${describeController(controller)}")
+                }
+
+                override fun onMediaButtonEvent(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    intent: Intent
+                ): Boolean {
+                    // A KEYCODE_MEDIA_STOP delivered here is translated by Media3 into
+                    // Player.stop() (MediaSessionImpl.applyMediaButtonKeyEvent ->
+                    // MediaSessionStub.stopForControllerInfo), which tears the
+                    // bit-perfect USB stream down and hands the DAC back. On the Xiaomi
+                    // TV Box such an event arrives on its own a second or two into
+                    // playback — the whole "plays about a second and then stops" report
+                    // — so record who sent it and deliberately do not honour it.
+                    @Suppress("DEPRECATION")
+                    val event = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT) as? KeyEvent
+                    if (event != null) {
+                        val source = runCatching { InputDevice.getDevice(event.deviceId)?.name }.getOrNull()
+                        Log.i(TAG, "Media button: action=${event.action} keyCode=${event.keyCode} " +
+                            "repeat=${event.repeatCount} deviceId=${event.deviceId} device='$source' " +
+                            "source=0x${Integer.toHexString(event.source)} intent=${intent.action}")
+                        if (event.keyCode == KeyEvent.KEYCODE_MEDIA_STOP) {
+                            Log.i(TAG, "Media button STOP ignored — honouring it would stop playback and drop the DAC")
+                            return true
+                        }
+                    }
+                    return super.onMediaButtonEvent(mediaSession, controller, intent)
+                }
+
+                override fun onDisconnected(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ) {
+                    Log.d(TAG, "Controller disconnected: ${describeController(controller)}")
+                }
+
+                override fun onPlayerCommandRequest(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    playerCommand: Int
+                ): Int {
+                    // Verifies that nothing sends this session a command that stops
+                    // playback behind the app's back (the usbdevfs session used to be
+                    // killed by an injected KEYCODE_MEDIA_STOP — see onMediaButtonEvent).
+                    Log.d(TAG, "Player command ${commandName(playerCommand)} from ${describeController(controller)}")
+                    return super.onPlayerCommandRequest(mediaSession, controller, playerCommand)
+                }
             })
             .build()
 
@@ -2360,6 +2530,7 @@ class PlaybackService : MediaSessionService() {
             try {
                 mediaSession?.player?.let { p ->
                     p.playWhenReady = false
+                    Log.i(TAG, "stopPlayer from stopPlaybackKeepLanControl")
                     p.stop()
                 }
             } catch (_: Exception) {}
@@ -2397,6 +2568,14 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        // The task went away: if we are not producing audio, hand the DAC back to the
+        // system immediately rather than waiting out the idle debounce. While this app
+        // holds the usbfs claim the kernel's snd-usb-audio is detached, and other apps
+        // are silent for exactly that long — so the sooner we let go, the better.
+        if (!isActivelyPlaying()) {
+            Log.i(TAG, "onTaskRemoved — releasing the DAC immediately")
+            releaseUsbDriverDac()
+        }
         // Media3's default stops the service when playback is idle, which kills
         // the MPD server and breaks LAN control after the app UI is closed.
         val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)

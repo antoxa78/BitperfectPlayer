@@ -27,8 +27,8 @@ android {
         applicationId = "com.github.antoxa78.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 69
-        versionName = "3.1.4"
+        versionCode = 70
+        versionName = "3.2.0-beta1"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -68,12 +68,16 @@ android {
 
     buildTypes {
         debug {
-            // Distinguishes this build in Settings → About (reads versionName)
-            // so it's obvious which APK is actually installed when comparing
-            // test results against a release build. Same applicationId as
-            // release (no suffix) so `adb install -r` upgrades in place and
-            // keeps settings/playlist/DAC preferences instead of resetting them.
-            versionNameSuffix = "-debug"
+            // Distinguishes this build in Settings → About (reads versionName) so it
+            // is obvious which APK is actually installed when comparing test results
+            // against a release build. Same applicationId as release (no suffix) so
+            // `adb install -r` upgrades in place and keeps settings/playlist/DAC
+            // preferences instead of resetting them.
+            //
+            // A per-build marker can be added with -PTEST_BUILD=9 (→ "3.1.4-debug-9"):
+            // a string of ad-hoc debug builds otherwise all report the same
+            // versionName and About cannot tell them apart.
+            versionNameSuffix = "-debug" + (prop("TEST_BUILD")?.let { "-$it" } ?: "")
         }
         release {
             isMinifyEnabled = true

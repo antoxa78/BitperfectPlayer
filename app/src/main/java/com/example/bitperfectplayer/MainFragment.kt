@@ -55,6 +55,8 @@ class MainFragment : BrowseSupportFragment() {
     private lateinit var settingsAdapter: ArrayObjectAdapter
     // Index of the "USB DAC" card inside settingsAdapter — must match the add() order below
     private val SETTINGS_USB_DAC_INDEX = 7
+    // Index of the "Debug Log" card inside settingsAdapter — also must match the add() order below
+    private val SETTINGS_DEBUG_LOG_INDEX = 12
 
     private val usbStateReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
@@ -315,6 +317,8 @@ class MainFragment : BrowseSupportFragment() {
         settingsAdapter.add(createActionItem("Audio Output", getAudioOutputSubtitle()))
         settingsAdapter.add(createActionItem("LAN Player Control", getLanControlSubtitle()))
         settingsAdapter.add(createActionItem("DSD Output", getDsdOutputSubtitle()))
+        settingsAdapter.add(createActionItem("Debug Log", getDebugLogSubtitle()))
+        settingsAdapter.add(createActionItem("USB Reset On Release", getUsbResetSubtitle()))
         settingsAdapter.add(createActionItem("About", "Version and build info"))
         val settingsHeader = HeaderItem(4, "Settings")
         rowsAdapter.add(ListRow(settingsHeader, settingsAdapter))
@@ -2003,33 +2007,62 @@ class MainFragment : BrowseSupportFragment() {
             "No USB DAC detected.\n\nConnect a USB DAC — it will be detected\nautomatically on startup or when plugged in.\n\nIf your DAC was just connected, try\n'Reset Audio Sink' to trigger negotiation."
         }
 
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val resetOn = prefs.getBoolean("usb_reset_on_release", true)
+        val items = listOf(
+            DialogOptionItem("Reset Audio Sink", R.drawable.ic_dac),
+            DialogOptionItem(
+                if (resetOn) "USB Reset On Release: Enabled"
+                else "USB Reset On Release: Disabled",
+                R.drawable.ic_dac
+            )
+        )
         AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("USB DAC")
             .setIcon(R.drawable.ic_dac)
             .setMessage(msg)
-            .setPositiveButton("OK", null)
-            .setNeutralButton("Reset Audio Sink") { _, _ ->
-                // Start the service if Android TV killed it while the UI was
-                // closed; retry once since onCreate() lands on the main looper.
-                val s = PlaybackService.ensureRunning(context)
-                if (s != null) {
-                    Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
-                    s.checkAndResetUsbAudio(reason = "manual from settings")
-                    refreshWithCurrentFocus()
-                } else {
-                    Toast.makeText(context, "Starting playback service…", Toast.LENGTH_SHORT).show()
-                    view?.postDelayed({
-                        val retried = PlaybackService.instance
-                        if (retried != null) {
+            .setAdapter(DialogOptionAdapter(context, items)) { _, which ->
+                when (which) {
+                    0 -> {
+                        // Start the service if Android TV killed it while the UI was
+                        // closed; retry once since onCreate() lands on the main looper.
+                        val s = PlaybackService.ensureRunning(context)
+                        if (s != null) {
                             Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
-                            retried.checkAndResetUsbAudio(reason = "manual from settings")
+                            s.checkAndResetUsbAudio(reason = "manual from settings")
                             refreshWithCurrentFocus()
                         } else {
-                            Toast.makeText(context, "Playback service not running", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Starting playback service…", Toast.LENGTH_SHORT).show()
+                            view?.postDelayed({
+                                val retried = PlaybackService.instance
+                                if (retried != null) {
+                                    Toast.makeText(context, "Resetting audio sink…", Toast.LENGTH_SHORT).show()
+                                    retried.checkAndResetUsbAudio(reason = "manual from settings")
+                                    refreshWithCurrentFocus()
+                                } else {
+                                    Toast.makeText(context, "Playback service not running", Toast.LENGTH_SHORT).show()
+                                }
+                            }, 200)
                         }
-                    }, 200)
+                    }
+                    1 -> {
+                        val next = !resetOn
+                        prefs.edit { putBoolean("usb_reset_on_release", next) }
+                        // The flag is read when the player is built, so rebuild it for
+                        // the change to take effect.
+                        PlaybackService.instance?.applyOutputModeAudioReset()
+                        Toast.makeText(
+                            context,
+                            if (next) "DAC will be soft-replugged on release"
+                            else "DAC released without a USB reset — other apps keep the device",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        refreshWithCurrentFocus()
+                        showUsbDacDialog()
+                    }
                 }
             }
+            .setNegativeButton("Back", null)
             .show()
     }
 
@@ -3168,6 +3201,139 @@ class MainFragment : BrowseSupportFragment() {
         Toast.makeText(requireContext(), "Library scan complete", Toast.LENGTH_SHORT).show()
     }
 
+    // ---------------------------------------------------------------------------
+    // USB reset on release (usbdevfs hand-back behaviour)
+    // ---------------------------------------------------------------------------
+
+    private fun getUsbResetSubtitle(): String {
+        val on = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean("usb_reset_on_release", true)
+        return if (on) "Enabled — DAC soft-replugged on hand-back"
+        else "Disabled — other apps keep the DAC"
+    }
+
+    /**
+     * Tap to flip whether the usbdevfs driver soft-replugs (USBDEVFS_RESET) the DAC
+     * when handing it back. The reset is what makes the kernel rebind the system
+     * USB-audio driver, but re-creating the ALSA card leaves some boxes unable to
+     * reach the DAC from any other app until a reboot — so it is switchable.
+     */
+    private fun toggleUsbResetOnRelease() {
+        val ctx = requireContext()
+        val prefs = ctx.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val next = !prefs.getBoolean("usb_reset_on_release", true)
+        prefs.edit { putBoolean("usb_reset_on_release", next) }
+        // Read when the player is built, so rebuild it for the change to apply.
+        PlaybackService.instance?.applyOutputModeAudioReset()
+        Toast.makeText(
+            ctx,
+            if (next) "DAC will be soft-replugged on release"
+            else "DAC released without a USB reset — other apps keep the device",
+            Toast.LENGTH_LONG
+        ).show()
+        refreshWithCurrentFocus()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Debug log (adb-free diagnostics)
+    // ---------------------------------------------------------------------------
+
+    private fun getDebugLogSubtitle(): String {
+        val ctx = requireContext()
+        if (!DebugLogServer.isEnabled(ctx)) return "Off — share over Wi-Fi"
+        val port = DebugLogServer.getPort().takeIf { it > 0 } ?: DebugLogServer.getConfiguredPort(ctx)
+        return "http://${getLocalIp()}:$port  (${DebugLog.lineCount()} lines)"
+    }
+
+    private fun updateDebugLogCard() {
+        if (!::settingsAdapter.isInitialized) return
+        if (SETTINGS_DEBUG_LOG_INDEX < settingsAdapter.size()) {
+            settingsAdapter.replace(SETTINGS_DEBUG_LOG_INDEX, createActionItem("Debug Log", getDebugLogSubtitle()))
+        }
+    }
+
+    /**
+     * Diagnostics for boxes where adb cannot run while the USB DAC is connected:
+     * turning on USB debugging switches the shared USB port to device mode and
+     * the DAC disappears. [DebugLog] captures the app's own logcat to a file on
+     * the box and [DebugLogServer] can serve it over Wi-Fi (or the file can be
+     * read on the TV / copied off it later).
+     */
+    private fun showDebugLogDialog() {
+        val ctx = requireContext()
+        val enabled = DebugLogServer.isEnabled(ctx)
+        val port = DebugLogServer.getPort().takeIf { it > 0 } ?: DebugLogServer.getConfiguredPort(ctx)
+        val url = "http://${getLocalIp()}:$port"
+        val file = DebugLog.logFile(ctx)?.absolutePath ?: "unavailable"
+
+        val message = buildString {
+            append("Captures this app's log to a file on the box, and can serve it over Wi-Fi.\n")
+            append("Useful when USB debugging is off (or disconnects the DAC), so adb is unavailable.\n\n")
+            append("Capturing: ${DebugLog.status()}\n")
+            append("Lines in memory: ${DebugLog.lineCount()}\n")
+            append("Log file: $file\n")
+            if (enabled) {
+                append("Sharing: ${if (DebugLogServer.isRunning()) "on" else "starting…"} — $url\n")
+                append("Also available: ${url}/log  ${url}/clear  ${url}/status\n")
+            } else {
+                append("Sharing: off\n")
+            }
+        }
+        val items = listOf(
+            DialogOptionItem(
+                if (enabled) "Share Over Wi-Fi: Enabled" else "Share Over Wi-Fi: Disabled",
+                R.drawable.ic_network_music
+            ),
+            DialogOptionItem("View Last 200 Lines", R.drawable.ic_history),
+            DialogOptionItem("Clear Log", R.drawable.ic_clear_history)
+        )
+        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Debug Log")
+            .setMessage(message)
+            .setAdapter(DialogOptionAdapter(ctx, items)) { _, which ->
+                when (which) {
+                    0 -> {
+                        val on = !DebugLogServer.isEnabled(ctx)
+                        DebugLogServer.setEnabled(ctx, on)
+                        Toast.makeText(
+                            ctx,
+                            if (on) "Log shared at $url" else "Log sharing off",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        updateDebugLogCard()
+                        showDebugLogDialog()
+                    }
+                    1 -> showDebugLogViewer()
+                    2 -> {
+                        DebugLog.clear()
+                        Toast.makeText(ctx, "Debug log cleared", Toast.LENGTH_SHORT).show()
+                        updateDebugLogCard()
+                        showDebugLogDialog()
+                    }
+                }
+            }
+            .setNegativeButton("Back", null)
+            .show()
+    }
+
+    private fun showDebugLogViewer() {
+        val ctx = requireContext()
+        val textView = android.widget.TextView(ctx).apply {
+            text = DebugLog.text(200).ifBlank { "(log is empty)" }
+            textSize = 10f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(0xFFDDDDDD.toInt())
+            setTextIsSelectable(true)
+            setPadding(24, 16, 24, 16)
+        }
+        val scroll = android.widget.ScrollView(ctx).apply { addView(textView) }
+        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Debug Log — Last 200 Lines")
+            .setView(scroll)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
     private fun showAboutDialog() {
         val versionName = try {
             requireContext().packageManager.getPackageInfo(requireContext().packageName, 0).versionName
@@ -3255,6 +3421,12 @@ class MainFragment : BrowseSupportFragment() {
             }
             actionId == "action:DSD Output" -> {
                 showDsdOutputDialog()
+            }
+            actionId == "action:Debug Log" -> {
+                showDebugLogDialog()
+            }
+            actionId == "action:USB Reset On Release" -> {
+                toggleUsbResetOnRelease()
             }
             actionId == "action:About" -> {
                 showAboutDialog()
