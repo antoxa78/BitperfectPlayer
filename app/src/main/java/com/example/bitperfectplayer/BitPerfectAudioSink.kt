@@ -75,6 +75,12 @@ class BitPerfectAudioSink(
     private var directStopIssued = false
     private var drainStartedMs = 0L
 
+    /** The direct track was created with a BIT_PERFECT mixer preference set. */
+    private var directMixerBitPerfect = false
+    /** [BitPerfectManager.clearGeneration] as it was just before that preference
+     *  was set: if it has moved since, someone cleared it while the track lived. */
+    private var directTrackClearGen = 0L
+
     /** The configured stream is DoP (DSD over PCM): only valid bit-exact through
      *  the USB driver; played as PCM anywhere else it is just noise. */
     private var currentIsDop = false
@@ -411,6 +417,17 @@ class BitPerfectAudioSink(
             applyConfiguration(pc.format, pc.specifiedBufferSize, pc.outputChannels)
         }
         if (directMode) {
+            if (directTrack != null && directMixerBitPerfect &&
+                bitPerfectManager.clearGeneration != directTrackClearGen
+            ) {
+                // The BIT_PERFECT preference was cleared while this track stayed
+                // alive (PlaybackService clears it on STATE_ENDED, but a seek back
+                // into the ended queue reuses the track). Reusing it would play
+                // through the resampling system mixer: drop it so the next buffer
+                // builds a fresh track and re-applies the preference.
+                Log.i(TAG, "Mixer preference was cleared under the live track — recreating it on flush")
+                releaseDirectTrack()
+            }
             directTrack?.let { t ->
                 // flush() only works on a paused/stopped track.
                 try { if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.pause() } catch (_: Exception) {}
@@ -474,7 +491,10 @@ class BitPerfectAudioSink(
         val outputDevice = preferredDevice ?: bitPerfectManager.findUsbOutputDevice()
         routedDevice = outputDevice
         selectedDevice.set(outputDevice)
-        bitPerfectManager.updateAudioTrack(config, outputDevice)
+        // Read the generation *before* applying, so a clear() racing in from the
+        // main thread right after the apply is still noticed (see flush()).
+        val clearGenBefore = bitPerfectManager.clearGeneration
+        val mixerBitPerfect = bitPerfectManager.updateAudioTrack(config, outputDevice)
 
         try {
             val audioFormat = AudioFormat.Builder()
@@ -498,6 +518,8 @@ class BitPerfectAudioSink(
             track.setVolume(volume)
             directTrack = track
             directConfig = config
+            directMixerBitPerfect = mixerBitPerfect
+            directTrackClearGen = clearGenBefore
             directBasePlaybackHead = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
             listener?.onAudioTrackInitialized(config)
             if (playing) track.play()
@@ -528,6 +550,7 @@ class BitPerfectAudioSink(
         val config = directConfig
         directTrack = null
         directConfig = null
+        directMixerBitPerfect = false
         pendingConverted = null
         try { track.pause() } catch (_: Exception) {}
         // release() can throw on a track already in a bad state (e.g. dead

@@ -964,6 +964,56 @@ void padInt24ToInt32(const uint8_t *src, uint8_t *dst, int numSamples) {
     }
 }
 
+// 16-bit → 24-bit packed: shift left 8 (lossless)
+void padInt16ToInt24(const uint8_t *src, uint8_t *dst, int numSamples) {
+    auto *in16 = reinterpret_cast<const int16_t *>(src);
+    for (int i = 0; i < numSamples; i++) {
+        uint32_t v = (uint32_t)(int32_t)in16[i] << 8;
+        dst[i*3]   = (uint8_t)(v & 0xFF);
+        dst[i*3+1] = (uint8_t)((v >> 8) & 0xFF);
+        dst[i*3+2] = (uint8_t)((v >> 16) & 0xFF);
+    }
+}
+
+static inline int32_t readPackedLE(const uint8_t *p, int bytes) {
+    switch (bytes) {
+        case 2: return (int16_t)(uint16_t)(p[0] | (p[1] << 8));
+        case 3: {
+            uint32_t s = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+            if (s & 0x800000u) s |= 0xFF000000u;
+            return (int32_t)s;
+        }
+        default:
+            return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                             ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+    }
+}
+
+static inline void writePackedLE(uint8_t *p, int bytes, int32_t v) {
+    uint32_t u = (uint32_t)v;
+    for (int b = 0; b < bytes; b++) p[b] = (uint8_t)((u >> (8 * b)) & 0xFF);
+}
+
+bool convertIntPcmDepth(const uint8_t *src, int inBits, uint8_t *dst, int outBits, int numSamples) {
+    auto ok = [](int b) { return b == 16 || b == 24 || b == 32; };
+    if (!ok(inBits) || !ok(outBits)) return false;
+    const int inB = inBits / 8, outB = outBits / 8;
+    for (int i = 0; i < numSamples; i++) {
+        int64_t s = readPackedLE(src + (size_t)i * inB, inB);
+        int64_t o;
+        if (outBits >= inBits) {
+            o = s * ((int64_t)1 << (outBits - inBits));       // exact
+        } else {
+            const int drop = inBits - outBits;
+            o = (s + ((int64_t)1 << (drop - 1))) >> drop;      // round to nearest
+            const int64_t maxV = ((int64_t)1 << (outBits - 1)) - 1;
+            if (o > maxV) o = maxV;                           // saturate (min cannot overflow)
+        }
+        writePackedLE(dst + (size_t)i * outB, outB, (int32_t)o);
+    }
+    return true;
+}
+
 // ── Shared URB submission logic ─────────────────────────────────────
 
 /**
@@ -1126,6 +1176,19 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioWriteRaw(
     } else if (inputBitDepth == 24 && ctx->bitDepth == 32) {
         // 24-bit packed (3 bytes/sample) → 32-bit: sign-extend + shift left 8
         padInt24ToInt32((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
+    } else if (inputBitDepth == 16 && ctx->bitDepth == 24) {
+        // DAC with a 3-byte subslot: 16-bit → 24-bit packed, lossless
+        padInt16ToInt24((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
+    } else if (convertIntPcmDepth((uint8_t *)rawData, inputBitDepth,
+                                  ctx->transferBuffer, ctx->bitDepth, totalSamples)) {
+        // The remaining combinations used to be dropped as silence. Widening
+        // (32-bit container ← anything is handled above; this is e.g. 16 → 24)
+        // is exact; narrowing — a source deeper than the DAC's best format —
+        // cannot be bit-perfect on this DAC and is rounded. Say so once per stream.
+        if (inputBitDepth > ctx->bitDepth && ctx->framesWritten == 0) {
+            LOGW("WriteRaw: %d-bit source on a %d-bit DAC format — rounded, NOT bit-perfect",
+                 inputBitDepth, ctx->bitDepth);
+        }
     } else {
         LOGE("WriteRaw: unsupported bit-depth conversion %d → %d", inputBitDepth, ctx->bitDepth);
         env->ReleaseByteArrayElements(pcm, rawData, JNI_ABORT);

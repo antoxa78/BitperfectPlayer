@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.2.0-beta2 - 2026-10-16
+
+### Fixed
+
+- **"Bit-perfect (USB driver)" cut off the last ~1.5 s of the queue for everything played through the ExoPlayer pipeline** (SMB shares, WAV, WavPack, DSD — anything not handled by the native FLAC engine). The wrapped delegate never creates an AudioTrack in this mode, so its `isEnded()` was true the moment the last buffer was handed over, while up to 16 decoded buffers still waited in `UsbStreamingThread`'s queue. The player went to `STATE_ENDED`, stopping the renderer froze the queue (`pauseStreaming()`), and the idle hand-back discarded it. `UsbAudioSink.isEnded()` now reports "not ended" until that queue has played out, with a 2 s stall guard so a queue that stops draining can never hold the player out of `STATE_ENDED`. `STATE_ENDED` and the DAC hand-back therefore arrive about 1.5 s later than before — when the music has actually finished.
+- **USB driver: some source/DAC bit-depth pairs skipped the track or played silence.** The native FLAC engine and the raw PCM path only converted 16→32 and 24→32. On a DAC whose best alt setting uses a 3-byte subslot, a local 16-bit FLAC made the engine stop on its first frame, which the sink read as "track finished" and skipped; 16/32-bit WAV and WavPack were dropped as silence. Added a lossless 16→24 pad to both paths. The engine now refuses, at creation, any depth it cannot pad losslessly (e.g. 24-bit FLAC on a 16-bit-only DAC), so that track plays through the ExoPlayer pipeline instead of being skipped. The raw path converts the remaining pairs instead of dropping them; narrowing (source deeper than the DAC's best format) is rounded and logged as `NOT bit-perfect`, since the DAC cannot take those bits. Existing 16/24/32-bit sources on 32-bit-container DACs take exactly the same code as before.
+- **"Bit-perfect via Android" lost the BIT_PERFECT mixer after the queue ended and playback resumed from a seek.** `PlaybackService` clears the preferred mixer attributes on `STATE_ENDED` (so other apps are not blocked), but the sink kept its direct AudioTrack; seeking back into the ended queue reused that track without re-applying the preference, so it could play through the resampling system mixer. `BitPerfectManager` now counts real clears (`clearGeneration`) and `updateAudioTrack()` reports whether a BIT_PERFECT mixer was set; `BitPerfectAudioSink.flush()` recreates a track whose preference was cleared under it, so the next buffer re-applies it (`Mixer preference was cleared under the live track — recreating it on flush` in the log). Costs a short gap, only in that case.
+
+### Build
+
+- `versionCode` 71, `versionName` `3.2.0-beta2`.
+
 ## 3.2.0-beta1 - 2026-10-16
 
 ### Fixed

@@ -394,8 +394,13 @@ static void *prepareThreadFunc(void *arg) {
 
 /** True if this engine can play [bits]-per-sample PCM into its USB format. */
 static bool isSupportedSourceDepth(const NativeAudioEngine *engine, int bits) {
+    // Only the exact (lossless) conversions the decode loop implements. Anything
+    // else is refused, so the caller plays the track through the ExoPlayer
+    // pipeline instead of the engine dying on its first frame (which the sink
+    // used to read as "track finished" and skip it).
     return bits == engine->dacBitDepth ||
-           (engine->dacBitDepth == 32 && (bits == 16 || bits == 24));
+           (engine->dacBitDepth == 32 && (bits == 16 || bits == 24)) ||
+           (engine->dacBitDepth == 24 && bits == 16);
 }
 
 /**
@@ -558,6 +563,11 @@ static void *decodeThreadFunc(void *arg) {
             padInt24ToInt32(engine->pcmBuffer, engine->convertBuffer, totalSamples);
             usbData = engine->convertBuffer;
             usbBytes = totalSamples * 4;
+        } else if (engine->bitsPerSample == 16 && engine->dacBitDepth == 24) {
+            // DAC with a 3-byte subslot: 16-bit → 24-bit packed, lossless
+            padInt16ToInt24(engine->pcmBuffer, engine->convertBuffer, totalSamples);
+            usbData = engine->convertBuffer;
+            usbBytes = totalSamples * 3;
         } else {
             LOGE("Unsupported bit-depth conversion: %d → %d",
                  engine->bitsPerSample, engine->dacBitDepth);
@@ -626,6 +636,25 @@ Java_com_decent_usbaudio_NativeAudioEngine_nativeCreateFromFd(
         delete parser;
         delete ds;
         return 0;
+    }
+
+    // Refuse a source depth the decode loop cannot convert losslessly into this
+    // USB stream's format (e.g. 24-bit FLAC on a 16-bit-only DAC). Returning 0
+    // makes the sink use the ExoPlayer pipeline for this track; before, the
+    // engine started, died on its first frame, and the track was skipped.
+    {
+        int srcBits = (int)parser->getBitsPerSample();
+        int dacBits = usbCtx->bitDepth;
+        bool ok = srcBits == dacBits ||
+                  (dacBits == 32 && (srcBits == 16 || srcBits == 24)) ||
+                  (dacBits == 24 && srcBits == 16);
+        if (!ok) {
+            LOGW("nativeCreateFromFd: %d-bit FLAC cannot be padded losslessly to the "
+                 "DAC's %d-bit format — not using the native engine", srcBits, dacBits);
+            delete parser;
+            delete ds;
+            return 0;
+        }
     }
 
     auto *engine = new NativeAudioEngine();

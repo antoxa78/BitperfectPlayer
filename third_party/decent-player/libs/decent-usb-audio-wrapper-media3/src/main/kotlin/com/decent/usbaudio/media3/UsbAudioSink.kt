@@ -196,6 +196,13 @@ class UsbAudioSink(
     private var usbStartMediaTimeNeedsInit: Boolean = true
     private var handledEndOfStream: Boolean = false
 
+    /** End-of-stream play-out of the ExoPlayer-pipeline queue (see isEnded):
+     *  the last queue size seen and when it last changed, so a queue that stops
+     *  draining cannot hold the player out of STATE_ENDED forever. */
+    private var endDrainLastQueueSize: Int = -1
+    private var endDrainLastChangeMs: Long = 0L
+    private var endDrainStallLogged: Boolean = false
+
     /** ExoPlayer's window offset, captured once per track. Never reset by flush.
      *  Used to convert between ExoPlayer timeline and FLAC absolute position. */
     private var windowOffsetUs: Long = -1L
@@ -605,6 +612,35 @@ class UsbAudioSink(
             // Cannot delegate to super because LoadControl blocked ExoPlayer's loading,
             // so the delegate never reached end-of-stream on its own.
             if (engine != null && !engine.isRunning) return true
+
+            // ExoPlayer pipeline (SMB, WAV, WavPack, DSD, streams): the delegate
+            // never created an AudioTrack, so its isEnded() is true the moment the
+            // last buffer is handed over — while up to QUEUE_BACKPRESSURE_THRESHOLD
+            // decoded buffers (~1.5 s at 44.1 kHz) still wait in the streaming
+            // queue. The player then went to STATE_ENDED, stopped the renderer
+            // (pause() → pauseStreaming() froze the queue) and the idle hand-back
+            // discarded it: the end of the last track was cut off. Report "not
+            // ended" until the queue has played out. Audio already in the URB ring
+            // (~80 ms) still plays, and the hand-back drains it.
+            val thread = usbStreamingThread
+            if (engine == null && thread != null && handledEndOfStream &&
+                usbAudioStream?.isAlive == true && thread.hasPendingData()
+            ) {
+                val now = SystemClock.elapsedRealtime()
+                val size = thread.queueSize()
+                // Only time a queue that is supposed to be moving: paused, or still
+                // shrinking, restarts the stall clock.
+                if (size != endDrainLastQueueSize || !isPlaying) {
+                    endDrainLastQueueSize = size
+                    endDrainLastChangeMs = now
+                }
+                if (now - endDrainLastChangeMs < END_DRAIN_STALL_TIMEOUT_MS) return false
+                if (!endDrainStallLogged) {
+                    endDrainStallLogged = true
+                    Log.w(TAG, "End of stream: USB queue stuck at $size buffers for " +
+                        "${END_DRAIN_STALL_TIMEOUT_MS} ms — reporting ended anyway")
+                }
+            }
         }
         return super.isEnded()
     }
@@ -620,6 +656,8 @@ class UsbAudioSink(
 
     override fun playToEndOfStream() {
         handledEndOfStream = true
+        endDrainLastQueueSize = -1
+        endDrainStallLogged = false
         // Always propagate to delegate — ExoPlayer needs this signal to
         // detect end-of-stream and transition to the next track.
         super.playToEndOfStream()
@@ -676,6 +714,8 @@ class UsbAudioSink(
         }
         usbStartMediaTimeNeedsInit = true
         handledEndOfStream = false
+        endDrainLastQueueSize = -1
+        endDrainStallLogged = false
         // Temporarily unblock LoadControl so ExoPlayer loads at least one chunk
         // after seek. handleBuffer will re-block once it captures presentationTimeUs.
         // Without this, the LoadControl blocks ALL post-seek loading and the engine
@@ -1383,6 +1423,10 @@ class UsbAudioSink(
         /** Upper bound for the player to reach the next item after a gapless
          *  switch before position reporting falls back to normal. */
         private const val GAPLESS_ADVANCE_TIMEOUT_MS = 5_000L
+
+        /** isEnded(): give up waiting for the end-of-stream queue play-out if
+         *  the queue has not shrunk for this long while playing. */
+        private const val END_DRAIN_STALL_TIMEOUT_MS = 2_000L
 
         /**
          * How long to keep retrying to re-claim the DAC after an idle release

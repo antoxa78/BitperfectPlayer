@@ -206,6 +206,19 @@ void padInt16ToInt32(const uint8_t *src, uint8_t *dst, int numSamples);
 /** 24-bit packed (3 bytes/sample) → 32-bit: sign-extend + shift left 8. */
 void padInt24ToInt32(const uint8_t *src, uint8_t *dst, int numSamples);
 
+/** 16-bit → 24-bit packed (3 bytes/sample): shift left 8. Lossless — for DACs
+ *  whose best alt setting uses a 3-byte subslot. */
+void padInt16ToInt24(const uint8_t *src, uint8_t *dst, int numSamples);
+
+/**
+ * Generic packed little-endian integer PCM depth change for the combinations
+ * the dedicated pads do not cover. inBits/outBits ∈ {16, 24, 32}. Widening is
+ * an exact left shift. Narrowing (source deeper than the DAC's best format)
+ * cannot be bit-perfect: it rounds to nearest with saturation, as the float
+ * path does. Returns false for an unsupported depth.
+ */
+bool convertIntPcmDepth(const uint8_t *src, int inBits, uint8_t *dst, int outBits, int numSamples);
+
 /** int32 holding a sign-extended 24-bit value → 32-bit: shift left 8.
  *  (Not used by the write paths: 32-bit input is treated as full-scale int32.) */
 void shiftInt32From24(const uint8_t *src, uint8_t *dst, int numSamples);
