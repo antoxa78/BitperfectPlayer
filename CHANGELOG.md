@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.4 - 2026-10-16
+
+### Changed
+
+- Rebuilt and re-signed the release package; no functional changes since 3.1.3.
+
 ## 3.1.3 - 2026-10-14
 
 ### Fixed
