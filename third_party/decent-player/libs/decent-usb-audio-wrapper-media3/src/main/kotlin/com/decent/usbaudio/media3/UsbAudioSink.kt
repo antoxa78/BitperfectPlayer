@@ -1015,9 +1015,17 @@ class UsbAudioSink(
                     // last played stream rate until physically unplugged or
                     // reprogrammed by another app.
                     usbAudioDevice.restoreToIdleSampleRate()
-                    // Soft-replug: re-enumerate so the kernel rebinds the system
-                    // USB-audio driver and the DAC returns to the system.
-                    usbAudioDevice.resetUsbDevice()
+                    if (config.resetOnRelease) {
+                        // Soft-replug: re-enumerate so the kernel rebinds the system
+                        // USB-audio driver and the DAC returns to the system.
+                        usbAudioDevice.resetUsbDevice()
+                    } else {
+                        // No soft-replug: leave the ALSA card instance alone. Some
+                        // boxes do not track the card that a reset re-creates and
+                        // end up unable to reach the DAC from any other app until a
+                        // reboot (see UsbAudioSinkConfig.resetOnRelease).
+                        Log.i(TAG, "USB reset on release is disabled — handing the DAC back without a soft-replug")
+                    }
                 } finally {
                     // Always drop the force=true interface claims, even if the
                     // reset threw or no stream was live (e.g. a stale connection
@@ -1025,7 +1033,8 @@ class UsbAudioSink(
                     // driver rebind for every other app.
                     usbAudioDevice.closeDevice()
                 }
-                Log.i(TAG, "USB driver released for idle — DAC reset & returned to system")
+                Log.i(TAG, "USB driver released for idle — DAC " +
+                    (if (config.resetOnRelease) "reset & " else "") + "returned to system")
             } catch (t: Throwable) {
                 Log.w(TAG, "Idle release failed: ${t.message}", t)
             } finally {
