@@ -55,6 +55,15 @@ class BitPerfectManager(private val context: Context) {
         private set
 
     /**
+     * Whether the last AudioTrack got a BIT_PERFECT mixer: true / false, or null
+     * before the first track and after [clear]. Lets Now Playing say when "Bit-perfect
+     * via Android" is in fact being resampled (no such mixer on the device).
+     */
+    @Volatile
+    var lastTrackBitPerfect: Boolean? = null
+        private set
+
+    /**
      * Updates mixer attributes from the final AudioTrack output configuration.
      * This runs immediately before AudioTrack creation, so the preference applies to that track.
      * Must never throw because it is part of the audio-track creation path.
@@ -65,7 +74,18 @@ class BitPerfectManager(private val context: Context) {
         config: AudioSink.AudioTrackConfig,
         outputDevice: AudioDeviceInfo? = null
     ): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return false
+        // null = no verdict for this track (pre-Android 14, no USB device, stale call):
+        // keep the previous one rather than claim "resampled".
+        val verdict = updateAudioTrackInternal(config, outputDevice)
+        if (verdict != null) lastTrackBitPerfect = verdict
+        return verdict == true
+    }
+
+    private fun updateAudioTrackInternal(
+        config: AudioSink.AudioTrackConfig,
+        outputDevice: AudioDeviceInfo?
+    ): Boolean? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
 
         // Grab the version stamp *before* the lock — it must reflect when the caller
         // actually decided to apply this config, not when it happened to get scheduled.
@@ -76,13 +96,13 @@ class BitPerfectManager(private val context: Context) {
             else -> findUsbOutputDevice()
         } ?: run {
             Log.d(TAG, "No USB output device found for bit-perfect routing")
-            return false
+            return null
         }
 
         return synchronized(lock) {
             if (myVersion <= appliedVersion) {
                 Log.d(TAG, "Skipping stale updateAudioTrack (v$myVersion, already at v$appliedVersion)")
-                return false
+                return null
             }
             var bitPerfect = false
             try {
@@ -127,6 +147,7 @@ class BitPerfectManager(private val context: Context) {
             appliedDevice = null
             appliedVersion = myVersion
             clearGeneration++
+            lastTrackBitPerfect = null
         }
     }
 
@@ -256,7 +277,7 @@ class BitPerfectManager(private val context: Context) {
 
     fun findUsbOutputDevice(): AudioDeviceInfo? {
         return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
-            isUsbOutputDevice(it)
+            it.isSink && isUsbOutputDevice(it)
         }
     }
 

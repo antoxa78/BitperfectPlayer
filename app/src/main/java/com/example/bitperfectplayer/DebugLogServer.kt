@@ -115,7 +115,12 @@ object DebugLogServer {
         Log.i(TAG, "Debug log server listening on $boundPort")
         while (running) {
             val client = try { ss.accept() } catch (_: Exception) { if (running) continue else break }
-            try { handle(client) } catch (t: Throwable) { Log.d(TAG, "request failed: ${t.message}") }
+            // Serve each client on its own thread: a browser preconnect socket that
+            // never sends a request used to block the accept loop for the whole
+            // soTimeout (5 s), stalling /log and /status for every other reader.
+            Thread({
+                try { handle(client) } catch (t: Throwable) { Log.d(TAG, "request failed: ${t.message}") }
+            }, "debuglog-http-client").apply { isDaemon = true }.start()
         }
     }
 

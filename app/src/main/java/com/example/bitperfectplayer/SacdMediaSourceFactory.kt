@@ -139,14 +139,23 @@ class SacdMediaSourceFactory(
      * Media3 cannot seek an [ExtractorInput], and WavPack seeking needs to land on an
      * arbitrary block, so the extractor owns its I/O through a [SacdRandomAccess] and the
      * DataSource is only a pass-through — the same shape as the SACD source above.
+     *
+     * The access handle is probed once here so a file that cannot be opened still falls
+     * back to the default sources; that probe becomes the first period's handle (no
+     * second open) and every extractor closes its own handle in `release()`.
      */
     private fun createWavPackSource(mediaItem: MediaItem, uri: String): MediaSource {
-        val access = WavPackSupport.openAccess(uri, context)
+        val probe = WavPackSupport.openAccess(uri, context)
             ?: return delegate.createMediaSource(mediaItem)
-        val extractors = ExtractorsFactory { arrayOf<Extractor>(WavPackExtractor(access)) }
+        val first = java.util.concurrent.atomic.AtomicReference<SacdRandomAccess?>(probe)
         val factory = ProgressiveMediaSource.Factory(
             DataSource.Factory { WavPackPassthroughDataSource() },
-            extractors
+            ProgressiveMediaExtractor.Factory {
+                val access = first.getAndSet(null)
+                    ?: WavPackSupport.openAccess(uri, context)
+                    ?: throw java.io.IOException("WavPack source unavailable: $uri")
+                WavPackProgressiveMediaExtractor(access)
+            }
         )
         loadErrorHandlingPolicy?.let { factory.setLoadErrorHandlingPolicy(it) }
         return maybeClip(mediaItem, factory.createMediaSource(mediaItem))

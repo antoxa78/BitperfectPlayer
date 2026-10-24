@@ -475,16 +475,24 @@ static int reapOldestUrb(UsbAudioContext *ctx, int timeoutMs) {
 
 /**
  * Drain ALL in-flight URBs. Blocks until every URB is reaped or timeout.
+ *
+ * @param discardPending when true, issue USBDEVFS_DISCARDURB for URBs that did
+ *        not complete naturally. When false, leave them for the caller's
+ *        USBDEVFS_RESET/close (the exit path): on the Amlogic kernel,
+ *        DISCARDURB for an already-completed URB can block inside usbfs and
+ *        wedge the release thread, which is what left the DAC claimed after
+ *        Exit until a physical replug.
  * @return Number of URBs successfully drained
  */
-static int drainAllUrbs(UsbAudioContext *ctx) {
+static int drainAllUrbs(UsbAudioContext *ctx, bool discardPending = true) {
     int drained = 0;
     int initialCount = ctx->urbsInFlight;
-    LOGI("drainAllUrbs: draining %d URBs (feedback=%s)...",
-         initialCount, ctx->feedbackInFlight ? "in-flight" : "idle");
+    LOGI("drainAllUrbs: draining %d URBs (feedback=%s, discardPending=%d)...",
+         initialCount, ctx->feedbackInFlight ? "in-flight" : "idle",
+         discardPending ? 1 : 0);
 
     // Discard the feedback URB first so it doesn't interfere with draining
-    if (ctx->feedbackInFlight && ctx->feedbackUrb) {
+    if (discardPending && ctx->feedbackInFlight && ctx->feedbackUrb) {
         ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->feedbackUrb);
         struct usbdevfs_urb *c = nullptr;
         for (int i = 0; i < 50; i++) {
@@ -507,23 +515,27 @@ static int drainAllUrbs(UsbAudioContext *ctx) {
     }
 
     if (ctx->urbsInFlight > 0) {
-        LOGW("drainAllUrbs: %d/%d reaped naturally, discarding remaining %d",
-             drained, initialCount, ctx->urbsInFlight);
+        const int remaining = ctx->urbsInFlight;
+        LOGW("drainAllUrbs: %d/%d reaped naturally, %d still in flight",
+             drained, initialCount, remaining);
 
-        // Phase 2: DISCARD all remaining URBs first
-        int toDiscard = ctx->urbsInFlight;
-        for (int i = 0; i < toDiscard; i++) {
-            int slotIdx = (ctx->reapIdx + i) % USB_AUDIO_NUM_URBS;
-            ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->ring[slotIdx].urb);
+        if (discardPending) {
+            // Phase 2: ask the kernel to discard the remaining URBs. On the
+            // Amlogic kernel this can block if the URB already completed, which
+            // is why the exit path calls us with discardPending=false and lets
+            // USBDEVFS_RESET/close abort them instead.
+            for (int i = 0; i < remaining; i++) {
+                int slotIdx = (ctx->reapIdx + i) % USB_AUDIO_NUM_URBS;
+                ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->ring[slotIdx].urb);
+            }
         }
 
-        // Phase 3: Reap ALL pending completions from the event ring.
-        // CRITICAL: Don't match 1:1 with discards — REAPURBNDELAY returns
-        // completions from ANY endpoint in ANY order. We must drain the
-        // entire completion queue to prevent event ring accumulation that
-        // would corrupt future streams.
+        // Phase 3: Reap ALL pending completions from the event ring. CRITICAL:
+        // Don't match 1:1 with discards — REAPURBNDELAY returns completions from
+        // ANY endpoint in ANY order. We must drain the entire completion queue
+        // to prevent event ring accumulation that would corrupt future streams.
         int reaped = 0;
-        for (int attempt = 0; attempt < 500 && reaped < toDiscard; attempt++) {
+        for (int attempt = 0; attempt < 500; attempt++) {
             struct usbdevfs_urb *c = nullptr;
             int ret = ioctl(ctx->fd, USBDEVFS_REAPURBNDELAY, &c);
             if (ret == 0 && c != nullptr) {
@@ -535,7 +547,12 @@ static int drainAllUrbs(UsbAudioContext *ctx) {
                 usleep(1000);  // 1ms
             }
         }
-        LOGI("drainAllUrbs: discarded %d, reaped %d completions", toDiscard, reaped);
+        if (discardPending) {
+            LOGI("drainAllUrbs: discarded %d, reaped %d completions", remaining, reaped);
+        } else {
+            LOGI("drainAllUrbs: reaped %d completions, left %d for reset/close",
+                 reaped, remaining - reaped);
+        }
         drained += reaped;
 
         // Phase 4: Flush any remaining stale completions (from previous
@@ -844,11 +861,11 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeFlush(
 
 JNIEXPORT jint JNICALL
 Java_com_decent_usbaudio_UsbAudioStream_nativeDrainUrbs(
-        JNIEnv *, jobject, jlong h) {
+        JNIEnv *, jobject, jlong h, jboolean discardPending) {
     auto *ctx = reinterpret_cast<UsbAudioContext *>(h);
     if (!ctx) return 0;
     ctx->running.store(false);
-    return drainAllUrbs(ctx);
+    return drainAllUrbs(ctx, discardPending == JNI_TRUE);
 }
 
 JNIEXPORT void JNICALL
@@ -859,7 +876,11 @@ Java_com_decent_usbaudio_UsbAudioStream_nativeUsbAudioDestroy(
     ctx->running.store(false);
 
     if (ctx->urbsInFlight > 0) {
-        drainAllUrbs(ctx);
+        // Normal destroy path: discard pending URBs before freeing the ring.
+        // The exit path already drained with discardPending=false and reset
+        // urbsInFlight, so it does not reach this call; releaseUsbForIdle then
+        // resets/closes the device and aborts anything still pending.
+        drainAllUrbs(ctx, true);
     }
 
     freeRing(ctx);

@@ -63,6 +63,24 @@ class UsbAudioDevice private constructor(private val context: Context) {
 
 
     /**
+     * True only for a USB Audio Class device that can actually play audio: an
+     * AudioStreaming interface (class 1, subclass 2) with an isochronous OUT
+     * endpoint. Microphone-only devices (e.g. a USB remote's microphone) have
+     * only an IN endpoint and must never be selected as the output DAC.
+     */
+    private fun UsbDevice.hasAudioPlaybackStream(): Boolean =
+        (0 until interfaceCount).any { i ->
+            val iface = getInterface(i)
+            iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
+                iface.interfaceSubclass == 2 &&
+                (0 until iface.endpointCount).any { e ->
+                    val ep = iface.getEndpoint(e)
+                    ep.direction == UsbConstants.USB_DIR_OUT &&
+                        ep.type == UsbConstants.USB_ENDPOINT_XFER_ISOC
+                }
+        }
+
+    /**
      * Find the first connected USB audio output device.
      *
      * Scans all USB devices for one with an AudioStreaming interface
@@ -72,16 +90,11 @@ class UsbAudioDevice private constructor(private val context: Context) {
      */
     fun findUsbAudioDevice(): UsbDevice? {
         for (device in usbManager.deviceList.values) {
-            for (i in 0 until device.interfaceCount) {
-                val iface = device.getInterface(i)
-                // USB Audio Class: class=1 (Audio), subclass=2 (AudioStreaming)
-                if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
-                    iface.interfaceSubclass == 2) {
-                    Log.i(TAG, "Found USB audio device: ${device.productName} " +
-                            "(vendor=0x${device.vendorId.toString(16)}, " +
-                            "product=0x${device.productId.toString(16)})")
-                    return device
-                }
+            if (device.hasAudioPlaybackStream()) {
+                Log.i(TAG, "Found USB audio device: ${device.productName} " +
+                        "(vendor=0x${device.vendorId.toString(16)}, " +
+                        "product=0x${device.productId.toString(16)})")
+                return device
             }
         }
         Log.d(TAG, "No USB audio device found")
@@ -733,6 +746,18 @@ class UsbAudioDevice private constructor(private val context: Context) {
             (0 until d.interfaceCount).map { d.getInterface(it) }
                 .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO && it.interfaceSubclass == 1 }
         }
+
+        // 1. Park streaming interface at alt=0 (zero-bandwidth) before releasing
+        val zeroAltStreaming = device?.let { d ->
+            (0 until d.interfaceCount).map { d.getInterface(it) }
+                .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
+                        it.interfaceSubclass == 2 && it.alternateSetting == 0 }
+        }
+        if (zeroAltStreaming != null) {
+            val setAltOk = conn.setInterface(zeroAltStreaming)
+            Log.i(TAG, "resetUsbDevice: parked streaming iface ${zeroAltStreaming.id} at alt=0: $setAltOk")
+        }
+
         controlInterface?.let {
             Log.i(TAG, "resetUsbDevice: releaseInterface(control iface ${it.id}): ${conn.releaseInterface(it)}")
         }
@@ -843,6 +868,50 @@ class UsbAudioDevice private constructor(private val context: Context) {
         }
         // Don't block the exit path long; the kernel driver probes asynchronously
         // and waitForUsbRebind() (in PlaybackService) observes the outcome.
+    }
+
+    /**
+     * Re-enumerate the whole USB host controller that owns the DAC.
+     *
+     * [resetUsbDevice]'s USBDEVFS_RESET and [forceKernelRebind]'s per-device
+     * sysfs unbind/bind can restore the kernel's ALSA card, but on some boxes
+     * (observed on a Tanix W2 / Android 11) Android's UsbHostManager never sees
+     * a real detach/attach, so UsbAlsaManager/AudioPolicy keeps the old (or no)
+     * USB output route and every other app stays silent. Unbinding and binding
+     * the parent xHCI platform driver produces the actual host-controller
+     * re-enumeration that makes the framework re-read the device.
+     *
+     * This drops **every** USB device on that controller, not just the DAC, and
+     * requires root (writes sysfs through `su`). Call it only as an explicit
+     * last resort. Returns true when both sysfs writes were accepted.
+     */
+    fun forceHostControllerRebind(productName: String?): Boolean {
+        if (productName.isNullOrBlank()) return false
+        val busId = findSysfsBusId(productName, File("/sys/bus/usb/devices")) ?: run {
+            Log.w(TAG, "forceHostControllerRebind: no sysfs node for '$productName'")
+            return false
+        }
+        val devicePath = "/sys/bus/usb/devices/$busId"
+        val realPath = runShellCapture("readlink -f '$devicePath'")
+            ?: runCatching { File(devicePath).canonicalPath }.getOrNull()
+        val controller = realPath
+            ?.split('/')
+            ?.firstOrNull { it.startsWith("xhci-hcd.") }
+        if (controller.isNullOrBlank()) {
+            Log.w(TAG, "forceHostControllerRebind: no xhci-hcd controller in '$realPath'")
+            return false
+        }
+        Log.i(TAG, "forceHostControllerRebind: $controller (for $busId / $productName)")
+        if (!writeSysfs("/sys/bus/platform/drivers/xhci-hcd/unbind", controller,
+                "host unbind $controller")) {
+            Log.w(TAG, "forceHostControllerRebind: host unbind failed — no root?")
+            return false
+        }
+        runCatching { Thread.sleep(200) }
+        val bound = writeSysfs("/sys/bus/platform/drivers/xhci-hcd/bind", controller,
+            "host bind $controller")
+        if (!bound) Log.w(TAG, "forceHostControllerRebind: host bind failed")
+        return bound
     }
 
     private fun findSysfsBusId(productName: String, sysfsDevices: File): String? {

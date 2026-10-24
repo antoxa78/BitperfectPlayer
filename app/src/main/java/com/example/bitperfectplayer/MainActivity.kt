@@ -47,6 +47,10 @@ class MainActivity : BaseActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Application.onCreate() may be too early for a foreground-service start
+        // on Android 12+; the activity is definitely foreground, so sync here.
+        UsbRecoveryService.sync(this)
+
         // Write defaults before the UI is created so the fragment reads the
         // correct initial values (e.g., resume_playback defaults to true).
         val prefs = getSharedPreferences(PREFS_APP, MODE_PRIVATE)

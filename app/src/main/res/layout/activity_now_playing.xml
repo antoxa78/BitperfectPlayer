@@ -229,6 +229,7 @@
                     android:src="@drawable/ic_play"
                     android:contentDescription="Play/Pause"
                     android:focusable="true"
+                    android:focusedByDefault="true"
                     android:padding="22dp"
                     android:scaleType="fitCenter"
                     app:tint="@color/text_primary" />

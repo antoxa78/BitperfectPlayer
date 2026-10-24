@@ -23,5 +23,16 @@ data class UsbAudioSinkConfig(
      * interfaces and closes the device without the reset, so the card instance the
      * system already knows about is left alone.
      */
-    val resetOnRelease: Boolean = true
+    val resetOnRelease: Boolean = true,
+    /**
+     * Ask for USB permission from [UsbAudioSink.configure] when a DAC is found
+     * but not yet granted.
+     *
+     * `configure()` runs as a track starts, so the system dialog this raises
+     * always appears *after* playback has begun, and the track that triggered it
+     * is already on the system-audio fallback (the grant does not move it). After
+     * a denial it is raised again on every track. Hosts that request permission
+     * themselves, before starting playback, should set this to false.
+     */
+    val requestPermissionOnConfigure: Boolean = true
 )

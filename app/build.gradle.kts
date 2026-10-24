@@ -27,8 +27,8 @@ android {
         applicationId = "com.github.antoxa78.bitperfectplayer"
         minSdk = 28
         targetSdk = 36
-        versionCode = 71
-        versionName = "3.2.0-beta2"
+        versionCode = 75
+        versionName = "3.2.0-beta6"
 
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

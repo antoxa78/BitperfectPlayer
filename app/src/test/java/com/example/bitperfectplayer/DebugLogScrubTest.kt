@@ -29,6 +29,22 @@ class DebugLogScrubTest {
         )
     }
 
+    /**
+     * A password may be quoted and contain spaces; only masking its first word left
+     * the rest of the secret in the buffer (and in the served log).
+     */
+    @Test fun mpdQuotedPasswordWithSpacesIsFullyMasked() {
+        assertEquals(
+            "D MpdServer: MPD <- password ***",
+            DebugLog.scrub("D MpdServer: MPD <- password \"hunter two\"")
+        )
+        // A quoted command word is masked too; what the client typed is preserved.
+        assertEquals(
+            "D MpdServer: MPD <- \"password\" ***",
+            DebugLog.scrub("D MpdServer: MPD <- \"password\" hunter two")
+        )
+    }
+
     @Test fun passwordAssignmentsAreMasked() {
         assertEquals("prefs password=***", DebugLog.scrub("prefs password=abc123"))
         assertEquals("prefs pwd: ***", DebugLog.scrub("prefs pwd: abc123"))

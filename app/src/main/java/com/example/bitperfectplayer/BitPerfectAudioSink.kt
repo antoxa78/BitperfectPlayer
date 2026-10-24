@@ -542,6 +542,10 @@ class BitPerfectAudioSink(
         delegate.setPreferredDevice(routedDevice ?: preferredDevice)
         delegate.configure(format, directBufferSize, null)
         delegateConfigured = true
+        // play() ran while the sink was in direct mode, when it only started the direct
+        // track — the delegate was never started. Without this the fallback path plays
+        // into a configured but paused AudioTrack (silence).
+        if (playing) delegate.play()
         return delegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
     }
 

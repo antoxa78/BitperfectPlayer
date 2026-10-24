@@ -101,6 +101,8 @@ class NowPlayingActivity : BaseActivity() {
     private lateinit var btnShuffle: ImageButton
     private lateinit var btnRepeat: ImageButton
     private lateinit var btnDacReset: ImageButton
+    /** Same logo + wordmark as the main menu, in the same top-right spot. */
+    private lateinit var brandMark: BrandMark
     private var isSeekBarTracking = false
     private var progressUpdateRunnable: Runnable? = null
 
@@ -113,6 +115,7 @@ class NowPlayingActivity : BaseActivity() {
         bindViews()
         setupSeekBar()
         setupButtons()
+        focusPlayPause()
 
         val sessionToken = SessionToken(this, ComponentName(this, PlaybackService::class.java))
         controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
@@ -130,6 +133,9 @@ class NowPlayingActivity : BaseActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Coming back with nothing focused (e.g. after the playlist/info dialogs or
+        // the screensaver): put the D-pad selector back on play/pause.
+        if (currentFocus == null) focusPlayPause()
         // The colour theme or output mode may have changed in Settings while this screen was hidden.
         if (::btnDacReset.isInitialized) {
             applyColorTheme()
@@ -155,6 +161,7 @@ class NowPlayingActivity : BaseActivity() {
         textArtist       = findViewById(R.id.text_artist)
         textAlbum        = findViewById(R.id.text_album)
         textPlaylistPos  = findViewById(R.id.text_playlist_pos)
+        textPlaylistPos.ellipsize = android.text.TextUtils.TruncateAt.END
         textBitrate      = findViewById(R.id.text_bitrate)
         textCurrentTime  = findViewById(R.id.text_current_time)
         textTotalTime    = findViewById(R.id.text_total_time)
@@ -168,6 +175,25 @@ class NowPlayingActivity : BaseActivity() {
         imgBackdrop      = findViewById(R.id.img_backdrop)
         backdropScrim    = findViewById(R.id.view_backdrop_scrim)
         artFrame         = findViewById(R.id.art_frame)
+
+        // Brand mark in the top-right corner, at the main menu's insets so it does not
+        // jump between screens. Added last to the root so it draws above the backdrop.
+        val density = resources.displayMetrics.density
+        brandMark = BrandMark(this)
+        findViewById<android.widget.FrameLayout>(R.id.now_playing_root).addView(
+            brandMark,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                android.view.Gravity.TOP or android.view.Gravity.END
+            ).apply {
+                topMargin = (BrandMark.TOP_INSET_DP * density).toInt()
+                marginEnd = (BrandMark.END_INSET_DP * density).toInt()
+            }
+        )
+        // With a two-line title the text column reaches up to the brand mark's rows;
+        // keep the header line (track position + audio output) from running under it.
+        brandMark.viewTreeObserver.addOnGlobalLayoutListener { fitHeaderBesideBrand() }
 
         // Rounded cover: the frame's rounded background is its outline, clip the art to it.
         artFrame.clipToOutline = true
@@ -241,6 +267,15 @@ class NowPlayingActivity : BaseActivity() {
     }
 
     // ── Buttons ───────────────────────────────────────────────────────────────
+
+    /**
+     * Opening Now Playing puts the D-pad selector on play/pause — the button the user
+     * almost always wants here. Without this Android picked the first focusable view in
+     * the layout, the seek bar. Posted so it wins over the window's own initial focus.
+     */
+    private fun focusPlayPause() {
+        btnPlayPause.post { btnPlayPause.requestFocus() }
+    }
 
     private fun setupButtons() {
         findViewById<ImageButton>(R.id.btn_prev).setOnClickListener { mediaController?.seekToPrevious() }
@@ -570,6 +605,7 @@ class NowPlayingActivity : BaseActivity() {
                 }
             }
         btnPlayPause.imageTintList = android.content.res.ColorStateList.valueOf(theme.onAccent)
+        brandMark.applyTheme(theme)
 
         seekBar.progressTintList = android.content.res.ColorStateList.valueOf(theme.accent)
         seekBar.thumbTintList = android.content.res.ColorStateList.valueOf(theme.accent)
@@ -622,8 +658,7 @@ class NowPlayingActivity : BaseActivity() {
         if (!finalAlbum.isNullOrEmpty()) { textAlbum.text = finalAlbum; textAlbum.visibility = android.view.View.VISIBLE }
         else textAlbum.visibility = android.view.View.INVISIBLE
 
-        textPlaylistPos.text =
-            if (controller.mediaItemCount > 0) "TRACK ${controller.currentMediaItemIndex + 1} OF ${controller.mediaItemCount}" else ""
+        updateHeaderLine()
 
         val uri = mediaItem?.mediaId ?: ""
         loadAlbumArt(uri, dispArtist, metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString(), dispTrack)
@@ -659,6 +694,34 @@ class NowPlayingActivity : BaseActivity() {
         }
     }
 
+    /**
+     * The small header above the title: "TRACK 3 OF 12 · USB AUDIO DRIVER". The
+     * second half is the audio output in use (PlaybackService.outputPathLabel) — the
+     * mode's name, or the real path when playback fell back from it.
+     */
+    private fun updateHeaderLine() {
+        val controller = mediaController ?: return
+        val parts = mutableListOf<String>()
+        if (controller.mediaItemCount > 0) {
+            parts += "TRACK ${controller.currentMediaItemIndex + 1} OF ${controller.mediaItemCount}"
+        }
+        parts += PlaybackService.outputPathLabel(this, controller.isPlaying)
+        val text = parts.joinToString("  ·  ").uppercase()
+        if (textPlaylistPos.text.toString() != text) textPlaylistPos.text = text
+    }
+
+    /** Caps the header's width at the brand mark's left edge when they share rows. */
+    private fun fitHeaderBesideBrand() {
+        if (brandMark.width == 0 || textPlaylistPos.height == 0) return
+        val header = IntArray(2).also { textPlaylistPos.getLocationInWindow(it) }
+        val brand = IntArray(2).also { brandMark.getLocationInWindow(it) }
+        val gap = (16 * resources.displayMetrics.density).toInt()
+        val sharesRows = header[1] < brand[1] + brandMark.height + gap &&
+            header[1] + textPlaylistPos.height > brand[1]
+        val limit = if (sharesRows) (brand[0] - header[0] - gap).coerceAtLeast(gap * 6) else Int.MAX_VALUE
+        if (textPlaylistPos.maxWidth != limit) textPlaylistPos.maxWidth = limit
+    }
+
     // ── Album art ─────────────────────────────────────────────────────────────
 
     /**
@@ -673,13 +736,16 @@ class NowPlayingActivity : BaseActivity() {
      *  5. Fallback: ic_audio icon tinted with theme color
      */
     private fun loadAlbumArt(uri: String, artist: String, album: String?, track: String) {
+        // SACD tracks carry their source ISO/share after the encoded mediaId fields;
+        // folder artwork lives beside that file, not beside the "sacd:" pseudo-URI.
+        val sourceUri = SacdSupport.parseTrackInfo(uri)?.srcUri ?: uri
         // The cache key must include the track's source folder, not just its tags.
         // Multi-disc releases (and duplicate rips of the same album in different
         // folders) commonly share identical artist/album metadata across discs while
         // each disc's folder has its own cover.jpg — keying on metadata alone meant
         // the first disc's art (or a stale online match) stuck for every later disc,
         // showing the wrong disc's cover once playback moved on.
-        val artKey = "$artist|${album ?: track}|${folderKeyFor(uri)}"
+        val artKey = "$artist|${album ?: track}|${folderKeyFor(sourceUri)}"
         if (artKey == lastArtKey) return
         lastArtKey = artKey
 
@@ -704,7 +770,7 @@ class NowPlayingActivity : BaseActivity() {
 
         Thread {
             // 2 — Local folder artwork
-            var bitmap = fetchLocalFolderArt(uri)
+            var bitmap = fetchLocalFolderArt(sourceUri)
 
             if (bitmap == null) {
                 val sArtist = sanitizeForSearch(artist)
@@ -788,8 +854,7 @@ class NowPlayingActivity : BaseActivity() {
                     uriString.substringBeforeLast("/", uriString)
                 }
                 uriString.startsWith("file://") || uriString.startsWith("/") -> {
-                    val path = if (uriString.startsWith("file://")) uriString.substring(7) else uriString
-                    java.io.File(path).parent ?: uriString
+                    java.io.File(localPathFor(uriString)).parent ?: uriString
                 }
                 uriString.startsWith("content://") -> {
                     val uri = uriString.toUri()
@@ -805,6 +870,19 @@ class NowPlayingActivity : BaseActivity() {
         }
     }
 
+    /**
+     * Filesystem path of a `file://` (percent-encoded) or bare-path URI. Decoding is
+     * essential: `Uri.fromFile()` escapes spaces and non-ASCII characters, so the raw
+     * URI text contains `%20` and `File(...)` would look for a folder literally named
+     * `My%20Music` — which never exists, so no folder art was ever found.
+     */
+    private fun localPathFor(uriString: String): String =
+        if (uriString.startsWith("file://")) {
+            uriString.toUri().path ?: uriString.substring(7)
+        } else {
+            uriString
+        }
+
     private fun fetchLocalFolderArt(uriString: String): Bitmap? {
         try {
             if (uriString.startsWith("smb://")) {
@@ -819,8 +897,7 @@ class NowPlayingActivity : BaseActivity() {
                     } catch (_: Exception) {}
                 }
             } else if (uriString.startsWith("file://") || uriString.startsWith("/")) {
-                val path = if (uriString.startsWith("file://")) uriString.substring(7) else uriString
-                val file = java.io.File(path)
+                val file = java.io.File(localPathFor(uriString))
                 val parent = file.parentFile ?: return null
                 for (name in FOLDER_ART_NAMES) {
                     val artFile = java.io.File(parent, name)
@@ -979,6 +1056,9 @@ class NowPlayingActivity : BaseActivity() {
                 // item's static title masks them), so poll the service-captured title.
                 val icy = PlaybackService.icyInfo
                 if (icy != lastIcyInfo) { lastIcyInfo = icy; updateUI(); refreshScreensaver() }
+                // The output path can change without a player event (the USB driver
+                // claims the DAC a moment after play, or falls back), so poll it.
+                updateHeaderLine()
 
                 handler.postDelayed(this, PROGRESS_TICK_MS)
             }
@@ -1092,7 +1172,7 @@ class NowPlayingActivity : BaseActivity() {
                     .filter { !it.name.startsWith(".") }
                     .mapNotNull { f -> when {
                         f.isDirectory -> BrowseItem(f.name, f.absolutePath, R.drawable.ic_folder, true)
-                        !isDirectoryMode && isPlayable(f.name) -> BrowseItem(f.name, f.absolutePath, if (f.name.lowercase().run { endsWith(".m3u")||endsWith(".m3u8")||endsWith(".pls") }) R.drawable.ic_playlist else R.drawable.ic_audio, false)
+                        !isDirectoryMode && isPlayable(f.name) -> BrowseItem(f.name, f.absolutePath, if (f.name.lowercase().run { endsWith(".m3u")||endsWith(".m3u8")||endsWith(".pls")||endsWith(".cue") }) R.drawable.ic_playlist else R.drawable.ic_audio, false)
                         else -> null
                     } }
                     .sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
@@ -1168,36 +1248,15 @@ class NowPlayingActivity : BaseActivity() {
     }
 
     // ── Playlist parsers (local) ───────────────────────────────────────────────
+    // Shared with the MPD server and the menu's folder scan, so attributes after the
+    // duration in #EXTINF (tvg-id=…, group-title=…) are handled the same everywhere and
+    // every item carries a MIME type.
 
-    private fun parseM3uLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> {
-        val items = mutableListOf<MediaItem>(); val bp = base?.toString()?.substringBeforeLast("/")
-        try { val r = java.io.BufferedReader(java.io.InputStreamReader(s)); var line: String?; var ct: String? = null
-            while (r.readLine().also { line = it } != null) { val t = line?.trim()?.removePrefix("\uFEFF") ?: continue; if (t.isEmpty()) continue
-                if (t.startsWith("#EXTINF:")) { val c = t.indexOf(','); if (c!=-1) ct = t.substring(c+1) }
-                else if (!t.startsWith("#")) { val u = resolvePlaylistEntry(t.replace("\\","/"), bp); if (u!=null) items.add(buildPlaylistItem(u, ct)); ct=null }
-            }
-        } catch (e: Exception) { e.printStackTrace() }; return items
-    }
+    private fun parseM3uLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> =
+        PlaylistParser.parseM3uFromStream(s, base?.toString()?.substringBeforeLast("/"))
 
-    private fun parsePlsLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> {
-        val items = mutableListOf<MediaItem>(); val bp = base?.toString()?.substringBeforeLast("/")
-        try { val r = java.io.BufferedReader(java.io.InputStreamReader(s)); val props = linkedMapOf<String,String>(); var line: String?
-            while (r.readLine().also { line = it } != null) { val t = line?.trim()?.removePrefix("\uFEFF") ?: continue; if (t.isEmpty()||t.startsWith("[")) continue; val eq = t.indexOf('='); if (eq!=-1) props[t.substring(0,eq).trim().lowercase()] = t.substring(eq+1).trim() }
-            val cnt = props.remove("numberofentries")?.toIntOrNull() ?: 0
-            for (i in 1..cnt) { val f = props.remove("file$i") ?: continue; val u = resolvePlaylistEntry(f.replace("\\","/"), bp) ?: continue; val tl = props.remove("title$i") ?: u.lastPathSegment ?: f.substringAfterLast("/").substringBeforeLast("."); items.add(buildPlaylistItem(u, tl)) }
-        } catch (e: Exception) { e.printStackTrace() }; return items
-    }
-
-    private fun resolvePlaylistEntry(path: String, base: String?): Uri? {
-        var r = path; if (base!=null && !path.contains("://") && !path.startsWith("/")) r = if (base.endsWith("/")) "$base$path" else "$base/$path"
-        return try { when { r.startsWith("/") -> Uri.fromFile(java.io.File(r)); r.startsWith("file://") -> Uri.fromFile(java.io.File(r.substring(7))); r.startsWith("content://")||r.startsWith("http://")||r.startsWith("https://")||r.startsWith("smb://") -> r.toUri(); else -> null } } catch (e: Exception) { null }
-    }
-
-    private fun buildPlaylistItem(uri: Uri, title: String?): MediaItem {
-        val m = MediaMetadata.Builder(); var t = title ?: uri.lastPathSegment ?: uri.toString()
-        if (t.contains(" - ")) { val p = t.split(" - ", limit=2); m.setArtist(p[0].trim()); t=p[1].trim() }
-        return MediaItem.Builder().setMediaId(uri.toString()).setUri(uri).setMediaMetadata(m.setTitle(t).build()).build()
-    }
+    private fun parsePlsLocal(s: java.io.InputStream, base: Uri?): List<MediaItem> =
+        PlaylistParser.parsePlsFromStream(s, base?.toString()?.substringBeforeLast("/"))
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 
@@ -1223,7 +1282,7 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun mimeTypeFor(uriString: String): String? = PlaylistParser.mimeTypeFor(uriString)
 
-    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso",".wv").any { name.lowercase().endsWith(it) }
+    private fun isPlayable(name: String) = listOf(".mp3",".flac",".wav",".m4a",".aac",".ogg",".wma",".m3u",".m3u8",".pls",".cue",".ape",".iso",".wv",".dsf",".dff").any { name.lowercase().endsWith(it) }
 
     private fun getThemeColor(): Int = ColorThemes.current(this).accent
 }

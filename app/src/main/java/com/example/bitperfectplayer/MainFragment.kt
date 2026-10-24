@@ -44,6 +44,8 @@ class MainFragment : BrowseSupportFragment() {
     private val KEY_NETWORK_BUFFER = "network_buffer"
     private val KEY_AUTO_RECONNECT = "auto_reconnect"
     private var hasAttemptedResume = false
+    /** Auto-resume is queued behind the USB DAC permission dialog (see observePlaybackState). */
+    private var resumeAwaitingUsbPermission = false
     private var lastSelectedRowId = -1L
     private var lastSelectedColumn = 0
     // Stored so it can be removed from the controller in onDestroyView (BUG-1).
@@ -53,10 +55,6 @@ class MainFragment : BrowseSupportFragment() {
     // preventing stale items from leaking into a freshly-cleared adapter (BUG-3).
     @Volatile private var playlistScanGeneration = 0
     private lateinit var settingsAdapter: ArrayObjectAdapter
-    // Index of the "USB DAC" card inside settingsAdapter — must match the add() order below
-    private val SETTINGS_USB_DAC_INDEX = 7
-    // Index of the "Debug Log" card inside settingsAdapter — also must match the add() order below
-    private val SETTINGS_DEBUG_LOG_INDEX = 12
 
     private val usbStateReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
@@ -205,7 +203,7 @@ class MainFragment : BrowseSupportFragment() {
         })
     }
 
-    /** Logo + "BitPerfect PLAYER" wordmark instead of Leanback's plain title text. */
+    /** Logo + "Bitperfect PLAYER" wordmark instead of Leanback's plain title text. */
     override fun onInflateTitleView(
         inflater: LayoutInflater,
         parent: android.view.ViewGroup?,
@@ -705,10 +703,14 @@ class MainFragment : BrowseSupportFragment() {
                 val controller = activity?.getController()
                 if (controller != null && controller.isConnected) {
                     // Store the listener so it can be removed in onDestroyView (BUG-1).
+                    // Playlist contents do not change with playback state: an earlier
+                    // version also called updatePlaylistRow() here, which cleared and
+                    // re-scanned every configured music folder on every player event
+                    // (play/pause/buffer/ICY update), dropping focus from the row and
+                    // walking the filesystem in the background during playback.
                     val listener = object : androidx.media3.common.Player.Listener {
                         override fun onEvents(player: androidx.media3.common.Player, events: androidx.media3.common.Player.Events) {
                             updateControlsRow()
-                            updatePlaylistRow()
                         }
                     }
                     playerListener = listener
@@ -722,31 +724,18 @@ class MainFragment : BrowseSupportFragment() {
                     //     restore from persisted prefs.
                     //  2. Items exist but player is paused in STATE_READY (service
                     //     survived a HOME press) → just resume in-place.
-                    if (isResumeEnabled() && !hasAttemptedResume) {
-                        when {
-                            controller.mediaItemCount == 0 -> {
-                                hasAttemptedResume = true
-                                resumeLastPlayed()
-                            }
-                            // Items already queued but not playing — resume in
-                            // place. STATE_BUFFERING is included so a stream that
-                            // is re-buffering after the app relaunches still gets
-                            // resumed instead of being left dead in the queue.
-                            controller.playbackState == androidx.media3.common.Player.STATE_IDLE -> {
-                                // Items queued but the player is idle (e.g. the
-                                // radio station errored and the service's
-                                // reconnect attempts ended there). Give it a
-                                // fresh prepare+play instead of leaving it dead.
-                                hasAttemptedResume = true
-                                controller.prepare()
-                                controller.play()
-                                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
-                            }
-                            !controller.isPlaying &&
-                            controller.playbackState != androidx.media3.common.Player.STATE_ENDED -> {
-                                hasAttemptedResume = true
-                                controller.play()
-                                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+                    //
+                    // Both wait for the USB DAC permission dialog the service
+                    // raises at start: resuming first configured the track
+                    // without the usbdevfs driver (fallback path) and Now Playing
+                    // opened over the still-unanswered dialog. The state is
+                    // re-read when the wait ends, since it may have changed.
+                    if (isResumeEnabled() && !hasAttemptedResume && !resumeAwaitingUsbPermission) {
+                        resumeAwaitingUsbPermission = true
+                        PlaybackService.runWhenUsbPermissionSettled {
+                            resumeAwaitingUsbPermission = false
+                            if (isAdded && view != null && controller.isConnected && !hasAttemptedResume) {
+                                autoResume(controller)
                             }
                         }
                     }
@@ -756,6 +745,35 @@ class MainFragment : BrowseSupportFragment() {
             }
         }
         view?.post(checkController)
+    }
+
+    private fun autoResume(controller: androidx.media3.session.MediaController) {
+        when {
+            controller.mediaItemCount == 0 -> {
+                hasAttemptedResume = true
+                resumeLastPlayed()
+            }
+            // Items already queued but not playing — resume in
+            // place. STATE_BUFFERING is included so a stream that
+            // is re-buffering after the app relaunches still gets
+            // resumed instead of being left dead in the queue.
+            controller.playbackState == androidx.media3.common.Player.STATE_IDLE -> {
+                // Items queued but the player is idle (e.g. the
+                // radio station errored and the service's
+                // reconnect attempts ended there). Give it a
+                // fresh prepare+play instead of leaving it dead.
+                hasAttemptedResume = true
+                controller.prepare()
+                controller.play()
+                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+            }
+            !controller.isPlaying &&
+            controller.playbackState != androidx.media3.common.Player.STATE_ENDED -> {
+                hasAttemptedResume = true
+                controller.play()
+                startActivity(android.content.Intent(requireContext(), NowPlayingActivity::class.java))
+            }
+        }
     }
 
     private fun createActionItem(title: String, description: String): MediaItem {
@@ -807,18 +825,7 @@ class MainFragment : BrowseSupportFragment() {
         return builder.build()
     }
 
-    private fun getMimeType(uri: String): String? {
-        val lower = uri.lowercase()
-        return when {
-            lower.endsWith(".flac") -> androidx.media3.common.MimeTypes.AUDIO_FLAC
-            lower.endsWith(".mp3") -> androidx.media3.common.MimeTypes.AUDIO_MPEG
-            lower.endsWith(".wav") -> androidx.media3.common.MimeTypes.AUDIO_WAV
-            lower.endsWith(".m4a") || lower.endsWith(".aac") -> androidx.media3.common.MimeTypes.AUDIO_AAC
-            lower.endsWith(".ogg") -> androidx.media3.common.MimeTypes.AUDIO_OGG
-            lower.endsWith(".ape") -> "audio/x-ape"
-            else -> null
-        }
-    }
+    private fun getMimeType(uri: String): String? = PlaylistParser.mimeTypeFor(uri)
 
     private fun setupEventListeners() {
         onItemViewClickedListener = OnItemViewClickedListener { _, item, _, row ->
@@ -827,7 +834,9 @@ class MainFragment : BrowseSupportFragment() {
                     handleAction(item.mediaId)
                 } else if (row is ListRow && row.headerItem.id == 6L) { // Playlists
                     if (item.mediaId.startsWith("smb://")) {
-                        val file = SmbFile(item.mediaId, SmbContext.get())
+                        // Use the share's own credentials: SmbContext.get() is the
+                        // anonymous base context, so an authenticated share failed here.
+                        val file = SmbFile(item.mediaId, SmbContext.getContextForUri(item.mediaId))
                         addSmbToPlaylist(file, replace = true)
                     } else if (item.mediaId.startsWith("content://")) {
                         addLocalToPlaylist(item.mediaId, item.mediaMetadata.title.toString(), replace = true)
@@ -1272,7 +1281,15 @@ class MainFragment : BrowseSupportFragment() {
             } else if (isInitialDir) {
                 scanRecursive(rootUri, true, name)
             } else {
-                itemsToAdd.add(createMediaItem(name, "", uriString))
+                // A single file picked from a SAF folder: read its tags like the
+                // per-file branch above, instead of queueing it with no metadata.
+                val meta = MetadataUtils.getMetadata(context, rootUri)
+                itemsToAdd.add(
+                    createMediaItem(
+                        meta.title ?: name, meta.artist ?: "", uriString,
+                        trackNumber = meta.trackNumber, discNumber = meta.discNumber
+                    )
+                )
             }
 
             activity?.runOnUiThread {
@@ -1947,9 +1964,24 @@ class MainFragment : BrowseSupportFragment() {
 
     /** Replaces only the USB DAC settings card subtitle without touching the rest of the row. */
     private fun updateUsbDacCard() {
+        replaceSettingsCard("USB DAC", getUsbDacStatus())
+    }
+
+    /**
+     * Replaces one Settings card's subtitle, finding the card by its title. The
+     * cards used to be addressed by hard-coded positions, and the "Debug Log" one
+     * (12) was off by one: updating it overwrote "USB Reset On Release" with a
+     * second Debug Log card.
+     */
+    private fun replaceSettingsCard(title: String, subtitle: String) {
         if (!::settingsAdapter.isInitialized) return
-        val newItem = createActionItem("USB DAC", getUsbDacStatus())
-        settingsAdapter.replace(SETTINGS_USB_DAC_INDEX, newItem)
+        val id = "action:$title"
+        for (i in 0 until settingsAdapter.size()) {
+            if ((settingsAdapter.get(i) as? MediaItem)?.mediaId == id) {
+                settingsAdapter.replace(i, createActionItem(title, subtitle))
+                return
+            }
+        }
     }
 
     private fun showUsbDacDialog() {
@@ -1969,6 +2001,8 @@ class MainFragment : BrowseSupportFragment() {
                 append("USB DAC connected\n\n")
                 append("Product: ${usbDac.productName ?: usbDac.deviceName}\n")
                 append("Vendor ID: 0x${usbDac.vendorId.toString(16).uppercase()}\n")
+                val usbManager = context.getSystemService(Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+                append("Permission: ${if (usbManager?.hasPermission(usbDac) == true) "granted" else "not granted yet"}\n")
                 if (audioDac != null) {
                     val rates = audioDac.sampleRates
                     if (rates.isNotEmpty()) append("Sample rates: ${rates.joinToString(", ")} Hz\n")
@@ -2009,19 +2043,27 @@ class MainFragment : BrowseSupportFragment() {
 
         val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         val resetOn = prefs.getBoolean("usb_reset_on_release", true)
+        val rememberOn = DacPermissionMemory.isEnabled(context)
+        val hostRebindOn = prefs.getBoolean("usb_host_rebind_on_exit", false)
         val items = listOf(
             DialogOptionItem("Reset Audio Sink", R.drawable.ic_dac),
             DialogOptionItem(
                 if (resetOn) "USB Reset On Release: Enabled"
                 else "USB Reset On Release: Disabled",
                 R.drawable.ic_dac
+            ),
+            DialogOptionItem(
+                if (rememberOn) "Remember DAC Permission: On"
+                else "Remember DAC Permission: Off",
+                R.drawable.ic_dac
+            ),
+            DialogOptionItem(
+                if (hostRebindOn) "Host Rebind: On (root)"
+                else "Host Rebind: Off (root)",
+                R.drawable.ic_dac
             )
         )
-        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("USB DAC")
-            .setIcon(R.drawable.ic_dac)
-            .setMessage(msg)
-            .setAdapter(DialogOptionAdapter(context, items)) { _, which ->
+        showMessageOptionsDialog("USB DAC", R.drawable.ic_dac, msg, items) { which ->
                 when (which) {
                     0 -> {
                         // Start the service if Android TV killed it while the UI was
@@ -2060,10 +2102,53 @@ class MainFragment : BrowseSupportFragment() {
                         refreshWithCurrentFocus()
                         showUsbDacDialog()
                     }
+                    2 -> {
+                        val next = !rememberOn
+                        DacPermissionMemory.setEnabled(context, next)
+                        AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                            .setTitle(if (next) "Remember DAC Permission: On" else "Remember DAC Permission: Off")
+                            .setIcon(R.drawable.ic_dac)
+                            .setMessage(
+                                if (next)
+                                    "Android can now remember this app for your DAC.\n\n" +
+                                        "The next time it asks for USB permission (or offers to open " +
+                                        "${getString(R.string.app_name)} when the DAC is connected), " +
+                                        "tick \"Always open ${getString(R.string.app_name)} when … is " +
+                                        "connected\" once. After that Android grants the DAC by itself " +
+                                        "every time it is switched on, replugged or re-enumerated.\n\n" +
+                                        "Only Android can store this choice — the app cannot tick it for you."
+                                else
+                                    "Android will no longer grant the DAC to this app automatically, " +
+                                        "and will not offer to open it when the DAC is connected.\n\n" +
+                                        "The USB permission will be asked for every time the DAC is " +
+                                        "switched on, replugged or re-enumerated."
+                            )
+                            .setPositiveButton("OK") { _, _ -> showUsbDacDialog() }
+                            .setOnCancelListener { showUsbDacDialog() }
+                            .show()
+                    }
+                    3 -> {
+                        val next = !hostRebindOn
+                        // commit(), not apply(): the monitor runs in a separate
+                        // process and reads this file immediately on start.
+                        prefs.edit().putBoolean("usb_host_rebind_on_exit", next).commit()
+                        // Start/stop the separate USB monitor with the setting.
+                        UsbRecoveryService.sync(context)
+                        Toast.makeText(
+                            context,
+                            if (next)
+                                "The app will re-enumerate the USB host controller when a " +
+                                    "USB attach leaves the DAC missing from Android audio " +
+                                    "(root; drops all USB devices)"
+                            else
+                                "Host-controller rebind disabled",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        refreshWithCurrentFocus()
+                        showUsbDacDialog()
+                    }
                 }
-            }
-            .setNegativeButton("Back", null)
-            .show()
+        }
     }
 
     // ── LAN Player Control ──────────────────────────────────────────────
@@ -2114,12 +2199,9 @@ class MainFragment : BrowseSupportFragment() {
     }
 
     private fun updateLanControlCard() {
-        if (!::settingsAdapter.isInitialized) return
-        // LAN index is 9 when inserted after USB DAC (7) and Audio Output (8)
-        val lanIndex = 9
-        if (lanIndex < settingsAdapter.size()) {
-            settingsAdapter.replace(lanIndex, createActionItem("LAN Player Control", getLanControlSubtitle()))
-        }
+        // Find the card by title like every other Settings refresh: a hard-coded index
+        // goes stale as soon as a card is added or removed above it.
+        replaceSettingsCard("LAN Player Control", getLanControlSubtitle())
     }
 
     private fun showLanControlDialog() {
@@ -2486,7 +2568,7 @@ class MainFragment : BrowseSupportFragment() {
         .getBoolean(KEY_RECENT, true)
 
     private fun isAutoScanEnabled() = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        .getBoolean(KEY_AUTO_SCAN, false)
+        .getBoolean(KEY_AUTO_SCAN, true)
 
     private fun getWaveformTypeName(): String {
         val types = arrayOf("Mirrored Bars", "Single Bars", "Bars with level hold", "Dots bars", "Dots bars with level holds")
@@ -2537,8 +2619,20 @@ class MainFragment : BrowseSupportFragment() {
             .setNegativeButton("Back", null)
             .create()
             .apply {
-                // Open with the active theme in view rather than at the top of a long list.
-                setOnShowListener { listView?.setSelection(themes.indexOfFirst { it.id == currentId }.coerceAtLeast(0)) }
+                // Open with the active theme in view, *centred*. setSelection() put it at
+                // the top, so with a Pure Black theme active (the default, near the end of
+                // the list) the dialog opened scrolled to the bottom showing only the
+                // seven Pure Black themes — the fourteen tinted ones were above, out of
+                // view, with nothing on screen to suggest the list scrolled up.
+                setOnShowListener {
+                    val lv = listView ?: return@setOnShowListener
+                    val index = themes.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+                    lv.setSelection(index)
+                    lv.post {
+                        val rowHeight = lv.getChildAt(0)?.height ?: 0
+                        lv.setSelectionFromTop(index, ((lv.height - rowHeight) / 2).coerceAtLeast(0))
+                    }
+                }
             }
             .show()
     }
@@ -2695,6 +2789,54 @@ class MainFragment : BrowseSupportFragment() {
             icon.drawable?.mutate()?.setTint(getThemeColor(context))
             return view
         }
+    }
+
+    /**
+     * A dialog with an explanatory message *and* a list of options.
+     *
+     * AlertDialog cannot show both: AlertController.setupContent() only adds the
+     * setAdapter() list when no message is set, so `setMessage(…).setAdapter(…)`
+     * showed the text and silently dropped every option — the Debug Log dialog had
+     * no "Share Over Wi-Fi" switch, and the USB DAC dialog none of its settings.
+     * Here the message is a non-focusable header of the options list instead, so
+     * it scrolls with them and D-pad focus starts on the first option.
+     */
+    private fun showMessageOptionsDialog(
+        title: String,
+        iconRes: Int?,
+        message: CharSequence,
+        items: List<DialogOptionItem>,
+        onPick: (Int) -> Unit
+    ) {
+        val ctx = requireContext()
+        val themed = android.view.ContextThemeWrapper(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        val density = ctx.resources.displayMetrics.density
+        val header = android.widget.TextView(themed).apply {
+            text = message
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+            setPadding((24 * density).toInt(), (8 * density).toInt(), (24 * density).toInt(), (12 * density).toInt())
+            isFocusable = false
+        }
+        val list = android.widget.ListView(themed).apply {
+            addHeaderView(header, null, false)
+            adapter = DialogOptionAdapter(ctx, items)
+        }
+        val builder = AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle(title)
+            .setView(list)
+            .setNegativeButton("Back", null)
+        iconRes?.let { builder.setIcon(it) }
+        val dialog = builder.create()
+        list.setOnItemClickListener { _, _, position, _ ->
+            val which = position - list.headerViewsCount
+            if (which in items.indices) {
+                dialog.dismiss()
+                onPick(which)
+            }
+        }
+        dialog.show()
+        // Focus the first option, not the (non-focusable) message header.
+        list.post { list.setSelection(list.headerViewsCount); list.requestFocus() }
     }
 
     data class DialogOptionItem(
@@ -2871,23 +3013,29 @@ class MainFragment : BrowseSupportFragment() {
                     val serverItems = foundIps.map { BrowseItem(it, it, R.drawable.ic_network, true) }
                     showBrowserDialog("Select SMB Server", BrowseAdapter(activity, serverItems), { which ->
                         val selectedIp = foundIps[which]
-                        showCredentialsDialog(selectedIp)
+                        // Keep the credentials the user typed for the scan: they were
+                        // dropped here, so the dialog came back empty and the share
+                        // could not be listed after selecting a server.
+                        showCredentialsDialog(selectedIp, user, pass)
                     }, onBack = { showAddSmbDialog() })
                 }
             }
         }.start()
     }
 
-    private fun showCredentialsDialog(ip: String) {
+    private fun showCredentialsDialog(ip: String, user: String = "", pass: String = "") {
         val activity = activity ?: return
         val view = LayoutInflater.from(activity).inflate(R.layout.dialog_add_smb, null)
         val editIp = view.findViewById<EditText>(R.id.edit_ip)
         val editShare = view.findViewById<EditText>(R.id.edit_share_name)
         val editUser = view.findViewById<EditText>(R.id.edit_username)
         val editPass = view.findViewById<EditText>(R.id.edit_password)
-        
+
         editIp.setText(ip)
         editIp.isEnabled = false // Lock IP
+        // Prefill what was used for the scan, so the user does not retype it.
+        if (user.isNotEmpty()) editUser.setText(user)
+        if (pass.isNotEmpty()) editPass.setText(pass)
 
         setupTvEditText(editShare)
         setupTvEditText(editUser)
@@ -3115,7 +3263,7 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun showScanLibraryMenu() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val autoScan = prefs.getBoolean(KEY_AUTO_SCAN, false)
+        val autoScan = prefs.getBoolean(KEY_AUTO_SCAN, true)
         val items = listOf(
             DialogOptionItem("Perform Library Scan Now", R.drawable.ic_scan_library),
             DialogOptionItem(
@@ -3151,7 +3299,9 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun toggleAutoScan() {
         val prefs = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val current = prefs.getBoolean(KEY_AUTO_SCAN, false)
+        // Same default as isAutoScanEnabled()/showScanLibraryMenu(), so the toggle
+        // flips the value the card actually displays when the pref was never written.
+        val current = prefs.getBoolean(KEY_AUTO_SCAN, true)
         prefs.edit { putBoolean(KEY_AUTO_SCAN, !current) }
         refreshWithCurrentFocus()
     }
@@ -3240,16 +3390,14 @@ class MainFragment : BrowseSupportFragment() {
 
     private fun getDebugLogSubtitle(): String {
         val ctx = requireContext()
-        if (!DebugLogServer.isEnabled(ctx)) return "Off — share over Wi-Fi"
+        if (!DebugLog.isEnabled(ctx)) return "Off"
+        if (!DebugLogServer.isEnabled(ctx)) return "On — ${DebugLog.lineCount()} lines, not shared"
         val port = DebugLogServer.getPort().takeIf { it > 0 } ?: DebugLogServer.getConfiguredPort(ctx)
         return "http://${getLocalIp()}:$port  (${DebugLog.lineCount()} lines)"
     }
 
     private fun updateDebugLogCard() {
-        if (!::settingsAdapter.isInitialized) return
-        if (SETTINGS_DEBUG_LOG_INDEX < settingsAdapter.size()) {
-            settingsAdapter.replace(SETTINGS_DEBUG_LOG_INDEX, createActionItem("Debug Log", getDebugLogSubtitle()))
-        }
+        replaceSettingsCard("Debug Log", getDebugLogSubtitle())
     }
 
     /**
@@ -3279,7 +3427,12 @@ class MainFragment : BrowseSupportFragment() {
                 append("Sharing: off\n")
             }
         }
+        val captureOn = DebugLog.isEnabled(ctx)
         val items = listOf(
+            DialogOptionItem(
+                if (captureOn) "Debug Log: On" else "Debug Log: Off",
+                R.drawable.ic_debug_log
+            ),
             DialogOptionItem(
                 if (enabled) "Share Over Wi-Fi: Enabled" else "Share Over Wi-Fi: Disabled",
                 R.drawable.ic_network_music
@@ -3287,13 +3440,26 @@ class MainFragment : BrowseSupportFragment() {
             DialogOptionItem("View Last 200 Lines", R.drawable.ic_history),
             DialogOptionItem("Clear Log", R.drawable.ic_clear_history)
         )
-        AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Debug Log")
-            .setMessage(message)
-            .setAdapter(DialogOptionAdapter(ctx, items)) { _, which ->
+        showMessageOptionsDialog("Debug Log", R.drawable.ic_debug_log, message, items) { which ->
                 when (which) {
                     0 -> {
+                        val on = !captureOn
+                        DebugLog.setEnabled(ctx, on)
+                        // Nothing new would reach a shared log, so stop sharing too.
+                        if (!on && DebugLogServer.isEnabled(ctx)) DebugLogServer.setEnabled(ctx, false)
+                        Toast.makeText(
+                            ctx,
+                            if (on) "Debug log on — capturing this app's log"
+                            else "Debug log off — capture stopped (existing lines kept until cleared)",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        updateDebugLogCard()
+                        showDebugLogDialog()
+                    }
+                    1 -> {
                         val on = !DebugLogServer.isEnabled(ctx)
+                        // Sharing an empty, stopped log is pointless: sharing turns capture on.
+                        if (on && !DebugLog.isEnabled(ctx)) DebugLog.setEnabled(ctx, true)
                         DebugLogServer.setEnabled(ctx, on)
                         Toast.makeText(
                             ctx,
@@ -3303,17 +3469,15 @@ class MainFragment : BrowseSupportFragment() {
                         updateDebugLogCard()
                         showDebugLogDialog()
                     }
-                    1 -> showDebugLogViewer()
-                    2 -> {
+                    2 -> showDebugLogViewer()
+                    3 -> {
                         DebugLog.clear()
                         Toast.makeText(ctx, "Debug log cleared", Toast.LENGTH_SHORT).show()
                         updateDebugLogCard()
                         showDebugLogDialog()
                     }
                 }
-            }
-            .setNegativeButton("Back", null)
-            .show()
+        }
     }
 
     private fun showDebugLogViewer() {

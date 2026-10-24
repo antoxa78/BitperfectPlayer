@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <usb-device class="1" />
+    <!-- UAC2 AudioControl / AudioStreaming only (protocol 0x20).
+         Do NOT use class="1" alone: input-only UAC1 devices (such as a TV
+         remote's USB microphone) have class 1 interfaces too, so Android would
+         offer Bitperfect Player for them on every attach. UAC1 DACs still work
+         through the app's own detection and permission request; they just do
+         not get Android's permanent "Always open" attach prompt.
+
+         DAC recovery after an unrelated USB attach is handled by the separate
+         UsbRecoveryService foreground service, not by this activity. -->
+    <usb-device class="1" subclass="1" protocol="32" />
+    <usb-device class="1" subclass="2" protocol="32" />
 </resources>

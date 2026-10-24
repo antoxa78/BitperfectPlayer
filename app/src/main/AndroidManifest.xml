@@ -4,11 +4,15 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Normal permission; also satisfies Android 14's runtime prerequisite for
+         the connectedDevice foreground-service type used by UsbRecoveryService. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -53,6 +57,22 @@
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
+        </activity>
+
+        <!-- USB DAC attach handler. Its intent filter is what lets Android offer
+             "Always open Bitperfect Player when <DAC> is connected" and then grant
+             the DAC on every reconnect without asking. Invisible: opens the UI only
+             when the app is not running. Enabled/disabled at runtime by
+             Settings → USB DAC → Remember DAC Permission (DacPermissionMemory). -->
+        <activity
+            android:name=".UsbAttachActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:label="@string/app_name"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>
@@ -65,6 +85,18 @@
             android:name=".NowPlayingActivity"
             android:screenOrientation="landscape"
             android:theme="@style/Theme.Leanback" />
+
+        <!-- Small foreground monitor in its own process: survives PlaybackService's
+             Exit/System.exit, listens for USB attaches, and restores the DAC if
+             Android's AudioPolicy lost its USB output. Started only while the
+             Host Rebind setting is on. -->
+        <service
+            android:name=".UsbRecoveryService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            android:process=":usbmonitor"
+            android:stopWithTask="false" />
 
         <service
             android:name=".PlaybackService"

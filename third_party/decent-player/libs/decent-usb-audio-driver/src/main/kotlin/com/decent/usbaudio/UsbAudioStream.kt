@@ -170,9 +170,9 @@ class UsbAudioStream(
      *
      * @return Number of URBs successfully drained
      */
-    fun drainUrbs(): Int {
+    fun drainUrbs(discardPending: Boolean = true): Int {
         if (nativeHandle == 0L) return 0
-        return nativeDrainUrbs(nativeHandle)
+        return nativeDrainUrbs(nativeHandle, discardPending)
     }
 
     /**
@@ -199,7 +199,7 @@ class UsbAudioStream(
     private external fun nativeUsbAudioWriteRaw(handle: Long, pcmBuffer: ByteArray, inputBitDepth: Int)
     private external fun nativeUsbAudioStop(handle: Long)
     private external fun nativeFlush(handle: Long)
-    private external fun nativeDrainUrbs(handle: Long): Int
+    private external fun nativeDrainUrbs(handle: Long, discardPending: Boolean): Int
     private external fun nativeUsbAudioDestroy(handle: Long)
     private external fun nativeIsRunning(handle: Long): Boolean
     private external fun nativeGetFramesWritten(handle: Long): Long

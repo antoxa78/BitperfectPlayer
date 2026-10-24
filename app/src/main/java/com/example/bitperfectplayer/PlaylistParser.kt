@@ -223,7 +223,9 @@ object PlaylistParser {
     private fun parseEntryUri(uriString: String, basePath: String?): Uri? = try {
         when {
             uriString.startsWith("/")          -> Uri.fromFile(java.io.File(uriString))
-            uriString.startsWith("file://")    -> Uri.fromFile(java.io.File(uriString.substring(7)))
+            // Decode: a file:// entry written by Uri.fromFile() percent-escapes spaces,
+            // and File(...) would otherwise look for a literal "%20" in the name.
+            uriString.startsWith("file://")    -> Uri.fromFile(java.io.File(decodeFilePath(uriString)))
             uriString.startsWith("content://") ||
             uriString.startsWith("http://")    ||
             uriString.startsWith("https://")   ||
@@ -233,6 +235,10 @@ object PlaylistParser {
             else -> null
         }
     } catch (e: Exception) { null }
+
+    /** Filesystem path of a file:// URI, percent-decoded. */
+    private fun decodeFilePath(uriString: String): String =
+        uriString.toUri().path ?: uriString.substring(7)
 
     fun mimeTypeFor(uriString: String): String? {
         val lower = uriString.lowercase()

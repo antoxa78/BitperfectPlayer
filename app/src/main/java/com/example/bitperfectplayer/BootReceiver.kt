@@ -12,6 +12,9 @@ class BootReceiver : BroadcastReceiver() {
         // If the app died while it had Android TV's inattentive-sleep timer
         // suspended for playback, put the user's setting back now.
         PlaybackService.restoreAttentiveSleep(context, "boot")
+        // Restart the USB DAC monitor if the Host Rebind setting is on. This is
+        // independent of MPD autostart and must run before the early return below.
+        UsbRecoveryService.sync(context)
         val prefs = context.getSharedPreferences("AppSettings", Context.MODE_PRIVATE)
         val autostart = prefs.getBoolean("mpd_autostart", false)
         val enabled = prefs.getBoolean("mpd_enabled", true)

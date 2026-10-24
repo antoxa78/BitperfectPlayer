@@ -5,11 +5,14 @@ import android.net.Uri
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.DataReader
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.ParserException
 import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.source.ProgressiveMediaExtractor
+import androidx.media3.extractor.DefaultExtractorInput
 import androidx.media3.extractor.Extractor
 import androidx.media3.extractor.ExtractorInput
 import androidx.media3.extractor.ExtractorOutput
@@ -76,13 +79,18 @@ class WavPackExtractor(
     /** Config of the first open, replayed onto decoders reopened mid-file. */
     private var savedConfig: WavpackConfig? = null
 
-    /** Byte offset to restart the decoder at, or -1 when not restarting. */
-    private var pendingOffset = -1L
     /** Sample the restarted decoder should land on, or -1 to decode from there. */
     private var pendingSample = -1L
+    /** A seek requested before the decoder (and its sample rate) was open, or -1.
+     *  Media3 calls [seek] right after [init] on a fresh load, so a seek resolved
+     *  there would be dropped and the file would play from 0:00. */
+    private var pendingSeekTimeUs = -1L
 
     private val index = BlockIndexTracker()
     private var fileLength: Long = -1L
+
+    /** Bytes produced by the most recent [read] (for [WavPackProgressiveMediaExtractor]). */
+    @Volatile private var lastReadBytes = 0
 
     // ── scratch ────────────────────────────────────────────────────────────
     private var decodeBuf = IntArray(0)
@@ -113,16 +121,17 @@ class WavPackExtractor(
     }
 
     override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
+        lastReadBytes = 0
         if (fileLength < 0) fileLength = access.length()
 
-        if (pendingOffset >= 0) {
-            closeDecoder()
-            openDecoder(pendingOffset)
-            pendingOffset = -1L
-        }
         if (ctx == null) openDecoder(0L)
         if (!tracksPublished) publishTracks()
         val track = trackOutput ?: return Extractor.RESULT_END_OF_INPUT
+
+        // A seek that arrived before the decoder was open is applied now, when the
+        // sample rate is finally known (see [seek]). This reopens the decoder, so `ctx`
+        // must be read after it (the previous instance is closed and freed).
+        applyPendingSeek()
         val c = ctx ?: return Extractor.RESULT_END_OF_INPUT
 
         // Land on the sample a seek asked for, if we are not already past it.
@@ -159,20 +168,40 @@ class WavPackExtractor(
         track.sampleData(ParsableByteArray(pcmBuf, size), size)
         // Raw PCM is all-sync: without KEY_FRAME the sample queue drops everything.
         track.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, size, 0, null)
+        lastReadBytes = size
         return Extractor.RESULT_CONTINUE
     }
 
     override fun seek(position: Long, timeUs: Long) {
         // `position` is Media3's guess at a byte offset and is meaningless here, because
         // this extractor reads through its own seekable source. timeUs is authoritative.
-        val sample = if (sampleRate > 0) timeUs * sampleRate / 1_000_000L else -1L
-        if (sample < 0) {
-            pendingOffset = position
-            pendingSample = -1L
-        } else {
-            pendingOffset = index.offsetForSample(access, fileLength, sample)
-            pendingSample = sample
+        //
+        // The target is always stored and applied from read(): media3 calls seek() right
+        // after init() on a fresh load, before the decoder is open, so `sampleRate` is
+        // still 0 here. Resolving it now would throw the seek away — a resumed file or a
+        // CUE track would decode from 0:00 to the target instead of seeking to it.
+        pendingSeekTimeUs = timeUs.coerceAtLeast(0L)
+        pendingSample = -1L
+    }
+
+    /** Applies [pendingSeekTimeUs] once the decoder is open and its rate is known. */
+    private fun applyPendingSeek() {
+        val timeUs = pendingSeekTimeUs
+        if (timeUs < 0 || sampleRate <= 0) return
+        val sample = timeUs * sampleRate / 1_000_000L
+        val c = ctx ?: return
+        if (sample <= 0 || WavpackUtils.WavpackGetSampleIndex(c) == sample) {
+            pendingSeekTimeUs = -1L
+            return
         }
+        // Resolve the boundary first: it reads the file and may fail with an IOException,
+        // which media3 retries. The request stays pending until the reopen succeeded, so
+        // the retry still seeks (the same reason SACD keeps its pending seek).
+        val offset = index.offsetForSample(access, fileLength, sample)
+        closeDecoder()
+        openDecoder(offset)
+        pendingSeekTimeUs = -1L
+        pendingSample = sample
     }
 
     override fun release() {
@@ -181,6 +210,15 @@ class WavPackExtractor(
         trackOutput = null
         tracksPublished = false
         index.reset()
+        pendingSeekTimeUs = -1L
+        lastReadBytes = 0
+    }
+
+    /** Bytes produced by the most recent [read]; consumed by the media-extractor wrapper. */
+    fun takeLastReadBytes(): Int {
+        val b = lastReadBytes
+        lastReadBytes = 0
+        return b
     }
 
     // ── opening / closing ──────────────────────────────────────────────────
@@ -387,6 +425,76 @@ class WavPackExtractor(
             val s = uriString?.substringBefore('?')?.lowercase() ?: return false
             return s.endsWith(".wv") || s.endsWith(".wvp")
         }
+    }
+}
+
+/**
+ * [ProgressiveMediaExtractor] wrapper for [WavPackExtractor].
+ *
+ * The extractor decodes through its own seekable [SacdRandomAccess] and never consumes
+ * bytes from the pass-through [DataSource], so Media3's input position would stay at 0.
+ * [ProgressiveMediaPeriod] only closes its load throttle once
+ * `currentInputPosition > position + continueLoadingCheckIntervalBytes`, so without an
+ * advancing position the loader would decode the whole file into memory in one go,
+ * ignoring [androidx.media3.exoplayer.LoadControl].
+ *
+ * Advancing the reported position by the size of each produced sample turns the loader
+ * into a pull-driven reader, exactly like [SacdProgressiveMediaExtractor] does for SACD
+ * ISOs. This wrapper also owns the [SacdRandomAccess] and closes it in [release], and it
+ * keeps one extractor across reloads/seek retries (media3 calls `init()` for each).
+ */
+@OptIn(UnstableApi::class)
+internal class WavPackProgressiveMediaExtractor(
+    private val access: SacdRandomAccess,
+) : ProgressiveMediaExtractor {
+
+    private var extractor: WavPackExtractor? = null
+    private var input: ExtractorInput? = null
+    private var inputPosition = 0L
+    private var released = false
+
+    override fun init(
+        dataReader: DataReader,
+        uri: Uri,
+        responseHeaders: Map<String, List<String>>,
+        position: Long,
+        length: Long,
+        output: ExtractorOutput,
+    ) {
+        input = DefaultExtractorInput(dataReader, position, length)
+        inputPosition = position
+        if (extractor == null) {
+            extractor = WavPackExtractor(access).also { it.init(output) }
+        }
+    }
+
+    override fun release() {
+        if (released) return
+        released = true
+        extractor?.release()
+        extractor = null
+        input = null
+        try { access.close() } catch (_: Exception) {}
+    }
+
+    override fun disableSeekingOnMp3Streams() {
+        // Not applicable: WavPack output is decoded, not demuxed.
+    }
+
+    override fun getCurrentInputPosition(): Long = inputPosition
+
+    override fun seek(position: Long, seekTimeUs: Long) {
+        inputPosition = position
+        extractor?.seek(position, seekTimeUs)
+    }
+
+    override fun read(positionHolder: PositionHolder): Int {
+        val e = extractor ?: return Extractor.RESULT_END_OF_INPUT
+        val i = input ?: return Extractor.RESULT_END_OF_INPUT
+        val result = e.read(i, positionHolder)
+        val produced = e.takeLastReadBytes()
+        if (produced > 0) inputPosition += produced
+        return result
     }
 }
 

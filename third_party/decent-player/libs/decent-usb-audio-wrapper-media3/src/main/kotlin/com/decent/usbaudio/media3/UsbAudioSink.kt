@@ -343,11 +343,15 @@ class UsbAudioSink(
                 // BitPerfectAudioSink can route via the system audio stack instead
                 // of pinning the delegate to the speaker with no USB stream to use.
                 Log.w(TAG, "USB stream creation failed — falling back to system audio")
-            } else if (device != null) {
+            } else if (device != null && config.requestPermissionOnConfigure) {
                 Log.w(TAG, "USB DAC found but no permission — requesting")
                 usbAudioDevice.requestPermission(device) { granted ->
                     Log.i(TAG, "USB permission result for bit-perfect streaming: granted=$granted")
                 }
+            } else if (device != null) {
+                // The host owns the permission request (see
+                // UsbAudioSinkConfig.requestPermissionOnConfigure).
+                Log.w(TAG, "USB DAC found but no permission — using system audio for this track")
             }
         }
 
@@ -1026,7 +1030,7 @@ class UsbAudioSink(
      * Duplicate calls while a release is in flight are skipped — configure()
      * waits for any in-flight release before re-opening the device.
      */
-    fun releaseUsbForIdle() {
+    fun releaseUsbForIdle(skipDrain: Boolean = false) {
         // Atomic acquire: only ONE idle release may ever run. Concurrent callers
         // (pause path + STATE_IDLE + screen-off are different threads) must not
         // spawn parallel release threads that both USBDEVFS_RESET the same DAC.
@@ -1046,7 +1050,7 @@ class UsbAudioSink(
         }
         val th = Thread({
             try {
-                releaseUsbStream()
+                releaseUsbStream(skipDrain)
                 try {
                     // Restore the DAC's clock to its default idle rate BEFORE
                     // the soft-replug. A UAC2 clock-source rate persists across
@@ -1085,7 +1089,7 @@ class UsbAudioSink(
         th.start()
     }
 
-    private fun releaseUsbStream() {
+    private fun releaseUsbStream(skipDrain: Boolean = false) {
         val stream = usbAudioStream ?: return
         usbAudioStream = null
         onDriverOwnsUsbDeviceChanged?.invoke(false)
@@ -1108,9 +1112,13 @@ class UsbAudioSink(
         usbStreamingThread?.stop()
         usbStreamingThread = null
 
-        // Drain ALL in-flight URBs — MUST complete before setAlt(0)
-        val drained = stream.drainUrbs()
-        Log.i(TAG, "USB stream drained $drained URBs")
+        // Drain ALL in-flight URBs — MUST complete before setAlt(0). The exit
+        // path skips the blocking DISCARDURB phase: on the Amlogic kernel that
+        // call can hang forever when the last URB has already completed, which
+        // left the DAC claimed after Exit. Its USBDEVFS_RESET/close aborts any
+        // URBs still pending instead.
+        val drained = stream.drainUrbs(discardPending = !skipDrain)
+        Log.i(TAG, "USB stream drained $drained URBs (skipDrain=$skipDrain)")
 
         // Release native context
         stream.release()
@@ -1232,7 +1240,7 @@ class UsbAudioSink(
             val engineFinished = cleanupFinishedEngine()
 
             // 2. Resolve file path from URI
-            val resolvedPath = resolveTrackPath(uri)
+            val resolvedPath = resolveTrackPath(mediaItem)
             currentTrackPath = resolvedPath
             Log.i(TAG, "onMediaItemTransition: uri=$uri path=$resolvedPath")
 
@@ -1295,7 +1303,7 @@ class UsbAudioSink(
         val index = if (p.repeatMode == Player.REPEAT_MODE_ONE) p.currentMediaItemIndex
                     else p.nextMediaItemIndex
         val path = if (index != C.INDEX_UNSET && index < p.mediaItemCount) {
-            resolveTrackPath(p.getMediaItemAt(index).localConfiguration?.uri)
+            resolveTrackPath(p.getMediaItemAt(index))
         } else null
         if (path == null || !path.lowercase().endsWith(".flac")) {
             if (queuedNextPath != null) {
@@ -1341,7 +1349,7 @@ class UsbAudioSink(
         val p = attachedPlayer ?: run { gaplessAdvanceInFlight = false; return }
         mainHandler.post {
             val stillThere = index != C.INDEX_UNSET && index < p.mediaItemCount &&
-                resolveTrackPath(p.getMediaItemAt(index).localConfiguration?.uri) == path
+                resolveTrackPath(p.getMediaItemAt(index)) == path
             if (stillThere) {
                 p.seekTo(index, 0L)
                 // Repeat-one re-seeks the same item, which fires no transition
@@ -1371,6 +1379,30 @@ class UsbAudioSink(
             p.hasNextMediaItem() -> p.seekToNextMediaItem()
             else -> p.pause()
         }
+    }
+
+    /**
+     * Resolve a [MediaItem]'s URI to a local file path for the native engine.
+     *
+     * Returns null for clipped items (CUE sheets and any other sliced track). The native
+     * engine addresses a file by byte offset and knows nothing about the Media3 timeline,
+     * so it cannot honour `startPositionMs`/`endPositionMs`: it would play the whole file
+     * from 0:00 on every track and never stop at the clip's end. Those items stay on
+     * ExoPlayer's ClippingMediaSource, whose integer PCM still reaches the DAC through
+     * [UsbStreamingThread] — bit-perfect, just without the native FLAC engine.
+     */
+    private fun resolveTrackPath(mediaItem: MediaItem?): String? {
+        if (mediaItem == null) return null
+        val clip = mediaItem.clippingConfiguration
+        // "No end" in ClippingConfiguration is C.TIME_END_OF_SOURCE (Long.MIN_VALUE),
+        // not C.TIME_UNSET (Long.MIN_VALUE + 1): comparing against the latter marked every
+        // item as clipped and silently disabled the native FLAC engine for all local files.
+        if (clip.startPositionMs > 0L || clip.endPositionMs != C.TIME_END_OF_SOURCE) {
+            Log.i(TAG, "resolveTrackPath: clipped item (start=${clip.startPositionMs}ms, " +
+                "end=${clip.endPositionMs}) → ExoPlayer pipeline")
+            return null
+        }
+        return resolveTrackPath(mediaItem.localConfiguration?.uri)
     }
 
     /**

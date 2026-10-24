@@ -32,8 +32,73 @@ private fun View.dp(value: Float): Int =
     TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics).toInt()
 
 /**
- * Replaces Leanback's plain title text with the app logo and a "BitPerfect / PLAYER" wordmark
- * whose second half is drawn in the theme accent, echoing the launcher banner.
+ * The app's brand mark: the cat logo next to a "Bitperfect / PLAYER" wordmark whose second
+ * half is drawn in the theme accent, echoing the launcher banner. Shared by the main menu's
+ * title ([BrandTitleView]) and the Now Playing screen, so both show the same mark.
+ * Not focusable and hidden from accessibility (it is decoration).
+ */
+class BrandMark(context: Context) : LinearLayout(context) {
+
+    private val wordmark = TextView(context)
+    private val tagline = TextView(context)
+
+    init {
+        orientation = HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        isFocusable = false
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+
+        val logo = ImageView(context).apply {
+            setImageResource(R.mipmap.ic_launcher_cat)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = null
+        }
+        addView(logo, LayoutParams(dp(52f), dp(52f)).apply { marginEnd = dp(10f) })
+
+        val words = LinearLayout(context).apply { orientation = VERTICAL }
+        wordmark.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            includeFontPadding = false
+            maxLines = 1
+        }
+        tagline.apply {
+            text = "PLAYER"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.42f
+            setTextColor(0xFFB0B0B0.toInt())
+            includeFontPadding = false
+        }
+        // Explicit WRAP_CONTENT: a vertical LinearLayout's default child params are
+        // MATCH_PARENT wide, and in a wrap_content column that means "as wide as the
+        // widest *other* child" — the "PLAYER" tagline. The wordmark was measured to
+        // that width and, being maxLines = 1, drawn cut off as "Bitper".
+        words.addView(wordmark, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        words.addView(tagline, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(3f) })
+        addView(words)
+
+        applyTheme(ColorThemes.current(context))
+    }
+
+    /** Recolours the accent half of the wordmark and the tagline. */
+    internal fun applyTheme(theme: ColorThemes.Theme) {
+        wordmark.text = SpannableStringBuilder("Bitperfect").apply {
+            setSpan(ForegroundColorSpan(theme.accent), 3, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        tagline.setTextColor(theme.cardSubtitle)
+    }
+
+    companion object {
+        /** Insets from the screen's top and end edges, the same on every screen that shows the mark. */
+        const val TOP_INSET_DP = 22f
+        const val END_INSET_DP = 48f
+    }
+}
+
+/**
+ * Replaces Leanback's plain title text with the [BrandMark].
  *
  * Installed through [MainFragment.onInflateTitleView]; it carries the
  * `browse_title_group` id and implements [TitleViewAdapter.Provider], which is all
@@ -42,9 +107,7 @@ private fun View.dp(value: Float): Int =
  */
 class BrandTitleView(context: Context) : LinearLayout(context), TitleViewAdapter.Provider {
 
-    private val wordmark = TextView(context)
-    private val tagline = TextView(context)
-    private val branding = LinearLayout(context)
+    private val branding = BrandMark(context)
     private val hiddenSearch = View(context).apply { visibility = View.GONE }
 
     private val titleAdapter = object : TitleViewAdapter() {
@@ -64,51 +127,14 @@ class BrandTitleView(context: Context) : LinearLayout(context), TitleViewAdapter
         orientation = HORIZONTAL
         gravity = Gravity.END or Gravity.CENTER_VERTICAL
         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        setPadding(dp(48f), dp(22f), dp(48f), 0)
-
-        branding.orientation = HORIZONTAL
-        branding.gravity = Gravity.CENTER_VERTICAL
-
-        val logo = ImageView(context).apply {
-            setImageResource(R.mipmap.ic_launcher_cat)
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            contentDescription = null
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
-        branding.addView(logo, LayoutParams(dp(52f), dp(52f)).apply { marginEnd = dp(10f) })
-
-        val words = LinearLayout(context).apply { orientation = VERTICAL }
-        wordmark.apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            includeFontPadding = false
-            maxLines = 1
-        }
-        tagline.apply {
-            text = "PLAYER"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            letterSpacing = 0.42f
-            setTextColor(0xFFB0B0B0.toInt())
-            includeFontPadding = false
-        }
-        words.addView(wordmark)
-        words.addView(tagline, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(3f) })
-        branding.addView(words)
+        setPadding(dp(BrandMark.END_INSET_DP), dp(BrandMark.TOP_INSET_DP), dp(BrandMark.END_INSET_DP), 0)
 
         addView(branding)
         addView(hiddenSearch)
-        applyTheme(ColorThemes.current(context))
     }
 
-    /** Recolours the accent half of the wordmark. */
-    internal fun applyTheme(theme: ColorThemes.Theme) {
-        wordmark.text = SpannableStringBuilder("BitPerfect").apply {
-            setSpan(ForegroundColorSpan(theme.accent), 3, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        }
-        tagline.setTextColor(theme.cardSubtitle)
-    }
+    /** Recolours the brand mark for a new theme. */
+    internal fun applyTheme(theme: ColorThemes.Theme) = branding.applyTheme(theme)
 
     override fun getTitleViewAdapter(): TitleViewAdapter = titleAdapter
 }

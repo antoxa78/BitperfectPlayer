@@ -279,7 +279,13 @@ class MpdServer(private val context: Context) {
         val latch = CountDownLatch(1)
         mainHandler.post { try { res = block(c) } catch (t: Throwable) { err = t } finally { latch.countDown() } }
         if (!latch.await(HOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)) throw MpdAck(ACK_SYSTEM, "player busy")
-        err?.let { e -> if (e is MpdAck) throw e else throw MpdAck(ACK_SYSTEM, e.message ?: "error") }
+        err?.let { e ->
+            if (e is MpdAck) throw e
+            // Without this the client only sees "ACK 52 error"; the real cause (a listener
+            // throwing during the player call, for example) would be swallowed.
+            Log.w(TAG, "MPD command failed on the main thread", e)
+            throw MpdAck(ACK_SYSTEM, e.message ?: e.javaClass.simpleName)
+        }
         @Suppress("UNCHECKED_CAST") return res as T
     }
 
@@ -437,9 +443,9 @@ class MpdServer(private val context: Context) {
                                 // "unexpected response: OK" (BUG).
                                 if (okEach && binaryResponseSent.get() != true) send(writer, "list_OK")
                             }
+                            catch (_: CloseSignal) { sock.close(); return }
                             catch (e: MpdAck) { sendAck(writer, idx, lineToken(line), e); hadError = true }
                             catch (e: Exception) { sendAck(writer, idx, lineToken(line), MpdAck(ACK_ERROR, e.message ?: "error")); hadError = true }
-                            catch (_: CloseSignal) { sock.close(); return }
                         }
                         // command_list_begin → single "OK"; command_list_ok_begin →
                         // final "OK" after the per-command "list_OK" responses.
@@ -449,12 +455,12 @@ class MpdServer(private val context: Context) {
                     binaryResponseSent.set(false)
                     try {
                         execLine(raw, writer, reader)
-                        if (idleConsumedCommand.get()) idleConsumedCommand.set(false)
+                        if (idleConsumedCommand.get() == true) idleConsumedCommand.set(false)
                         else if (binaryResponseSent.get() != true) send(writer, "OK")
                     }
+                    catch (_: CloseSignal) { break }
                     catch (e: MpdAck) { sendAck(writer, 0, lineToken(raw), e) }
                     catch (e: Exception) { sendAck(writer, 0, lineToken(raw), MpdAck(ACK_ERROR, e.message ?: "error")) }
-                    catch (_: CloseSignal) { break }
                 }
             } catch (e: Exception) { if (running) Log.d(TAG, "client: ${e.message}") }
             finally {
@@ -504,13 +510,13 @@ class MpdServer(private val context: Context) {
 
     // Per-connection auth flag is stored in Client; execLine checks it via helper below.
     // We pass authenticated state via ThreadLocal for simplicity (each Client thread has its own).
-    private val clientAuth = ThreadLocal.withInitial { false }
+    private val clientAuth: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
     private val clientSocket = ThreadLocal<Socket>()
-    private val binaryResponseSent = ThreadLocal.withInitial { false }
+    private val binaryResponseSent: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
     // Set when an idle session consumed a command sent on the same connection;
     // the client loop must then skip its trailing "OK" so the client never sees
     // a double response (BUG: corrupted response stream).
-    private val idleConsumedCommand = ThreadLocal.withInitial { false }
+    private val idleConsumedCommand: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
 
     @Throws(MpdAck::class, CloseSignal::class)
     private fun execLine(line: String, writer: BufferedWriter, reader: BufferedReader? = null) {
@@ -599,6 +605,10 @@ class MpdServer(private val context: Context) {
                                     val cmdTok = try { tokenize(peek).firstOrNull() ?: "" } catch (_: Exception) { "" }
                                     sendAck(writer, 0, cmdTok, e)
                                     idleConsumedCommand.set(true)
+                                } catch (_: CloseSignal) {
+                                    // Let `close` sent during idle actually close the
+                                    // connection; the generic catch below swallowed it.
+                                    throw CloseSignal
                                 } catch (_: Exception) {}
                                 idleWaiters.remove(waiter)
                                 break
@@ -645,7 +655,19 @@ class MpdServer(private val context: Context) {
             "playlistid" -> writePlaylistId(args, out)
             "plchanges", "plchangesposid" -> writePlChanges(args, out, posOnly = cmd == "plchangesposid")
             "play" -> { val p = args.firstOrNull()?.toIntOrNull(); hop { c -> if (p != null) { if (c.playbackState == Player.STATE_IDLE) c.prepare(); c.seekTo(p, 0); c.play() } else { if (c.playbackState == Player.STATE_IDLE) c.prepare(); c.play() } } }
-            "playid" -> { val id = args.firstOrNull()?.toIntOrNull() ?: throw MpdAck(ACK_ARG, "need id"); val pos = posOfId(id); if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song"); hop { c -> if (c.playbackState == Player.STATE_IDLE) c.prepare(); c.seekTo(pos, 0); c.play() } }
+            "playid" -> {
+                val id = args.firstOrNull()?.toIntOrNull() ?: throw MpdAck(ACK_ARG, "need id")
+                // Sync inside the hop: songIds is only reconciled with the player's
+                // timeline there, and a stale list resolves the id to another song.
+                hop { c ->
+                    syncIdsIfNeeded(c)
+                    val pos = posOfId(id)
+                    if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
+                    if (c.playbackState == Player.STATE_IDLE) c.prepare()
+                    c.seekTo(pos, 0)
+                    c.play()
+                }
+            }
             "pause" -> {
                 val v = args.firstOrNull()
                 hop { c -> when (v) { null -> if (c.isPlaying) c.pause() else { if (c.playbackState == Player.STATE_IDLE) c.prepare(); c.play() }; "0" -> { if (c.playbackState == Player.STATE_IDLE) c.prepare(); c.play() }; "1" -> c.pause(); else -> throw MpdAck(ACK_ARG, "bad pause arg") } }
@@ -662,9 +684,13 @@ class MpdServer(private val context: Context) {
             "seekid" -> {
                 if (args.size < 2) throw MpdAck(ACK_ARG, "need id and time")
                 val id = args[0].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad id")
-                val pos = posOfId(id); if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
                 val secs = args[1].toDoubleOrNull() ?: throw MpdAck(ACK_ARG, "bad time")
-                hop { it.seekTo(pos, (secs * 1000).toLong()) }
+                hop { c ->
+                    syncIdsIfNeeded(c)
+                    val pos = posOfId(id)
+                    if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
+                    c.seekTo(pos, (secs * 1000).toLong())
+                }
             }
             "seekcur" -> {
                 if (args.isEmpty()) throw MpdAck(ACK_ARG, "need time")
@@ -706,13 +732,22 @@ class MpdServer(private val context: Context) {
                 hop { c ->
                     val f = from.coerceIn(0, c.mediaItemCount)
                     val u = until.coerceIn(f, c.mediaItemCount)
-                    if (f < u) c.removeMediaItems(f, u - f)
+                    // Player.removeMediaItems(fromIndex, toIndex) is an exclusive range,
+                    // not (index, count): passing u - f removed the wrong span (or threw
+                    // for any range not starting at 0).
+                    if (f < u) c.removeMediaItems(f, u)
                 }
             }
             "deleteid" -> {
                 val id = args.firstOrNull()?.toIntOrNull() ?: throw MpdAck(ACK_ARG, "need id")
-                val pos = posOfId(id); if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
-                hop { it.removeMediaItems(pos, 1) }
+                hop { c ->
+                    syncIdsIfNeeded(c)
+                    val pos = posOfId(id)
+                    if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
+                    // Exclusive range: (pos, 1) meant "from 22 to 1" and threw for any
+                    // entry past the first position.
+                    c.removeMediaItems(pos, pos + 1)
+                }
             }
             "move" -> {
                 if (args.size < 2) throw MpdAck(ACK_ARG, "need from and to")
@@ -723,9 +758,13 @@ class MpdServer(private val context: Context) {
             "moveid" -> {
                 if (args.size < 2) throw MpdAck(ACK_ARG, "need id and to")
                 val id = args[0].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad id")
-                val pos = posOfId(id); if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
                 val to = args[1].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad to")
-                hop { it.moveMediaItems(pos, pos + 1, to) }
+                hop { c ->
+                    syncIdsIfNeeded(c)
+                    val pos = posOfId(id)
+                    if (pos < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
+                    c.moveMediaItems(pos, pos + 1, to)
+                }
             }
             "swap" -> {
                 if (args.size < 2) throw MpdAck(ACK_ARG, "need two positions")
@@ -747,10 +786,13 @@ class MpdServer(private val context: Context) {
             }
             "swapid" -> {
                 if (args.size < 2) throw MpdAck(ACK_ARG, "need two ids")
-                val a = posOfId(args[0].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad id"))
-                val b = posOfId(args[1].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad id"))
-                if (a < 0 || b < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
+                val idA = args[0].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad id")
+                val idB = args[1].toIntOrNull() ?: throw MpdAck(ACK_ARG, "bad id")
                 hop { c ->
+                    syncIdsIfNeeded(c)
+                    val a = posOfId(idA)
+                    val b = posOfId(idB)
+                    if (a < 0 || b < 0) throw MpdAck(ACK_NO_EXIST, "No such song")
                     if (a == b) return@hop
                     if (a < b) { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b - 1, b, a) }
                     else       { c.moveMediaItems(a, a + 1, b); c.moveMediaItems(b + 1, b + 2, a) }
@@ -823,6 +865,10 @@ class MpdServer(private val context: Context) {
     }
 
     private fun getArtworkBytes(uri: String): ByteArray? {
+        // SACD track mediaIds carry their source ISO/share after the encoded fields:
+        // folder art lives beside that file, and a local path must be the real path for
+        // the storage-root containment check in resolveLocalPath().
+        val artUri = SacdSupport.parseTrackInfo(uri)?.srcUri ?: uri
         // 1. For the currently playing track, use ExoPlayer's already-parsed embedded
         //    artworkData (same source the player's own Now Playing screen uses). This is
         //    the most reliable path and matches exactly what the on-device UI shows.
@@ -850,8 +896,10 @@ class MpdServer(private val context: Context) {
         try {
             // Network-share files: look for common cover images in the SMB folder
             // beside the track, mirroring the local folder-art behavior below.
-            if (uri.trim().startsWith("smb://") || uri.trim().startsWith("/smb://")) {
-                val trackUri = enrichSmbUri(uri.trim().removePrefix("/"))
+            if (artUri.trim().startsWith("smb://") || artUri.trim().startsWith("/smb://")) {
+                // Percent-escapes arrive from clients and from our own lsinfo output;
+                // jcifs does not decode them, so decode before the lookup.
+                val trackUri = enrichSmbUri(decSmbUri(artUri.trim().removePrefix("/")))
                 try {
                     val trackFile = SmbFile(trackUri, SmbContext.getContextForUri(trackUri))
                     if (trackFile.exists() && !trackFile.isDirectory()) {
@@ -869,7 +917,7 @@ class MpdServer(private val context: Context) {
                     Log.w(TAG, "No SMB folder art for ${sanitizeSmbUri(trackUri)}: ${e.message}")
                 }
             } else {
-            val file = resolveLocalPath(uri)
+            val file = resolveLocalPath(artUri)
             if (file.exists() && file.isFile) {
                 // 2. Local folder artwork — the player's own UI goes straight from
                 //    embedded artworkData to folder art, so match it exactly (no
@@ -901,13 +949,18 @@ class MpdServer(private val context: Context) {
 
         // 4. Online fallback (mirrors the player's own UI) — for files/streams
         //    that have no local artwork. Uses the current track's metadata when
-        //    the library has no entry (e.g. internet radio streams).
+        //    the library has no entry (e.g. internet radio streams), but only when
+        //    the client asked for the track that is actually playing: otherwise a
+        //    different queue entry without local art was answered with this song's
+        //    cover.
         if (artist.isNullOrBlank()) {
             try {
                 hop { c ->
                     val idx = c.currentMediaItemIndex
                     if (idx >= 0 && idx < c.mediaItemCount) {
                         val item = c.getMediaItemAt(idx)
+                        val itemUri = SacdSupport.parseTrackInfo(item.mediaId)?.srcUri ?: item.mediaId
+                        if (itemUri != artUri) return@hop
                         val isStream = item.mediaId.startsWith("http://") || item.mediaId.startsWith("https://")
                         if (isStream) {
                             // Streams: use the live track info (icyInfo) so the search

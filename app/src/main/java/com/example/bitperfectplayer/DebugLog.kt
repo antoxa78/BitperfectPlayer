@@ -48,7 +48,18 @@ object DebugLog {
     private val lock = Any()
     private val lines = ArrayDeque<String>()
 
-    @Volatile private var started = false
+    /** Settings → Debug Log → "Debug Log: On/Off" (capture itself, not just sharing). */
+    private const val PREFS = "AppSettings"
+    private const val KEY_CAPTURE = "debug_log_capture"
+
+    @Volatile private var installed = false
+    @Volatile private var hooksInstalled = false
+    /** True while the logcat reader runs; cleared to stop it. */
+    @Volatile private var capturing = false
+    /** First reader of this process takes a logcat tail; a restart must not re-add it. */
+    @Volatile private var tailTaken = false
+    @Volatile private var readerThread: Thread? = null
+    @Volatile private var readerProcess: Process? = null
     @Volatile private var appContext: Context? = null
     @Volatile private var state = "not started"
 
@@ -72,27 +83,94 @@ object DebugLog {
      */
     private val scrubbers = listOf(
         Regex("""(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]*):[^@\s/]*@""") to "\$1:***@",
-        Regex("""(?i)(MPD <- password\s+)\S+""") to "\$1***",
+        // Mask the whole argument, not just its first word: a password may be quoted
+        // and contain spaces, and the old \S+ left the rest of it in the log.
+        Regex("""(?i)(MPD <- "?password"?\s+)(.*)""") to "\$1***",
         Regex("""(?i)(password|passwd|pwd)(\s*[:=]\s*)\S+""") to "\$1\$2***"
     )
 
     // ── Public API ──────────────────────────────────────────────────────────
 
-    /** Idempotent. Starts the logcat reader; safe to call from every entry point. */
+    /**
+     * Idempotent; safe to call from every entry point. Starts the logcat reader
+     * only when capture was explicitly enabled in Settings (off by default).
+     */
     fun install(context: Context) {
         val ctx = context.applicationContext
         synchronized(lock) {
-            if (started) return
-            started = true
+            if (installed) return
+            installed = true
             appContext = ctx
         }
-        installCrashHandler()
-        installShutdownFlush()
-        Thread({ readLoop() }, "debuglog-reader").apply { isDaemon = true }.start()
+        if (isEnabled(ctx)) {
+            startCapture()
+        } else {
+            state = "off"
+        }
+    }
+
+    /**
+     * The persisted on/off switch. Off by default: the logcat reader, the
+     * rotating debug.log file and the extra disk writes are diagnostics, not
+     * something every install should run unless the user asks for them. A user
+     * who explicitly enabled capture keeps it enabled across updates.
+     */
+    fun isEnabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_CAPTURE, false)
+
+    /**
+     * Switches capture on or off now and for later app starts. Off stops the
+     * logcat reader and closes the file; what was already captured stays
+     * readable (and clearable) until it is cleared.
+     */
+    fun setEnabled(context: Context, enabled: Boolean) {
+        val ctx = context.applicationContext
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_CAPTURE, enabled).apply()
+        appContext = ctx
+        if (enabled) startCapture() else stopCapture()
+    }
+
+    fun isCapturing(): Boolean = capturing
+
+    private fun startCapture() {
+        synchronized(lock) {
+            if (capturing) return
+            capturing = true
+        }
+        installHooksOnce()
+        readerThread = Thread({ readLoop() }, "debuglog-reader").apply {
+            isDaemon = true
+            start()
+        }
         Log.i(TAG, "Debug log capture started (pid ${android.os.Process.myPid()})")
     }
 
-    fun isCapturing(): Boolean = started
+    private fun stopCapture() {
+        val process: Process?
+        synchronized(lock) {
+            if (!capturing) return
+            capturing = false
+            process = readerProcess
+            readerProcess = null
+        }
+        // Ends the reader's blocking readLine(); the loop then sees capturing=false.
+        try { process?.destroy() } catch (_: Exception) {}
+        readerThread?.interrupt()
+        readerThread = null
+        synchronized(lock) { closeWriterLocked() }
+        state = "off"
+        Log.i(TAG, "Debug log capture stopped")
+    }
+
+    private fun installHooksOnce() {
+        synchronized(lock) {
+            if (hooksInstalled) return
+            hooksInstalled = true
+        }
+        installCrashHandler()
+        installShutdownFlush()
+    }
 
     /** One-line status for the Settings card / HTTP `/status`. */
     fun status(): String = state
@@ -145,30 +223,41 @@ object DebugLog {
     // ── Capture ─────────────────────────────────────────────────────────────
 
     private fun readLoop() {
-        var attempt = 0
-        while (true) {
-            attempt++
+        while (capturing) {
             var process: Process? = null
             try {
-                process = ProcessBuilder(
+                // The tail brings in the moments before capture started — but only
+                // once per process, or switching capture off and on again would
+                // re-add lines that are already in the buffer.
+                val tail = if (tailTaken) 1 else LOGCAT_TAIL_LINES
+                tailTaken = true
+                val started = ProcessBuilder(
                     "logcat", "-v", "threadtime",
-                    "-T", LOGCAT_TAIL_LINES.toString(),
+                    "-T", tail.toString(),
                     "--pid=${android.os.Process.myPid()}"
                 ).redirectErrorStream(true).start()
+                process = started
+                synchronized(lock) {
+                    if (!capturing) { started.destroy(); return }
+                    readerProcess = started
+                }
                 state = "capturing (pid ${android.os.Process.myPid()})"
                 synthetic("reader started")
-                val reader = BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8))
-                while (true) {
+                val reader = BufferedReader(InputStreamReader(started.inputStream, Charsets.UTF_8))
+                while (capturing) {
                     val line = reader.readLine() ?: break
                     addLine(line)
                 }
+                if (!capturing) return
                 synthetic("logcat exited")
             } catch (t: Throwable) {
+                if (!capturing) return
                 synthetic("logcat reader failed: $t")
                 state = "reader error: ${t.message}"
             } finally {
                 try { process?.destroy() } catch (_: Exception) {}
             }
+            if (!capturing) return
             state = "reader restarting"
             try { Thread.sleep(3000) } catch (_: InterruptedException) { return }
         }
@@ -190,6 +279,7 @@ object DebugLog {
     private fun installShutdownFlush() {
         try {
             Runtime.getRuntime().addShutdownHook(Thread({
+                if (!capturing) return@Thread
                 try {
                     val process = ProcessBuilder(
                         "logcat", "-d", "-v", "threadtime",
@@ -207,7 +297,7 @@ object DebugLog {
     private fun installCrashHandler() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            try {
+            if (capturing) try {
                 synthetic("FATAL in ${thread.name}: $throwable")
                 throwable.stackTraceToString().lineSequence().forEach { addLine(it) }
             } catch (_: Throwable) {}

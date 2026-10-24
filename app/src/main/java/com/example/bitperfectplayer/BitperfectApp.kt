@@ -15,11 +15,24 @@ class BitperfectApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        val isMainProcess = android.app.Application.getProcessName() == packageName
+        if (isMainProcess) {
+            try {
+                DebugLog.install(this)
+                DebugLogServer.apply(this)
+            } catch (t: Throwable) {
+                Log.w("BitperfectApp", "Debug log init failed", t)
+            }
+        }
+        // Main process only: the monitor service runs in :usbmonitor. Starting it
+        // here covers app launches (including after an update) when the setting
+        // was enabled in a previous session; it is a no-op when the setting is off.
         try {
-            DebugLog.install(this)
-            DebugLogServer.apply(this)
+            if (isMainProcess) {
+                UsbRecoveryService.sync(this)
+            }
         } catch (t: Throwable) {
-            Log.w("BitperfectApp", "Debug log init failed", t)
+            Log.w("BitperfectApp", "USB recovery monitor init failed", t)
         }
     }
 }
