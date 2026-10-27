@@ -5,6 +5,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -17,6 +21,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.ColorUtils
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ImageSpan
@@ -42,7 +47,6 @@ class NowPlayingActivity : BaseActivity() {
 
     companion object {
         private const val PREFS_APP          = "AppSettings"
-        private const val KEY_WAVEFORM_TYPE  = "waveform_type"
         private const val PROGRESS_TICK_MS   = 1_000L
         private const val METADATA_DELAY_1   = 1_000L
         private const val METADATA_DELAY_2   = 3_000L
@@ -141,6 +145,19 @@ class NowPlayingActivity : BaseActivity() {
             applyColorTheme()
             updateDacButton()
         }
+        applyWaveformPreference()
+    }
+
+    /** Shows the selected type, or removes the view entirely for "Disabled". */
+    private fun applyWaveformPreference() {
+        val type = WaveformSettings.type(this)
+        if (type == WaveformSettings.TYPE_DISABLED) {
+            animatedWaveform.visibility = android.view.View.GONE
+            return
+        }
+        animatedWaveform.visibility = android.view.View.VISIBLE
+        animatedWaveform.setPlaying(mediaController?.isPlaying == true)
+        animatedWaveform.setWaveformType(type)
     }
 
     override fun onDestroy() {
@@ -167,6 +184,7 @@ class NowPlayingActivity : BaseActivity() {
         textTotalTime    = findViewById(R.id.text_total_time)
         imgTrackIcon     = findViewById(R.id.img_track_icon)
         animatedWaveform = findViewById(R.id.animated_waveform)
+        applyWaveformPreference()
         seekBar          = findViewById(R.id.seek_bar)
         btnPlayPause     = findViewById(R.id.btn_play_pause)
         btnShuffle       = findViewById(R.id.btn_shuffle)
@@ -256,6 +274,45 @@ class NowPlayingActivity : BaseActivity() {
                 startProgressUpdate()
             }
         })
+    }
+
+    /**
+     * Focus cue for the seek bar. The idle thumb is a plain accent dot; when the
+     * D-pad lands on the bar, the dot turns white inside a soft accent halo. A
+     * full-width focus pill looked heavy against the artwork.
+     */
+    private fun buildSeekThumb(accent: Int): Drawable {
+        val density = resources.displayMetrics.density
+        val halo = (26 * density).toInt()
+        val dot = (15 * density).toInt()
+        val inset = (halo - dot) / 2
+
+        fun circle(color: Int, size: Int) = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+            setSize(size, size)
+        }
+
+        fun glow(size: Int) = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            colors = intArrayOf(ColorUtils.setAlphaComponent(accent, 0x7A), Color.TRANSPARENT)
+            gradientRadius = size / 2f
+            setSize(size, size)
+        }
+
+        fun state(focused: Boolean): Drawable {
+            val outer = if (focused) glow(halo) else circle(Color.TRANSPARENT, halo)
+            val inner = circle(if (focused) Color.WHITE else accent, dot)
+            return LayerDrawable(arrayOf(outer, inner)).apply {
+                setLayerInset(1, inset, inset, inset, inset)
+            }
+        }
+
+        return StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_focused), state(true))
+            addState(intArrayOf(), state(false))
+        }
     }
 
     /** Applies a user seek for seekable items; live streams have no real position. */
@@ -446,8 +503,7 @@ class NowPlayingActivity : BaseActivity() {
 
     private fun setupController() {
         val controller = mediaController ?: return
-        animatedWaveform.setPlaying(controller.isPlaying)
-        animatedWaveform.setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM_TYPE, 0))
+        applyWaveformPreference()
         animatedWaveform.setColor(getThemeColor())
         applyColorTheme()
 
@@ -491,19 +547,25 @@ class NowPlayingActivity : BaseActivity() {
         if (!isScreensaverActive) return
         window.decorView.findViewWithTag<TextView>("screensaver_text")?.let { updateScreensaverText(it) }
         val wv = window.decorView.findViewWithTag<AnimatedWaveformView>("screensaver_waveform")
-        wv?.setPlaying(mediaController?.isPlaying == true)
-        wv?.setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM_TYPE, 0))
-        wv?.setColor(getThemeColor())
+        if (WaveformSettings.isDisabled(this)) {
+            wv?.visibility = android.view.View.GONE
+        } else {
+            wv?.visibility = android.view.View.VISIBLE
+            wv?.setPlaying(mediaController?.isPlaying == true)
+            wv?.setWaveformType(WaveformSettings.type(this))
+            wv?.setColor(getThemeColor())
+        }
     }
 
     override fun onScreensaverCreated(container: android.view.ViewGroup) {
+        if (WaveformSettings.isDisabled(this)) return
         val dp = resources.displayMetrics.density
         AnimatedWaveformView(this).apply {
             tag = "screensaver_waveform"
             layoutParams = android.widget.LinearLayout.LayoutParams((400 * dp).toInt(), (64 * dp).toInt())
                 .also { it.topMargin = (24 * dp).toInt() }
             setPlaying(mediaController?.isPlaying == true)
-            setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM_TYPE, 0))
+            setWaveformType(WaveformSettings.type(this@NowPlayingActivity))
             setColor(getThemeColor())
             container.addView(this)
         }
@@ -608,8 +670,9 @@ class NowPlayingActivity : BaseActivity() {
         brandMark.applyTheme(theme)
 
         seekBar.progressTintList = android.content.res.ColorStateList.valueOf(theme.accent)
-        seekBar.thumbTintList = android.content.res.ColorStateList.valueOf(theme.accent)
         seekBar.progressBackgroundTintList = android.content.res.ColorStateList.valueOf(0x40FFFFFF)
+        seekBar.thumbTintList = null
+        seekBar.thumb = buildSeekThumb(theme.accent)
 
         animatedWaveform.setColor(theme.accent)
         backdropScrim.background = ColorThemes.nowPlayingScrim(theme)
@@ -1130,6 +1193,9 @@ class NowPlayingActivity : BaseActivity() {
         dv.addView(br)
         lv.setOnItemClickListener { _, _, w, _ -> controller.seekTo(w, 0); controller.play(); dlg.dismiss() }
         dlg.show()
+        // Open the queue at the playing track instead of always at position 1.
+        val playingIndex = controller.currentMediaItemIndex
+        if (playingIndex in items.indices) lv.post { lv.setSelection(playingIndex) }
     }
 
     // ── Internal storage browsing ─────────────────────────────────────────────
@@ -1163,7 +1229,8 @@ class NowPlayingActivity : BaseActivity() {
         }
     }
 
-    private fun browseFileStorage(path: String, isSelectionMode: Boolean, isDirectoryMode: Boolean) {
+    /** [rootPath] is the folder the browser was opened at; Back stops there. */
+    private fun browseFileStorage(path: String, isSelectionMode: Boolean, isDirectoryMode: Boolean, rootPath: String = path) {
         val dir = java.io.File(path)
         val toast = Toast.makeText(this, "Reading folder…", Toast.LENGTH_SHORT); toast.show()
         Thread {
@@ -1178,15 +1245,23 @@ class NowPlayingActivity : BaseActivity() {
                     .sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
                 runOnUiThread {
                     toast.cancel()
-                    val title = if (isDirectoryMode) "Select Directory" else dir.name.ifEmpty { "Storage" }
+                    val folderName = StorageNavigation.displayName(
+                        dir.absolutePath,
+                        android.os.Environment.getExternalStorageDirectory().absolutePath
+                    )
+                    val title = if (isDirectoryMode) "Select Directory: $folderName" else folderName
                     val dv = android.widget.LinearLayout(this).apply { orientation=android.widget.LinearLayout.VERTICAL; setPadding(16,16,16,16) }
                     val lv = android.widget.ListView(this).apply { adapter=BrowseAdapter(sorted); descendantFocusability=android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS; layoutParams=android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT,0,1f) }
                     dv.addView(lv)
                     val br = android.widget.LinearLayout(this).apply { orientation=android.widget.LinearLayout.HORIZONTAL; gravity=android.view.Gravity.CENTER; layoutParams=android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT) }
                     val dlg = android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle(title).setView(dv).create()
                     fun btn(lbl: String, cb: () -> Unit) = android.widget.Button(this).apply { text=lbl; setOnClickListener { cb(); dlg.dismiss() }; layoutParams=android.widget.LinearLayout.LayoutParams(0,android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,1f); isFocusable=true }
-                    // Up one folder; at a storage root (internal storage or a USB drive), just close
-                    fun goUp() { val p=dir.parentFile; val internal=android.os.Environment.getExternalStorageDirectory().absolutePath; if (p!=null && dir.absolutePath!=internal && p.absolutePath!="/storage" && p.absolutePath!="/" && p.absolutePath!=java.io.File(internal).parent) browseFileStorage(p.absolutePath, isSelectionMode, isDirectoryMode) }
+                    // Up one folder; at the browser's root (internal storage or a USB drive), just close
+                    fun goUp() {
+                        StorageNavigation.parentWithinRoot(dir.absolutePath, rootPath)?.let {
+                            browseFileStorage(it, isSelectionMode, isDirectoryMode, rootPath)
+                        }
+                    }
                     br.addView(btn("Back") { goUp() })
                     // Remote Back = the Back button. Back cancels the dialog on every API level
                     // (incl. predictive back); the buttons and list clicks dismiss(), not cancel().
@@ -1195,7 +1270,7 @@ class NowPlayingActivity : BaseActivity() {
                     if (isDirectoryMode) br.addView(btn("Add Folder") { addFilesToPlaylist(dir, false) })
                     else { br.addView(btn("Add All") { addFilesToPlaylist(dir, false) }); br.addView(btn("Replace All") { addFilesToPlaylist(dir, true) }) }
                     dv.addView(br)
-                    lv.setOnItemClickListener { _, _, w, _ -> dlg.dismiss(); val it=sorted[w]; if (it.isDirectory) browseFileStorage(it.path, isSelectionMode, isDirectoryMode) else handleFileSelection(it.path, it.name) }
+                    lv.setOnItemClickListener { _, _, w, _ -> dlg.dismiss(); val it=sorted[w]; if (it.isDirectory) browseFileStorage(it.path, isSelectionMode, isDirectoryMode, rootPath) else handleFileSelection(it.path, it.name) }
                     dlg.show()
                 }
             } catch (e: Exception) { runOnUiThread { toast.cancel(); Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_SHORT).show() } }

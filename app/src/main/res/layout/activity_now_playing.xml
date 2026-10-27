@@ -156,8 +156,7 @@
                 android:paddingEnd="0dp"
                 android:paddingTop="8dp"
                 android:paddingBottom="8dp"
-                android:progressTint="@color/text_primary"
-                android:thumbTint="@color/text_primary" />
+                android:progressTint="@color/text_primary" />
 
             <LinearLayout
                 android:layout_width="match_parent"

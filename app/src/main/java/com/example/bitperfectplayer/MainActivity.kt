@@ -111,9 +111,14 @@ class MainActivity : BaseActivity() {
         if (!isScreensaverActive) return
         window.decorView.findViewWithTag<TextView>("screensaver_text")?.let { updateScreensaverText(it) }
         val waveform = window.decorView.findViewWithTag<AnimatedWaveformView>("screensaver_waveform")
-        waveform?.setPlaying(mediaController?.isPlaying == true)
-        waveform?.setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM, 0))
-        waveform?.setColor(getThemeColor())
+        if (WaveformSettings.isDisabled(this)) {
+            waveform?.visibility = android.view.View.GONE
+        } else {
+            waveform?.visibility = android.view.View.VISIBLE
+            waveform?.setPlaying(mediaController?.isPlaying == true)
+            waveform?.setWaveformType(WaveformSettings.type(this))
+            waveform?.setColor(getThemeColor())
+        }
     }
 
     override fun updateScreensaverText(textView: TextView) {
@@ -168,6 +173,7 @@ class MainActivity : BaseActivity() {
     }
 
     override fun onScreensaverCreated(container: android.view.ViewGroup) {
+        if (WaveformSettings.isDisabled(this)) return
         val density = resources.displayMetrics.density
         AnimatedWaveformView(this).apply {
             tag = "screensaver_waveform"
@@ -176,7 +182,7 @@ class MainActivity : BaseActivity() {
                 (64 * density).toInt()
             ).also { it.topMargin = (24 * density).toInt() }
             setPlaying(mediaController?.isPlaying == true)
-            setWaveformType(getSharedPreferences(PREFS_APP, MODE_PRIVATE).getInt(KEY_WAVEFORM, 0))
+            setWaveformType(WaveformSettings.type(this@MainActivity))
             setColor(getThemeColor())
             container.addView(this)
         }

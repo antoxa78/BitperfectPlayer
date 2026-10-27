@@ -1,7 +1,16 @@
 package com.example.bitperfectplayer
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.text.SpannableStringBuilder
@@ -12,6 +21,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -41,6 +51,18 @@ class BrandMark(context: Context) : LinearLayout(context) {
 
     private val wordmark = TextView(context)
     private val tagline = TextView(context)
+
+    // A short light sweep every few seconds; no animator runs during the pause,
+    // so the mark costs nothing while it is idle.
+    private var accent = Color.WHITE
+    private var sweeping = false
+    private var sweepProgress = 1f
+    private var sweepScheduled = false
+    private var sweepAnimator: ValueAnimator? = null
+    private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
+    }
+    private val sweepStarter = Runnable { startSweep() }
 
     init {
         orientation = HORIZONTAL
@@ -84,10 +106,115 @@ class BrandMark(context: Context) : LinearLayout(context) {
 
     /** Recolours the accent half of the wordmark and the tagline. */
     internal fun applyTheme(theme: ColorThemes.Theme) {
+        accent = theme.accent
         wordmark.text = SpannableStringBuilder("Bitperfect").apply {
             setSpan(ForegroundColorSpan(theme.accent), 3, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
         tagline.setTextColor(theme.cardSubtitle)
+    }
+
+    // ── Light sweep ─────────────────────────────────────────────────────────
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        scheduleSweep(1_200L)
+    }
+
+    override fun onDetachedFromWindow() {
+        stopSweep()
+        super.onDetachedFromWindow()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility == View.VISIBLE) scheduleSweep(1_200L) else stopSweep()
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (visibility == View.VISIBLE) scheduleSweep(1_200L) else stopSweep()
+    }
+
+    /**
+     * Draws the children normally, then a soft diagonal-ish band of light over
+     * the logo and both text lines. SRC_ATOP clips the band to the mark's own
+     * pixels, so the background never picks up the tint.
+     */
+    override fun dispatchDraw(canvas: Canvas) {
+        if (!sweeping || width <= 0 || height <= 0) {
+            super.dispatchDraw(canvas)
+            return
+        }
+
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val save = canvas.saveLayer(0f, 0f, w, h, null)
+        super.dispatchDraw(canvas)
+
+        val band = (w * 0.45f).coerceAtLeast(72f * resources.displayMetrics.density)
+        val x = -band + (w + band * 2f) * sweepProgress
+        sweepPaint.shader = LinearGradient(
+            x, 0f, x + band, h,
+            intArrayOf(
+                Color.TRANSPARENT,
+                ColorUtils.setAlphaComponent(Color.WHITE, 0x44),
+                ColorUtils.setAlphaComponent(accent, 0x76),
+                ColorUtils.setAlphaComponent(Color.WHITE, 0x44),
+                Color.TRANSPARENT
+            ),
+            floatArrayOf(0f, 0.28f, 0.5f, 0.72f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, w, h, sweepPaint)
+        canvas.restoreToCount(save)
+    }
+
+    private fun scheduleSweep(delayMs: Long) {
+        if (sweepScheduled || sweepAnimator != null) return
+        if (!isAttachedToWindow || windowVisibility != View.VISIBLE || visibility != View.VISIBLE) return
+        sweepScheduled = true
+        postDelayed(sweepStarter, delayMs)
+    }
+
+    private fun startSweep() {
+        sweepScheduled = false
+        if (!isAttachedToWindow || windowVisibility != View.VISIBLE || visibility != View.VISIBLE) return
+        if (sweepAnimator != null) return
+
+        sweeping = true
+        sweepProgress = 0f
+        invalidate()
+
+        val animation = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 1_500L
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                sweepProgress = it.animatedValue as Float
+                invalidate()
+            }
+        }
+        animation.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                if (sweepAnimator !== animation) return
+                sweepAnimator = null
+                sweeping = false
+                sweepProgress = 1f
+                invalidate()
+                scheduleSweep(3_500L)
+            }
+        })
+        sweepAnimator = animation
+        animation.start()
+    }
+
+    private fun stopSweep() {
+        removeCallbacks(sweepStarter)
+        sweepScheduled = false
+        sweepAnimator?.cancel()
+        sweepAnimator = null
+        sweeping = false
+        sweepProgress = 1f
+        invalidate()
     }
 
     companion object {

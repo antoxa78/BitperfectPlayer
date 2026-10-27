@@ -51,6 +51,8 @@ object DebugLog {
     /** Settings → Debug Log → "Debug Log: On/Off" (capture itself, not just sharing). */
     private const val PREFS = "AppSettings"
     private const val KEY_CAPTURE = "debug_log_capture"
+    /** Set as soon as the user toggles capture, so the off-by-default migration leaves it alone. */
+    private const val KEY_CAPTURE_USER_SET = "debug_log_capture_user_set"
 
     @Volatile private var installed = false
     @Volatile private var hooksInstalled = false
@@ -97,6 +99,7 @@ object DebugLog {
      */
     fun install(context: Context) {
         val ctx = context.applicationContext
+        migrateLegacyDefault(ctx)
         synchronized(lock) {
             if (installed) return
             installed = true
@@ -113,10 +116,23 @@ object DebugLog {
      * The persisted on/off switch. Off by default: the logcat reader, the
      * rotating debug.log file and the extra disk writes are diagnostics, not
      * something every install should run unless the user asks for them. A user
-     * who explicitly enabled capture keeps it enabled across updates.
+     * who toggles it in Settings keeps that choice across updates.
      */
     fun isEnabled(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_CAPTURE, false)
+
+    /**
+     * Capture used to be on by default. Turn off installs that never explicitly
+     * touched the switch; a later toggle records [KEY_CAPTURE_USER_SET].
+     */
+    private fun migrateLegacyDefault(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.contains(KEY_CAPTURE_USER_SET)) return
+        if (prefs.getBoolean(KEY_CAPTURE, false)) {
+            prefs.edit().putBoolean(KEY_CAPTURE, false).apply()
+        }
+        prefs.edit().putBoolean(KEY_CAPTURE_USER_SET, true).apply()
+    }
 
     /**
      * Switches capture on or off now and for later app starts. Off stops the
@@ -126,7 +142,9 @@ object DebugLog {
     fun setEnabled(context: Context, enabled: Boolean) {
         val ctx = context.applicationContext
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_CAPTURE, enabled).apply()
+            .putBoolean(KEY_CAPTURE, enabled)
+            .putBoolean(KEY_CAPTURE_USER_SET, true)
+            .apply()
         appContext = ctx
         if (enabled) startCapture() else stopCapture()
     }
