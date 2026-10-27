@@ -66,7 +66,9 @@ class MainFragment : BrowseSupportFragment() {
     private val externalStorageReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: android.content.Intent?) {
             if (!isAdded) return
-            view?.post { refreshRows() }
+            // Keep the card the user is on selected; refreshRows() with no target
+            // clears the adapter and drops D-pad focus to the headers.
+            view?.post { refreshWithCurrentFocus() }
         }
     }
 
@@ -1500,20 +1502,11 @@ class MainFragment : BrowseSupportFragment() {
         val drives = linkedMapOf<String, ExternalDrive>()
         val primaryRoot = android.os.Environment.getExternalStorageDirectory().absolutePath.trimEnd('/')
 
-        fun tryAdd(rawPath: String?, label: String?) {
-            if (rawPath.isNullOrBlank()) return
-            val path = rawPath.trimEnd('/')
-            if (path.isEmpty() || path == primaryRoot || drives.containsKey(path)) return
-            val file = java.io.File(path)
-            if (!file.exists() || !file.isDirectory) return
-            // canRead() is unreliable on /mnt/media_rw and some Android TV mounts; listing is the real test
-            val readable = try { file.list() != null } catch (e: Exception) { false }
-            if (!readable) return
-            val name = label?.takeIf { it.isNotBlank() } ?: file.name.ifEmpty { "External Drive" }
-            drives[path] = ExternalDrive(name, path)
-        }
-
-        // 1) StorageManager.getStorageVolumes() — gives the best human-readable label
+        // StorageManager knows the user-visible description ("USB drive", a label
+        // set on the volume, …). Collect it first so the paths found by the other
+        // probes below get the same friendly title instead of their volume ID.
+        val volumeLabels = mutableMapOf<String, String>()
+        val volumePaths = mutableListOf<String>()
         try {
             val sm = context.getSystemService(Context.STORAGE_SERVICE) as? android.os.storage.StorageManager
             sm?.storageVolumes?.forEach { volume ->
@@ -1523,9 +1516,29 @@ class MainFragment : BrowseSupportFragment() {
                 } else {
                     try { volume.javaClass.getMethod("getPath").invoke(volume) as? String } catch (e: Exception) { null }
                 }
-                tryAdd(path, volume.getDescription(context))
+                if (path.isNullOrBlank()) return@forEach
+                val normalized = path.trimEnd('/')
+                val label = try { volume.getDescription(context) } catch (e: Exception) { null }
+                if (!label.isNullOrBlank()) volumeLabels[normalized] = label
+                volumePaths += normalized
             }
         } catch (e: Exception) { e.printStackTrace() }
+
+        fun tryAdd(rawPath: String?, label: String?) {
+            if (rawPath.isNullOrBlank()) return
+            val path = rawPath.trimEnd('/')
+            if (path.isEmpty() || path == primaryRoot || drives.containsKey(path)) return
+            val file = java.io.File(path)
+            if (!file.exists() || !file.isDirectory) return
+            // canRead() is unreliable on /mnt/media_rw and some Android TV mounts; listing is the real test
+            val readable = try { file.list() != null } catch (e: Exception) { false }
+            if (!readable) return
+            val name = StorageNavigation.driveDisplayName(label ?: volumeLabels[path], path)
+            drives[path] = ExternalDrive(name, path)
+        }
+
+        // 1) StorageManager.getStorageVolumes() — gives the best human-readable label
+        volumePaths.forEach { tryAdd(it, volumeLabels[it]) }
 
         // 2) getExternalFilesDirs() — sandbox paths reveal volume roots
         try {
@@ -1603,21 +1616,45 @@ class MainFragment : BrowseSupportFragment() {
             return
         }
 
+        // Two volumes can share the generic StorageVolume description ("USB drive").
+        // Add the mount ID only when needed, so the selection is unambiguous.
+        val nameCounts = drives.groupingBy { it.name.lowercase() }.eachCount()
+        val labels = drives.map { drive ->
+            if ((nameCounts[drive.name.lowercase()] ?: 0) > 1) {
+                val id = java.io.File(drive.path).name
+                if (drive.name.contains(id, ignoreCase = true)) drive.name else "${drive.name} ($id)"
+            } else drive.name
+        }
+
         if (drives.size == 1) {
-            browseFileStorage(drives[0].path)
+            browseFileStorage(drives[0].path, rootLabel = labels[0])
             return
         }
 
-        val items = drives.map { BrowseItem(it.name, it.path, R.drawable.ic_usb, true) }
+        val items = drives.mapIndexed { i, drive ->
+            BrowseItem(labels[i], drive.path, R.drawable.ic_usb, true)
+        }
         val adapter = BrowseAdapter(context, items)
         AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select External Drive")
-            .setAdapter(adapter) { _, which -> browseFileStorage(drives[which].path) }
+            .setAdapter(adapter) { _, which ->
+                browseFileStorage(drives[which].path, rootLabel = labels[which])
+            }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun browseFileStorage(path: String, isSelectionMode: Boolean = false) {
+    /**
+     * [rootPath] is the folder the browser was opened at; Back stops there.
+     * [rootLabel] is its friendly title (e.g. a USB volume's description); it is
+     * used only at the root, and subfolders show their own names.
+     */
+    private fun browseFileStorage(
+        path: String,
+        isSelectionMode: Boolean = false,
+        rootPath: String = path,
+        rootLabel: String? = null,
+    ) {
         val context = activity ?: return
         val currentDir = java.io.File(path)
         val loadingToast = Toast.makeText(context, "Reading folder...", Toast.LENGTH_SHORT)
@@ -1644,29 +1681,39 @@ class MainFragment : BrowseSupportFragment() {
                 activity?.runOnUiThread {
                     loadingToast.cancel()
                     
-                    val folderName = currentDir.name.ifEmpty { "Storage" }
+                    val atRoot = java.io.File(currentDir.absolutePath).absolutePath ==
+                        java.io.File(rootPath).absolutePath
+                    val folderName = if (atRoot) {
+                        rootLabel?.takeIf { it.isNotBlank() }
+                            ?: StorageNavigation.displayName(
+                                currentDir.absolutePath,
+                                android.os.Environment.getExternalStorageDirectory().absolutePath
+                            )
+                    } else {
+                        StorageNavigation.displayName(
+                            currentDir.absolutePath,
+                            android.os.Environment.getExternalStorageDirectory().absolutePath
+                        )
+                    }
                     val title = if (isSelectionMode) "Add Folder: $folderName" else folderName
-                    
+
                     val onBack: () -> Unit = {
-                        val parent = currentDir.parentFile
-                        val internalRoot = android.os.Environment.getExternalStorageDirectory().absolutePath
-                        if (parent != null && currentDir.absolutePath != internalRoot &&
-                            parent.absolutePath != "/storage" && parent.absolutePath != "/") {
-                            browseFileStorage(parent.absolutePath, isSelectionMode)
+                        StorageNavigation.parentWithinRoot(currentDir.absolutePath, rootPath)?.let {
+                            browseFileStorage(it, isSelectionMode, rootPath, rootLabel)
                         }
                     }
 
                     if (isSelectionMode) {
                         showFolderSelectionDialog(title, BrowseAdapter(context, sortedItems), { which ->
                             val item = sortedItems[which]
-                            if (item.isDirectory) browseFileStorage(item.path, true)
+                            if (item.isDirectory) browseFileStorage(item.path, true, rootPath, rootLabel)
                         }, { // Add Folder
                             saveMusicFolder(Uri.fromFile(currentDir).toString(), true)
                         }, onBack)
                     } else {
                         showBrowserDialog(title, BrowseAdapter(context, sortedItems), { which ->
                             val item = sortedItems[which]
-                            if (item.isDirectory) browseFileStorage(item.path) else handleFileSelection(item.path, item.name)
+                            if (item.isDirectory) browseFileStorage(item.path, false, rootPath, rootLabel) else handleFileSelection(item.path, item.name)
                         }, { // Add All
                             addFilesToPlaylist(currentDir, replace = false)
                         }, { // Replace
@@ -2570,16 +2617,28 @@ class MainFragment : BrowseSupportFragment() {
     private fun isAutoScanEnabled() = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         .getBoolean(KEY_AUTO_SCAN, true)
 
+    private val waveformTypeNames = arrayOf(
+        "Mirrored Bars",
+        "Single Bars",
+        "Bars with level hold",
+        "Dots bars",
+        "Dots bars with level holds",
+        "Disabled"
+    )
+
     private fun getWaveformTypeName(): String {
-        val types = arrayOf("Mirrored Bars", "Single Bars", "Bars with level hold", "Dots bars", "Dots bars with level holds")
         val index = requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             .getInt(KEY_WAVEFORM_TYPE, 0)
-        return if (index in types.indices) types[index] else types[0]
+        return if (index in waveformTypeNames.indices) waveformTypeNames[index] else waveformTypeNames[0]
     }
 
     private fun showWaveformTypeDialog() {
-        val typeNames = arrayOf("Mirrored Bars", "Single Bars", "Bars with level hold", "Dots bars", "Dots bars with level holds")
-        val items = typeNames.map { DialogOptionItem(it, R.drawable.ic_waveform) }
+        val items = waveformTypeNames.mapIndexed { index, name ->
+            DialogOptionItem(
+                name,
+                if (index == WaveformSettings.TYPE_DISABLED) R.drawable.ic_block else R.drawable.ic_waveform
+            )
+        }
         val adapter = DialogOptionAdapter(requireContext(), items)
         AlertDialog.Builder(requireContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Select Waveform Type")
@@ -2960,9 +3019,10 @@ class MainFragment : BrowseSupportFragment() {
             true
         }
         
-        // Disable automatic keyboard popup on focus to allow D-pad navigation
-        editText.onFocusChangeListener = null
-        
+        // Keep the IME closed when the dialog opens: auto-showing it covers the
+        // Scan/Add buttons and sends the first D-pad presses to the keyboard.
+        editText.showSoftInputOnFocus = false
+
         // Show keyboard only when OK/Center button is pressed
         editText.setOnClickListener { v ->
             val imm = v.context.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
