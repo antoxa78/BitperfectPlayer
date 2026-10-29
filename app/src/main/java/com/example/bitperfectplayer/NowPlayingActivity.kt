@@ -692,11 +692,16 @@ class NowPlayingActivity : BaseActivity() {
         val metadata  = controller.mediaMetadata
         val mediaItem = controller.currentMediaItem
         val itemMeta  = mediaItem?.mediaMetadata
+        // Media3 can keep the last item's metadata after clearMediaItems(); with
+        // no current item there is no track to describe, so show the empty state
+        // instead of leaving the last title, tags and format chips on screen.
+        val queueEmpty = mediaItem == null
         val artist       = metadata.artist?.toString()       ?: itemMeta?.artist?.toString()
         val albumArtist  = metadata.albumArtist?.toString()  ?: itemMeta?.albumArtist?.toString()
 
         // Shared with the main-screen Now Playing card so both always agree.
-        val info = TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
+        val info = if (queueEmpty) TrackInfoResolver.Info("Nothing Playing", "", "")
+                   else TrackInfoResolver.resolve(controller, PlaybackService.icyInfo)
         var dispArtist = info.artist
         var dispTrack  = info.track
 
@@ -714,6 +719,10 @@ class NowPlayingActivity : BaseActivity() {
 
         textTitle.text  = dispTrack
         textArtist.text = dispArtist
+        // Keep the artist row's space (INVISIBLE, not GONE) but do not leave a
+        // lone leading icon when there is nothing to name.
+        textArtist.visibility =
+            if (dispArtist.isBlank()) android.view.View.INVISIBLE else android.view.View.VISIBLE
 
         val finalAlbum = info.album
         // INVISIBLE (not GONE) so the album row keeps its space — the seek bar and
@@ -723,24 +732,39 @@ class NowPlayingActivity : BaseActivity() {
 
         updateHeaderLine()
 
+        // Zero the transport when the queue is empty; the progress runnable also
+        // stops itself in that state rather than showing an unknown-duration "∞".
+        if (queueEmpty) {
+            textCurrentTime.text = "0:00"
+            textTotalTime.text = "0:00"
+            seekBar.max = 100
+            seekBar.progress = 0
+        }
+
         val uri = mediaItem?.mediaId ?: ""
-        loadAlbumArt(uri, dispArtist, metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString(), dispTrack)
+        val albumTitle = if (queueEmpty) null
+                         else metadata.albumTitle?.toString() ?: itemMeta?.albumTitle?.toString()
+        loadAlbumArt(uri, dispArtist, albumTitle, dispTrack)
 
         btnPlayPause.setImageResource(if (controller.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
         updateShuffleRepeatUI()
         updateDacButton()
 
         var format: Format? = null
-        for (g in controller.currentTracks.groups) {
-            if (g.type == C.TRACK_TYPE_AUDIO && g.isSelected) {
-                for (i in 0 until g.length) { if (g.isTrackSelected(i)) { format = g.getTrackFormat(i); break } }
-                if (format != null) break
+        if (!queueEmpty) {
+            for (g in controller.currentTracks.groups) {
+                if (g.type == C.TRACK_TYPE_AUDIO && g.isSelected) {
+                    for (i in 0 until g.length) { if (g.isTrackSelected(i)) { format = g.getTrackFormat(i); break } }
+                    if (format != null) break
+                }
             }
         }
         val metaList = mutableListOf<String>()
-        val icyName = station ?: albumArtist
-        if (!icyName.isNullOrBlank() && icyName != artist && icyName != dispArtist && icyName != dispTrack) metaList.add(icyName)
-        if (!genre.isNullOrBlank() && genre != icyName && genre != dispArtist && genre != dispTrack) metaList.add(genre)
+        if (!queueEmpty) {
+            val icyName = station ?: albumArtist
+            if (!icyName.isNullOrBlank() && icyName != artist && icyName != dispArtist && icyName != dispTrack) metaList.add(icyName)
+            if (!genre.isNullOrBlank() && genre != icyName && genre != dispArtist && genre != dispTrack) metaList.add(genre)
+        }
         val formatList = format?.let { formatInfoParts(it) } ?: emptyList()
 
         if (metaList.isNotEmpty() || formatList.isNotEmpty()) {
@@ -764,22 +788,35 @@ class NowPlayingActivity : BaseActivity() {
      */
     private fun updateHeaderLine() {
         val controller = mediaController ?: return
-        val parts = mutableListOf<String>()
+        // Join the phrases with breakable spaces before the dot and a non-breaking
+        // space after it, and keep the spaces inside each phrase non-breaking. When
+        // the header has to wrap beside the brand mark it then breaks between
+        // phrases — "TRACK 3 OF 12 · ANDROID AUDIO" / "· NO USB DAC" — instead of
+        // leaving a lone "DAC".
+        val units = mutableListOf<String>()
         if (controller.mediaItemCount > 0) {
-            parts += "TRACK ${controller.currentMediaItemIndex + 1} OF ${controller.mediaItemCount}"
+            units += "TRACK ${controller.currentMediaItemIndex + 1} OF ${controller.mediaItemCount}"
         }
-        parts += PlaybackService.outputPathLabel(this, controller.isPlaying)
-        val text = parts.joinToString("  ·  ").uppercase()
+        units += PlaybackService.outputPathLabel(this, controller.isPlaying).split(" · ")
+        val text = units.joinToString("  ·\u00A0") { it.replace(' ', '\u00A0') }.uppercase()
         if (textPlaylistPos.text.toString() != text) textPlaylistPos.text = text
     }
 
-    /** Caps the header's width at the brand mark's left edge when they share rows. */
+    /**
+     * Caps the header's width at the brand mark's left edge only when their rows
+     * actually overlap. With a one-line title the header sits just below the mark,
+     * and the long fallback labels ("Android Audio · no USB DAC", "…USB permission
+     * needed") need the full text-column width; capping them at the mark's edge
+     * cut the output status off even though nothing was in its way. When the rows
+     * do overlap (a two-line title lifts the column), the header wraps instead of
+     * ellipsizing so the status stays readable.
+     */
     private fun fitHeaderBesideBrand() {
         if (brandMark.width == 0 || textPlaylistPos.height == 0) return
         val header = IntArray(2).also { textPlaylistPos.getLocationInWindow(it) }
         val brand = IntArray(2).also { brandMark.getLocationInWindow(it) }
         val gap = (16 * resources.displayMetrics.density).toInt()
-        val sharesRows = header[1] < brand[1] + brandMark.height + gap &&
+        val sharesRows = header[1] < brand[1] + brandMark.height &&
             header[1] + textPlaylistPos.height > brand[1]
         val limit = if (sharesRows) (brand[0] - header[0] - gap).coerceAtLeast(gap * 6) else Int.MAX_VALUE
         if (textPlaylistPos.maxWidth != limit) textPlaylistPos.maxWidth = limit
@@ -1109,6 +1146,16 @@ class NowPlayingActivity : BaseActivity() {
         val runnable = object : Runnable {
             override fun run() {
                 val c = mediaController ?: return
+                // Clearing the queue leaves no item; stop polling and show a
+                // zeroed transport instead of the "∞" unknown-duration state.
+                if (c.currentMediaItem == null) {
+                    progressUpdateRunnable = null
+                    textCurrentTime.text = "0:00"
+                    textTotalTime.text = "0:00"
+                    seekBar.max = 100
+                    seekBar.progress = 0
+                    return
+                }
                 val pos = c.currentPosition; val dur = c.duration
                 textCurrentTime.text = formatTime(pos)
                 if (dur > 0 && dur != Long.MAX_VALUE && dur != C.TIME_UNSET) {

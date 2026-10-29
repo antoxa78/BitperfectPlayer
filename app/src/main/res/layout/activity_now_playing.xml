@@ -69,6 +69,8 @@
             android:clipChildren="false"
             android:clipToPadding="false">
 
+            <!-- Track position + audio output; wraps to a second line when the brand
+                 mark beside it leaves too little width (see fitHeaderBesideBrand). -->
             <TextView
                 android:id="@+id/text_playlist_pos"
                 android:layout_width="wrap_content"
@@ -78,7 +80,7 @@
                 android:textSize="12sp"
                 android:fontFamily="sans-serif-medium"
                 android:letterSpacing="0.18"
-                android:maxLines="1" />
+                android:maxLines="2" />
 
             <androidx.appcompat.widget.AppCompatTextView
                 android:id="@+id/text_title"

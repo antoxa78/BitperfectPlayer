@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.2.0-beta7 - 2026-10-29
+
+### Added
+
+- **Waveform Type → Disabled**, with the separate Waveform Animation option removed (the chosen type animates itself). The brand mark also gets its periodic light sweep, and the Now Playing seek bar shows a clear focus halo.
+
+### Fixed
+
+- **Now Playing cut off the audio output status while playing over Bluetooth.** In USB-driver mode with no DAC claimed, the header above the title reads e.g. "TRACK 3 OF 12 · ANDROID AUDIO · NO USB DAC", and `fitHeaderBesideBrand` capped it at the brand mark's left edge whenever the two were within 16 dp vertically — even when the header sat entirely below the mark. On a 960×540 dp TV that left about 300 dp of the column's ~500 dp for the line, so the status was ellipsized somewhere in "NO USB DAC". The header now only stops short of the mark when their rows actually overlap, and wraps to a second line at a phrase boundary rather than ellipsizing when it must, so the full output path stays readable.
+- **Now Playing kept the last track on screen after clearing the playlist.** `Player.clearMediaItems()` leaves Media3's last `mediaMetadata` in place, and `updateUI()` trusted it: the header dropped the track number, but the title, artist and format pills still described the removed track. With no current item the screen now shows "Nothing Playing", hides the artist row and album art, clears the format pills, zeroes the seek bar and times instead of showing "∞", and stops the progress poller (it restarts on the next play).
+- **Storage browser navigation and titles:** the rows keep D-pad focus when they rebuild, Back stops at the browser's mounting root instead of climbing to `/`, and internal-storage/USB volumes show friendly names. Opening the now-playing queue scrolls to the playing track.
+
+### Changed
+
+- **Debug Log defaults to off,** with a one-time migration from the old implicit-on state.
+
+### Build
+
+- `versionCode` 76, `versionName` `3.2.0-beta7`.
+- Signed release APK: `Bitperfect-Player3.2.0-beta7.release.apk`.
+
 ## 3.2.0-beta6 - 2026-10-24
 
 ### Fixed
