@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.2.0-beta8 - 2026-10-30
+
+### Fixed
+
+- **Stations whose playlist entry is a PLS/M3U link could not be played from a loaded playlist.** Radio directories often list a station as a small document (`…/listen.pls?sid=1`) rather than the stream itself. ExoPlayer fed that text to its audio extractors and failed with "Source error" (`UnrecognizedInputFormatException`), while direct stream entries in the same queue played normally. `AppDataSource` now follows `.pls`/`.m3u` links to the stream they name on the loader thread (32 KiB prefix, 6 s timeout, at most two hops), keeping the item's original mediaId so ICY metadata and saved queues stay matched to the station. HLS manifests are deliberately not expanded, and any resolution failure falls back to the original URL. New `StreamPlaylistParser` with unit tests. Verified on the Shield: all four `.pls` entries in the test queue now play.
+
+### Build
+
+- `versionCode` 77, `versionName` `3.2.0-beta8`.
+- Signed release APK: `Bitperfect-Player3.2.0-beta8.release.apk`.
+
 ## 3.2.0-beta7 - 2026-10-29
 
 ### Added
