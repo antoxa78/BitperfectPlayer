@@ -23,6 +23,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
+import java.io.ByteArrayOutputStream
 import java.io.File
 import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
@@ -130,6 +131,14 @@ class PlaybackService : MediaSessionService() {
         private const val POSITION_SAVE_MS     = 10_000L
         private const val RECONNECT_DELAY_MS   = 5_000L
         private const val MAX_RETRIES          = 5
+
+        // A station link such as …/listen.pls?sid=1 is a tiny playlist document,
+        // not audio; it is resolved to the stream URL before ExoPlayer opens it.
+        // Timeouts are shorter than the stream ones so a dead link fails over to
+        // the player's normal error/reconnect path quickly.
+        private const val MAX_PLAYLIST_BYTES    = 32 * 1024
+        private const val PLAYLIST_TIMEOUT_MS   = 6_000
+        private const val MAX_PLAYLIST_HOPS     = 2
 
         private const val BUFFER_MIN_MS        = 5_000
         private const val BUFFER_MAX_MS        = 120_000
@@ -2278,6 +2287,13 @@ class PlaybackService : MediaSessionService() {
 
     private lateinit var httpFactory: OkHttpDataSource.Factory
 
+    /**
+     * Short-timeout HTTP source used only to read station playlist links
+     * (`.pls`/`.m3u`). It shares the stream client's redirect/UA behaviour but
+     * must not sit on a dead link for the full [HTTP_TIMEOUT_SECS].
+     */
+    private lateinit var playlistHttpFactory: OkHttpDataSource.Factory
+
     private fun buildPlayer(): ExoPlayer {
         val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
         val offloadProvider = BitPerfectOffloadProvider(am)
@@ -2385,7 +2401,7 @@ class PlaybackService : MediaSessionService() {
             .setConstantBitrateSeekingEnabled(true)
 
         val dataSourceFactory = DataSource.Factory {
-            AppDataSource(this, httpFactory)
+            AppDataSource(this, httpFactory, playlistHttpFactory)
         }
 
         val mediaSourceFactory = SacdMediaSourceFactory(
@@ -2875,12 +2891,17 @@ class PlaybackService : MediaSessionService() {
         // auto-resume waits for the answer (runWhenUsbPermissionSettled).
         requestUsbPermissionIfNeeded("service start")
 
-        httpFactory = OkHttpDataSource.Factory(
-            OkHttpClient.Builder()
-                .connectTimeout(HTTP_TIMEOUT_SECS, TimeUnit.SECONDS)
-                .readTimeout(HTTP_TIMEOUT_SECS, TimeUnit.SECONDS)
-                .followRedirects(true)
-                .followSslRedirects(true)
+        val httpClient = OkHttpClient.Builder()
+            .connectTimeout(HTTP_TIMEOUT_SECS, TimeUnit.SECONDS)
+            .readTimeout(HTTP_TIMEOUT_SECS, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+        httpFactory = OkHttpDataSource.Factory(httpClient).setUserAgent(USER_AGENT)
+        playlistHttpFactory = OkHttpDataSource.Factory(
+            httpClient.newBuilder()
+                .connectTimeout(PLAYLIST_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+                .readTimeout(PLAYLIST_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
                 .build()
         ).setUserAgent(USER_AGENT)
 
@@ -3334,7 +3355,11 @@ class PlaybackService : MediaSessionService() {
     // ── Inner data source ─────────────────────────────────────────────────────
 
     @UnstableApi
-    private inner class AppDataSource(context: Context, httpFactory: HttpDataSource.Factory) : DataSource {
+    private inner class AppDataSource(
+        context: Context,
+        httpFactory: HttpDataSource.Factory,
+        private val playlistFactory: HttpDataSource.Factory
+    ) : DataSource {
         private val defaultSrc = DefaultDataSource.Factory(context, httpFactory).createDataSource()
         private val smbSrc     = SmbDataSource()
         private var active: DataSource? = null
@@ -3344,9 +3369,67 @@ class PlaybackService : MediaSessionService() {
         override fun open(dataSpec: DataSpec): Long {
             val scheme = dataSpec.uri.scheme
             lastUri = if (scheme == "http" || scheme == "https") dataSpec.uri.toString() else null
-            active = if (scheme == "smb") smbSrc else defaultSrc
-            return active?.open(dataSpec) ?: throw IOException("No data source available")
+            // Radio directories link some stations as a small PLS/M3U document
+            // (…/listen.pls?sid=1). ExoPlayer would feed that text to the audio
+            // extractors and raise UnrecognizedInputFormatException ("Source
+            // error"), so resolve it to the stream it names before opening. The
+            // item keeps its original URL/mediaId, which also keeps ICY info and
+            // saved queues matching the station the user queued.
+            val playable = if (scheme == "http" || scheme == "https") resolveStationPlaylist(dataSpec) else dataSpec
+            active = if (playable.uri.scheme == "smb") smbSrc else defaultSrc
+            return active?.open(playable) ?: throw IOException("No data source available")
         }
+
+        /**
+         * Follows `.pls`/`.m3u` station links until a stream URL is reached.
+         * Only a bounded prefix is read, redirects are followed, and any
+         * failure falls back to the original [DataSpec] so the player's normal
+         * error/reconnect handling still applies.
+         */
+        private fun resolveStationPlaylist(dataSpec: DataSpec): DataSpec {
+            var current = dataSpec.uri
+            if (!StreamPlaylistParser.isPlaylistUrl(current.toString())) return dataSpec
+            var spec = dataSpec
+            var hops = 0
+            while (hops < MAX_PLAYLIST_HOPS && StreamPlaylistParser.isPlaylistUrl(current.toString())) {
+                val text = fetchPlaylistText(current) ?: return dataSpec
+                val next = StreamPlaylistParser.parse(text, current.toString()) ?: return dataSpec
+                current = Uri.parse(next)
+                // The resolved stream starts at 0: the original position referred
+                // to the (unread) playlist document, not to the audio.
+                spec = dataSpec.buildUpon()
+                    .setUri(current)
+                    .setPosition(0)
+                    .setLength(C.LENGTH_UNSET.toLong())
+                    .build()
+                hops++
+            }
+            return spec
+        }
+
+        /** Reads at most [MAX_PLAYLIST_BYTES] of [uri], or null on any failure. */
+        private fun fetchPlaylistText(uri: Uri): String? {
+            val source = playlistFactory.createDataSource()
+            return try {
+                source.open(DataSpec(uri))
+                val out = ByteArrayOutputStream()
+                val buffer = ByteArray(4096)
+                var total = 0
+                while (total < MAX_PLAYLIST_BYTES) {
+                    val n = source.read(buffer, 0, minOf(buffer.size, MAX_PLAYLIST_BYTES - total))
+                    if (n < 0) break
+                    out.write(buffer, 0, n)
+                    total += n
+                }
+                String(out.toByteArray(), Charsets.UTF_8)
+            } catch (e: Exception) {
+                Log.d(TAG, "Station playlist link unreadable: ${uri.host}${uri.path ?: ""}: ${e.message}")
+                null
+            } finally {
+                try { source.close() } catch (_: Exception) {}
+            }
+        }
+
         override fun read(b: ByteArray, o: Int, l: Int): Int = active?.read(b, o, l) ?: -1
         override fun getUri(): Uri? = active?.uri
         override fun getResponseHeaders(): Map<String, List<String>> {
