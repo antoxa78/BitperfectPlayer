@@ -42,7 +42,7 @@ Enjoying the app? A small donation is greatly appreciated and helps keep the pro
 
 ## Remote Control
 
-Bitperfect Player embeds an MPD-protocol server (default port `6600`, configurable in settings), so you can drive playback from another device on your network. The companion **[Bitperfect Remote](https://github.com/antoxa78/Bitperfect-Remote)** app is a modern Android remote built with Kotlin and Jetpack Compose that connects to this built-in server (or to any standard MPD server) and gives you:
+Bitperfect Player embeds an MPD-protocol server (default port `6600`, configurable in settings), so you can drive playback from another device on your network. The server advertises itself over mDNS (`_mpd._tcp`), so the companion app's **Scan network** action discovers it automatically; the advertisement can be turned off in Settings → **LAN Player Control** → **Discoverable via mDNS**. The companion **[Bitperfect Remote](https://github.com/antoxa78/Bitperfect-Remote)** app is a modern Android remote built with Kotlin and Jetpack Compose that connects to this built-in server (or to any standard MPD server) and gives you:
 
 *   **Full Playback Control**: Play, pause, stop, next/previous, seek bar with real-time progress.
 *   **Volume & Modes**: Volume slider plus repeat, single, shuffle, and consume toggles.

@@ -2216,10 +2216,12 @@ class MainFragment : BrowseSupportFragment() {
             requireContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                 .getString("mpd_password", "")?.isNotBlank() == true
         } catch (_: Exception) { false }
+        val mdns = try { MpdServer.isMdnsEnabled(requireContext()) } catch (_: Exception) { true }
         val lock = if (pwdSet) " 🔒" else ""
         return when {
             !enabled -> "Disabled"
-            running -> "Enabled :$port$lock — ${getLocalIp()}:$port" + if (clients > 0) " ($clients)" else ""
+            running -> "Enabled :$port$lock — ${getLocalIp()}:$port" +
+                (if (mdns) " · mDNS" else "") + if (clients > 0) " ($clients)" else ""
             else -> "Enabled :$port$lock — starting…"
         }
     }
@@ -2257,6 +2259,7 @@ class MainFragment : BrowseSupportFragment() {
         var enabled = prefs.getBoolean("mpd_enabled", true)
         val port = prefs.getInt("mpd_port", 6600)
         var currentPassword = prefs.getString("mpd_password", "") ?: ""
+        var mdnsEnabled = prefs.getBoolean(MpdServer.KEY_MDNS, true)
         val ip = getLocalIp()
         val running = PlaybackService.instance?.isMpdRunning() == true
 
@@ -2268,9 +2271,14 @@ class MainFragment : BrowseSupportFragment() {
         fun buildInfoText(pwd: String, isEnabled: Boolean, curPort: Int = port): String = buildString {
             val clients = PlaybackService.instance?.getClientCount() ?: 0
             val runText = if (!isEnabled) "Disabled" else if (running) "Running ($clients client${if (clients != 1) "s" else ""})" else "Starting…"
-            append("MPD server for MALP / YMuse / any MPD client\n\n")
+            append("MPD server for Bitperfect Remote / MALP / YMuse / any MPD client\n\n")
             append("Status: $runText\n")
             append("Address: $ip:$curPort\n")
+            if (isEnabled) {
+                append("Discovery: ")
+                append(if (mdnsEnabled) "mDNS (${MpdAdvertiser.SERVICE_TYPE})" else "off")
+                append('\n')
+            }
             if (pwd.isNotBlank()) append("Password: set (🔒)\n") else append("Password: none\n")
         }
 
@@ -2409,6 +2417,39 @@ class MainFragment : BrowseSupportFragment() {
         autostartRow.addView(autostartSwitch)
         dialogView.addView(autostartRow)
 
+        // mDNS discovery row
+        val mdnsRow = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 12, 0, 4)
+        }
+        val mdnsLabels = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            )
+        }
+        val mdnsLabel = android.widget.TextView(context).apply {
+            text = "Discoverable via mDNS"
+            textSize = 13f
+        }
+        val mdnsHint = android.widget.TextView(context).apply {
+            text = "Advertise as ${MpdAdvertiser.SERVICE_TYPE} so the remote app can find this player"
+            textSize = 11f
+            setTextColor(0xFF888888.toInt())
+            setPadding(0, 2, 0, 0)
+        }
+        mdnsLabels.addView(mdnsLabel)
+        mdnsLabels.addView(mdnsHint)
+        val mdnsSwitch = android.widget.Switch(context).apply {
+            isChecked = mdnsEnabled
+            isFocusable = true
+            isFocusableInTouchMode = true
+        }
+        mdnsRow.addView(mdnsLabels)
+        mdnsRow.addView(mdnsSwitch)
+        dialogView.addView(mdnsRow)
+
         // Ensure focus navigation works on TV (D-pad)
         pwdInput.isFocusable = true
         pwdInput.isFocusableInTouchMode = true
@@ -2417,19 +2458,22 @@ class MainFragment : BrowseSupportFragment() {
         // Make container not steal focus
         dialogView.isFocusable = false
         dialogView.descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
-        // Fix focus order: pwd -> showPwd -> port -> autostart
+        // Fix focus order: pwd -> showPwd -> port -> autostart -> mDNS
         pwdInput.nextFocusDownId = showPwdCheck.id
         showPwdCheck.nextFocusDownId = portInput.id
         portInput.nextFocusDownId = autostartSwitch.id
+        autostartSwitch.nextFocusDownId = mdnsSwitch.id
         // Assign IDs if needed for focus chain
         if (pwdInput.id == android.view.View.NO_ID) pwdInput.id = android.view.View.generateViewId()
         if (showPwdCheck.id == android.view.View.NO_ID) showPwdCheck.id = android.view.View.generateViewId()
         if (portInput.id == android.view.View.NO_ID) portInput.id = android.view.View.generateViewId()
         if (autostartSwitch.id == android.view.View.NO_ID) autostartSwitch.id = android.view.View.generateViewId()
+        if (mdnsSwitch.id == android.view.View.NO_ID) mdnsSwitch.id = android.view.View.generateViewId()
         // Re-apply after IDs generated
         pwdInput.nextFocusDownId = showPwdCheck.id
         showPwdCheck.nextFocusDownId = portInput.id
         portInput.nextFocusDownId = autostartSwitch.id
+        autostartSwitch.nextFocusDownId = mdnsSwitch.id
 
         val dialog = AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("LAN Player Control")
@@ -2481,6 +2525,10 @@ class MainFragment : BrowseSupportFragment() {
             autostartSwitch.setOnCheckedChangeListener { _, checked ->
                 autostartEnabled = checked
             }
+            mdnsSwitch.setOnCheckedChangeListener { _, checked ->
+                mdnsEnabled = checked
+                refreshInfo()
+            }
             showPwdCheck.setOnCheckedChangeListener { _, checked ->
                 val selStart = pwdInput.selectionStart
                 val selEnd = pwdInput.selectionEnd
@@ -2511,12 +2559,15 @@ class MainFragment : BrowseSupportFragment() {
                 val oldPwd = prefs.getString("mpd_password", "") ?: ""
                 val oldPort = prefs.getInt("mpd_port", 6600)
                 val oldAutostart = prefs.getBoolean("mpd_autostart", false)
-                val changed = oldEnabled != enabled || oldPwd != newPwd || oldPort != newPort || oldAutostart != autostartEnabled
+                val oldMdns = prefs.getBoolean(MpdServer.KEY_MDNS, true)
+                val changed = oldEnabled != enabled || oldPwd != newPwd || oldPort != newPort ||
+                    oldAutostart != autostartEnabled || oldMdns != mdnsEnabled
                 prefs.edit {
                     putBoolean("mpd_enabled", enabled)
                     putString("mpd_password", newPwd)
                     putInt("mpd_port", newPort)
                     putBoolean("mpd_autostart", autostartEnabled)
+                    putBoolean(MpdServer.KEY_MDNS, mdnsEnabled)
                 }
                 if (changed) {
                     PlaybackService.instance?.updateMpdServer()
@@ -2542,6 +2593,7 @@ class MainFragment : BrowseSupportFragment() {
                     putString("mpd_password", newPwd)
                     putInt("mpd_port", newPort)
                     putBoolean("mpd_autostart", autostartEnabled)
+                    putBoolean(MpdServer.KEY_MDNS, mdnsEnabled)
                 }
                 PlaybackService.instance?.updateMpdServer()
                 Toast.makeText(context, "Restarting MPD :$newPort …", Toast.LENGTH_SHORT).show()

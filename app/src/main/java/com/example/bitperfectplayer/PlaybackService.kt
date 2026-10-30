@@ -3072,6 +3072,10 @@ class PlaybackService : MediaSessionService() {
                     mpdServer?.stop()
                     mpdServer = MpdServer(this).also { it.start() }
                     Log.i(TAG, "MPD server restarted on $port (port changed)")
+                } else {
+                    // A password change or the mDNS toggle does not need a
+                    // restart of the listening socket, only of the advertisement.
+                    mpdServer?.refreshMdns()
                 }
             } else {
                 mpdServer?.stop()

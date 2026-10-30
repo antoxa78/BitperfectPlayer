@@ -53,9 +53,12 @@ class MpdServer(private val context: Context) {
     companion object {
         private const val TAG = "MpdServer"
         const val PORT = 6600
+        const val KEY_MDNS = "mpd_mdns"
+        const val REPORTED_VERSION = "0.24.0"
         fun getConfiguredPort(ctx: Context): Int =
             ctx.getSharedPreferences("AppSettings", Context.MODE_PRIVATE).getInt("mpd_port", 6600).coerceIn(1024, 65535)
-        private const val REPORTED_VERSION = "0.24.0"
+        fun isMdnsEnabled(ctx: Context): Boolean =
+            ctx.getSharedPreferences("AppSettings", Context.MODE_PRIVATE).getBoolean(KEY_MDNS, true)
         private const val HOP_TIMEOUT_MS = 3000L
         private const val IDLE_MAX_MS = 60_000L
         /** Settling window that coalesces burst queue edits into one version change. */
@@ -96,6 +99,7 @@ class MpdServer(private val context: Context) {
 
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val mdns = MpdAdvertiser(appContext)
     val library = MpdLibrary(appContext)
 
     @Volatile private var running = false
@@ -111,6 +115,17 @@ class MpdServer(private val context: Context) {
     /** Port actually bound, or the configured port if not yet bound. */
     @Volatile private var boundPort = 0
     fun getPort(): Int = if (boundPort > 0) boundPort else getConfiguredPort(appContext)
+
+    /** Re-applies the mDNS preference after it (or the password) changes. */
+    fun refreshMdns() = updateMdns()
+
+    private fun updateMdns() {
+        if (!running || !isMdnsEnabled(appContext)) {
+            mdns.stop()
+        } else if (boundPort > 0) {
+            mdns.start(boundPort, getPassword().isNotEmpty())
+        }
+    }
 
     // Queue bookkeeping. songIds/songMediaIds are parallel lists: entry i of the
     // player queue has id songIds[i] and mediaId songMediaIds[i].
@@ -162,6 +177,7 @@ class MpdServer(private val context: Context) {
     fun stop() {
         running = false
         boundPort = 0
+        mdns.stop()
         try { serverSocket?.close() } catch (_: Exception) {}
         clients.shutdownNow()
         scheduler.shutdownNow()
@@ -211,6 +227,7 @@ class MpdServer(private val context: Context) {
         if (ss == null) { Log.e(TAG, "MPD disabled: cannot bind $port"); return }
         serverSocket = ss
         boundPort = port
+        updateMdns()
         val pwdInfo = if (getPassword().isNotEmpty()) " (password set)" else ""
         Log.i(TAG, "MPD server listening on $port — configure MALP host=<shield-ip> port=$port$pwdInfo")
         while (running) {
