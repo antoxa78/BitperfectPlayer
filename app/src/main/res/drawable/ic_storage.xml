@@ -1,9 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "harddisk" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M20,13H4c-1.1,0 -2,0.9 -2,2v4c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2v-4c0,-1.1 -0.9,-2 -2,-2zM7,19c-1.1,0 -2,-0.9 -2,-2s0.9,-2 2,-2 2,0.9 2,2 -0.9,2 -2,2zM20,3H4c-1.1,0 -2,0.9 -2,2v4c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V5c0,-1.1 -0.9,-2 -2,-2zM7,9c-1.1,0 -2,-0.9 -2,-2s0.9,-2 2,-2 2,0.9 2,2 -0.9,2 -2,2z" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,2 L18,2 C19.105,2,20,2.895,20,4 L20,20 C20,21.105,19.105,22,18,22 L6,22 C4.895,22,4,21.105,4,20 L4,4 C4,2.895,4.895,2,6,2 M12,4 C8.686,4,6,6.686,6,10 C6,13.31,8.69,16,12.1,16 L11.22,13.77 C10.948,13.289,11.113,12.679,11.59,12.4 L12.45,11.9 C12.931,11.628,13.541,11.793,13.82,12.27 L15.74,14.69 C17.17,13.554,18.002,11.826,18,10 C18,6.686,15.314,4,12,4 M12,9 C12.552,9,13,9.448,13,10 C13,10.552,12.552,11,12,11 C11.448,11,11,10.552,11,10 C11,9.448,11.448,9,12,9 M7,18 C6.448,18,6,18.448,6,19 C6,19.552,6.448,20,7,20 C7.552,20,8,19.552,8,19 C8,18.448,7.552,18,7,18 M12.09,13.27 L14.58,19.58 L17.17,18.08 L12.95,12.77 Z" />
 </vector>
