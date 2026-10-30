@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.2.0-beta9 - 2026-10-30
+
+### Added
+
+- **The embedded MPD server is discoverable over mDNS.** It now advertises itself on the LAN as `_mpd._tcp` — the same service type MPD/Avahi clients use — so Bitperfect Remote's **Scan network** action finds the player automatically instead of needing its address typed in. The advertisement carries the configured port, the reported MPD version and whether a password is required. It follows the **LAN Player Control** setting **Discoverable via mDNS** (on by default) live, starts only after the MPD socket is bound, and retries if Android's NSD service is not ready at boot or rejects the registration. A failed registration never affects the MPD server itself.
+
+### Build
+
+- `versionCode` 78, `versionName` `3.2.0-beta9`.
+- Signed release APK: `Bitperfect-Player3.2.0-beta9.release.apk`.
+
 ## 3.2.0-beta8 - 2026-10-30
 
 ### Fixed
