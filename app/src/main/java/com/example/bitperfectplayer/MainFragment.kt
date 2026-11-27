@@ -1,20 +1,24 @@
 package com.example.bitperfectplayer
 
+import android.Manifest
 import android.app.AlertDialog
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.leanback.app.BrowseSupportFragment
 import androidx.leanback.app.RowsSupportFragment
 import androidx.leanback.widget.*
-import androidx.core.content.edit
-import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import jcifs.smb.SmbFile
@@ -2031,6 +2035,36 @@ class MainFragment : BrowseSupportFragment() {
         }
     }
 
+    /**
+     * Android 11 only offers the USB dialog's "Always open …" checkbox when the
+     * app holds RECORD_AUDIO, because its UsbDescriptorParser counts the DAC's
+     * USB-streaming Input Terminal as a capture path. The app never records;
+     * the grant only unlocks Android's persistent USB choice. Android 12+
+     * distinguishes playback-only DACs and needs no permission.
+     */
+    private fun hasUsbRecordPermission(context: Context): Boolean =
+        Build.VERSION.SDK_INT > Build.VERSION_CODES.R ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+
+    private fun usbNeedsRecordPermission(): Boolean =
+        Build.VERSION.SDK_INT <= Build.VERSION_CODES.R
+
+    /** Result of MainActivity.requestUsbAudioPermission(). */
+    fun onUsbRecordPermissionResult(granted: Boolean) {
+        if (!isAdded) return
+        Toast.makeText(
+            requireContext(),
+            if (granted)
+                "Microphone permission granted. Power-cycle the DAC, then tick " +
+                    "\"Always open …\" in the USB dialog."
+            else
+                "Microphone permission denied — Android 11 will keep asking for USB access.",
+            Toast.LENGTH_LONG
+        ).show()
+        showUsbDacDialog()
+    }
+
     private fun showUsbDacDialog() {
         val context = requireContext()
         // UsbManager check = live device presence (correct after power-off)
@@ -2042,6 +2076,13 @@ class MainFragment : BrowseSupportFragment() {
             it.type == android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY ||
             it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
         }
+
+        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val resetOn = prefs.getBoolean("usb_reset_on_release", true)
+        val rememberOn = DacPermissionMemory.isEnabled(context)
+        val hostRebindOn = prefs.getBoolean("usb_host_rebind_on_exit", false)
+        val showMicOption = usbNeedsRecordPermission() && rememberOn
+        val recordGranted = hasUsbRecordPermission(context)
 
         val msg = if (usbDac != null) {
             buildString {
@@ -2082,34 +2123,50 @@ class MainFragment : BrowseSupportFragment() {
                         append("\n")
                     }
                 }
+                if (showMicOption && !recordGranted) {
+                    append("\nAndroid 11 hides \"Always open …\" until Microphone permission is granted (see the Microphone Permission option below).")
+                }
                 append("\nIf the DAC outputs wrong audio after being power-cycled,\nuse 'Reset Audio Sink' to force re-negotiation.")
             }
         } else {
             "No USB DAC detected.\n\nConnect a USB DAC — it will be detected\nautomatically on startup or when plugged in.\n\nIf your DAC was just connected, try\n'Reset Audio Sink' to trigger negotiation."
         }
 
-        val prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val resetOn = prefs.getBoolean("usb_reset_on_release", true)
-        val rememberOn = DacPermissionMemory.isEnabled(context)
-        val hostRebindOn = prefs.getBoolean("usb_host_rebind_on_exit", false)
-        val items = listOf(
-            DialogOptionItem("Reset Audio Sink", R.drawable.ic_dac),
-            DialogOptionItem(
-                if (resetOn) "USB Reset On Release: Enabled"
-                else "USB Reset On Release: Disabled",
-                R.drawable.ic_dac
-            ),
-            DialogOptionItem(
-                if (rememberOn) "Remember DAC Permission: On"
-                else "Remember DAC Permission: Off",
-                R.drawable.ic_dac
-            ),
-            DialogOptionItem(
-                if (hostRebindOn) "Host Rebind: On (root)"
-                else "Host Rebind: Off (root)",
-                R.drawable.ic_dac
+        val items = buildList {
+            add(DialogOptionItem("Reset Audio Sink", R.drawable.ic_dac))
+            add(
+                DialogOptionItem(
+                    if (resetOn) "USB Reset On Release: Enabled"
+                    else "USB Reset On Release: Disabled",
+                    R.drawable.ic_dac
+                )
             )
-        )
+            add(
+                DialogOptionItem(
+                    if (rememberOn) "Remember DAC Permission: On"
+                    else "Remember DAC Permission: Off",
+                    R.drawable.ic_dac
+                )
+            )
+            if (showMicOption) {
+                add(
+                    DialogOptionItem(
+                        if (recordGranted) "Microphone Permission: Granted"
+                        else "Microphone Permission: Grant (Android 11)",
+                        R.drawable.ic_dac
+                    )
+                )
+            }
+            add(
+                DialogOptionItem(
+                    if (hostRebindOn) "Host Rebind: On (root)"
+                    else "Host Rebind: Off (root)",
+                    R.drawable.ic_dac
+                )
+            )
+        }
+        val micIndex = if (showMicOption) 3 else -1
+        val hostIndex = if (showMicOption) 4 else 3
         showMessageOptionsDialog("USB DAC", R.drawable.ic_dac, msg, items) { which ->
                 when (which) {
                     0 -> {
@@ -2163,7 +2220,11 @@ class MainFragment : BrowseSupportFragment() {
                                         "tick \"Always open ${getString(R.string.app_name)} when … is " +
                                         "connected\" once. After that Android grants the DAC by itself " +
                                         "every time it is switched on, replugged or re-enumerated.\n\n" +
-                                        "Only Android can store this choice — the app cannot tick it for you."
+                                        "Only Android can store this choice — the app cannot tick it for you." +
+                                        (if (usbNeedsRecordPermission())
+                                            "\n\nAndroid 11 also needs Microphone permission — see " +
+                                                "the Microphone Permission option."
+                                         else "")
                                 else
                                     "Android will no longer grant the DAC to this app automatically, " +
                                         "and will not offer to open it when the DAC is connected.\n\n" +
@@ -2174,7 +2235,55 @@ class MainFragment : BrowseSupportFragment() {
                             .setOnCancelListener { showUsbDacDialog() }
                             .show()
                     }
-                    3 -> {
+                    micIndex -> {
+                        if (recordGranted) {
+                            AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                                .setTitle("Microphone Permission: Granted")
+                                .setIcon(R.drawable.ic_dac)
+                                .setMessage(
+                                    "Android 11 can now offer \"Always open " +
+                                        "${getString(R.string.app_name)} when … is connected\".\n\n" +
+                                        "Power-cycle the DAC once, then tick that box in the USB " +
+                                        "dialog. After that Android grants the DAC by itself."
+                                )
+                                .setPositiveButton("OK") { _, _ -> showUsbDacDialog() }
+                                .setOnCancelListener { showUsbDacDialog() }
+                                .show()
+                        } else {
+                            AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                                .setTitle("Android 11 USB Permission")
+                                .setIcon(R.drawable.ic_dac)
+                                .setMessage(
+                                    "Android 11 hides the \"Always open " +
+                                        "${getString(R.string.app_name)} when … is connected\" " +
+                                        "option for USB DACs unless ${getString(R.string.app_name)} " +
+                                        "has Microphone permission.\n\n" +
+                                        "Android counts the DAC's USB-streaming Input Terminal as a " +
+                                        "recording path, even though this DAC is output-only. " +
+                                        "${getString(R.string.app_name)} never records audio — the " +
+                                        "permission is used only to let Android remember the DAC and " +
+                                        "stop asking after every power cycle.\n\n" +
+                                        "Grant it, then power-cycle the DAC and tick \"Always open …\" once."
+                                )
+                                .setPositiveButton("Grant") { _, _ ->
+                                    DacPermissionMemory.setEnabled(context, true)
+                                    val activity = activity as? MainActivity
+                                    if (activity != null) {
+                                        activity.requestUsbAudioPermission()
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            "Open the main screen to grant the permission",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
+                                .setNegativeButton("Not now") { _, _ -> showUsbDacDialog() }
+                                .setOnCancelListener { showUsbDacDialog() }
+                                .show()
+                        }
+                    }
+                    hostIndex -> {
                         val next = !hostRebindOn
                         // commit(), not apply(): the monitor runs in a separate
                         // process and reads this file immediately on start.

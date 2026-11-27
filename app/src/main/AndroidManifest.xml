@@ -15,6 +15,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Android 11's USB descriptor parser counts every UAC Input Terminal as a
+         capture path, so it hides the USB dialog's "Always open …" checkbox for
+         an output-only DAC unless the app holds RECORD_AUDIO. The app never
+         records audio; the permission only lets Android remember the DAC across
+         power cycles. Android 12+ distinguishes USB-streaming terminals and does
+         not need it, hence maxSdkVersion=30. -->
+    <uses-permission
+        android:name="android.permission.RECORD_AUDIO"
+        android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Optional, granted once over adb (never at install): lets PlaybackService
@@ -33,6 +42,12 @@
         android:required="false" />
     <uses-feature
         android:name="android.hardware.usb.host"
+        android:required="false" />
+    <!-- RECORD_AUDIO is only for Android 11's USB permission checkbox; the app
+         never records. Keep the permission from implying a required microphone
+         so TV boxes without one still see the app. -->
+    <uses-feature
+        android:name="android.hardware.microphone"
         android:required="false" />
 
     <application

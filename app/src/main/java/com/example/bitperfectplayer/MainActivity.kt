@@ -31,6 +31,7 @@ class MainActivity : BaseActivity() {
         private const val KEY_WAVEFORM     = "waveform_type"
         private const val REQUEST_FILES    = 2001
         private const val REQUEST_PERMS    = 1
+        private const val REQUEST_USB_AUDIO_PERM = 2002
     }
 
     private var mediaController: MediaController? = null
@@ -329,8 +330,49 @@ class MainActivity : BaseActivity() {
         }
     }
 
+    /**
+     * Android 11 hides the USB dialog's "Always open …" checkbox for a DAC
+     * unless the app holds RECORD_AUDIO: its UsbDescriptorParser treats every
+     * UAC Input Terminal (including the DAC's USB-streaming one) as a capture
+     * path. The app never records audio — the grant is used only to let Android
+     * persist the USB permission. On Android 12+ the parser distinguishes
+     * playback-only DACs and the permission is not declared at all.
+     *
+     * Called from Settings → USB DAC. Must run on the main thread.
+     */
+    fun requestUsbAudioPermission() {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.R) return
+        val fragment = supportFragmentManager.findFragmentById(R.id.main_browse_fragment) as? MainFragment
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED) {
+            fragment?.onUsbRecordPermissionResult(true)
+            return
+        }
+        try {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQUEST_USB_AUDIO_PERM
+            )
+        } catch (t: Throwable) {
+            Toast.makeText(
+                this,
+                "Could not request Microphone permission: ${t.message}",
+                Toast.LENGTH_LONG
+            ).show()
+            fragment?.onUsbRecordPermissionResult(false)
+        }
+    }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_USB_AUDIO_PERM) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            (supportFragmentManager.findFragmentById(R.id.main_browse_fragment) as? MainFragment)
+                ?.onUsbRecordPermissionResult(granted)
+            return
+        }
         (supportFragmentManager.findFragmentById(R.id.main_browse_fragment) as? MainFragment)
             ?.refreshWithCurrentFocus()
     }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.2.0-beta10 - 2026-11-27
+
+### Fixed
+
+- **Android 11 hid the USB DAC "Always open …" checkbox, so the USB permission dialog returned after every DAC power cycle.** Android 11's `UsbDescriptorParser` treats *any* UAC Input Terminal as a capture path — including the USB-streaming terminal that every playback-only DAC exposes — so `UsbConfirmActivity`/`UsbPermissionActivity` show the "This app has not been granted record permission but could capture audio…" warning and skip the "Always open" checkbox entirely. There was nothing to tick: the view was never added. The app now declares `RECORD_AUDIO` with `maxSdkVersion="30"` and adds **Settings → USB DAC → Microphone Permission** with an explanation that the app never records and the grant is only used to let Android persist the DAC choice. `PlaybackService` and `UsbAttachActivity` also point at that option when the permission is missing. Android 12+ is unaffected (its parser distinguishes playback-only DACs, and the permission is not requested there). Once granted, tick the USB dialog's checkbox once and the existing default-handler path remembers the DAC.
+
+### Build
+
+- `versionCode` 79, `versionName` `3.2.0-beta10`.
+- Signed release APK: `Bitperfect-Player3.2.0-beta10.release.apk`.
+
 ## 3.2.0-beta9 - 2026-10-30
 
 ### Added

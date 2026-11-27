@@ -1148,11 +1148,20 @@ class PlaybackService : MediaSessionService() {
             if (DacPermissionMemory.isEnabled(this)) {
                 // Android offers the permanent grant in this same dialog — the app
                 // cannot tick it itself (Settings → USB DAC → Remember DAC Permission).
+                // Android 11 additionally requires RECORD_AUDIO before it will show
+                // the checkbox for any UAC device (see Settings → USB DAC).
+                val recordMissing = Build.VERSION.SDK_INT <= Build.VERSION_CODES.R &&
+                    checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
                 android.widget.Toast.makeText(
                     applicationContext,
-                    "Tick \"Always open ${getString(R.string.app_name)} when " +
-                        "${dac.productName ?: "the DAC"} is connected\" so Android " +
-                        "doesn't ask again.",
+                    if (recordMissing)
+                        "Android 11 hides \"Always open …\" until Microphone permission " +
+                            "is granted: Settings → USB DAC → Microphone Permission."
+                    else
+                        "Tick \"Always open ${getString(R.string.app_name)} when " +
+                            "${dac.productName ?: "the DAC"} is connected\" so Android " +
+                            "doesn't ask again.",
                     android.widget.Toast.LENGTH_LONG
                 ).show()
             }

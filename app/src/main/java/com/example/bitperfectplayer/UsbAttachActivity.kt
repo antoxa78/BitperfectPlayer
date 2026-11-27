@@ -1,5 +1,6 @@
 package com.example.bitperfectplayer
 
+import android.Manifest
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
@@ -10,6 +11,8 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
+import androidx.core.content.ContextCompat
 
 /**
  * Invisible target of `USB_DEVICE_ATTACHED` for USB audio devices.
@@ -32,6 +35,11 @@ import android.util.Log
  * component ([DacPermissionMemory]). Disabled, the app no longer matches the
  * DAC, so Android neither offers "Always open" nor grants anything on attach —
  * the permission is asked for every time the DAC (re)appears.
+ *
+ * Android 11 has an extra requirement: its `UsbDescriptorParser` treats every
+ * UAC Input Terminal as a capture path, so it hides the "Always open" checkbox
+ * for output-only DACs unless the app holds RECORD_AUDIO. Settings → USB DAC →
+ * "Microphone Permission" requests that grant; the app never records audio.
  */
 class UsbAttachActivity : Activity() {
 
@@ -70,6 +78,23 @@ class UsbAttachActivity : Activity() {
             finish()
             return
         }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R &&
+            DacPermissionMemory.isEnabled(this) &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED &&
+            !micHintShown) {
+            // Android 11 suppresses the USB dialog's "Always open …" checkbox for
+            // every UAC device unless the app holds RECORD_AUDIO. Point the user
+            // at the opt-in once per process; the dialog itself has no way to
+            // explain why the checkbox is missing.
+            micHintShown = true
+            Toast.makeText(
+                applicationContext,
+                "Android 11 hides the \"Always open\" USB option until Microphone " +
+                    "permission is granted: Settings → USB DAC → Microphone Permission.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
         if (!running) {
             // Same as the old behaviour: connecting the DAC starts the player.
             startActivity(Intent(this, MainActivity::class.java)
@@ -80,6 +105,7 @@ class UsbAttachActivity : Activity() {
 
     companion object {
         private const val TAG = "UsbAttach"
+        @Volatile private var micHintShown = false
     }
 }
 
