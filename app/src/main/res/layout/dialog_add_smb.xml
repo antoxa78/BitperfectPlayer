@@ -11,6 +11,7 @@
         android:layout_height="wrap_content"
         android:hint="@string/smb_ip_hint"
         android:inputType="text"
+        android:autofillHints="postalAddress"
         android:layout_marginBottom="8dp"
         android:textColor="#FFFFFF"
         android:textColorHint="#888888" />
@@ -21,6 +22,7 @@
         android:layout_height="wrap_content"
         android:hint="@string/smb_share_hint"
         android:inputType="text"
+        android:autofillHints="none"
         android:layout_marginBottom="8dp"
         android:textColor="#FFFFFF"
         android:textColorHint="#888888" />
@@ -31,6 +33,7 @@
         android:layout_height="wrap_content"
         android:hint="@string/smb_username_hint"
         android:inputType="text"
+        android:autofillHints="username"
         android:layout_marginBottom="8dp"
         android:textColor="#FFFFFF"
         android:textColorHint="#888888" />
@@ -41,6 +44,7 @@
         android:layout_height="wrap_content"
         android:hint="@string/smb_password_hint"
         android:inputType="textPassword"
+        android:autofillHints="password"
         android:textColor="#FFFFFF"
         android:textColorHint="#888888" />
 

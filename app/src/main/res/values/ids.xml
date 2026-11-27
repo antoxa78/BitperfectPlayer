@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- CardPresenter: ColorThemes.Theme a card was bound with (for its focus colour). -->
+    <item name="card_theme_tag" type="id" />
+</resources>

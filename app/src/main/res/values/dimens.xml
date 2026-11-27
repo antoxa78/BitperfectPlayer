@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      Leanback sidebar width. The library's 270dp, minus its 56dp start padding, 8dp end padding
+      and 12dp fade edge, left ~128dp for a header label next to its icon, so "Local Music
+      Library" and "Network Shares (SMB)" were cut off. 330dp leaves ~194dp (the longest label
+      is ~184dp at 18sp). The rows start 32dp before the sidebar's edge, as in the library
+      (270dp / 238dp), so they move right by the same 60dp.
+    -->
+    <dimen name="lb_browse_headers_width" tools:override="true">330dp</dimen>
+    <dimen name="lb_browse_rows_margin_start" tools:override="true">298dp</dimen>
+</resources>

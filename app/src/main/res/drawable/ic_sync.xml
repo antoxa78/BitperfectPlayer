@@ -1,9 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "sync" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
     <path
-        android:fillColor="#00E676"
-        android:pathData="M12,4V1L8,5l4,4V6c3.31,0 6,2.69 6,6 0,1.01 -0.25,1.97 -0.7,2.8l1.46,1.46C19.54,15.03 20,13.57 20,12c0,-4.42 -3.58,-8 -8,-8zm0,14c-3.31,0 -6,-2.69 -6,-6 0,-1.01 0.25,-1.97 0.7,-2.8L5.24,7.74C4.46,8.97 4,10.43 4,12c0,4.42 3.58,8 8,8v3l4,-4 -4,-4v3z" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,18 C8.686,18,6,15.314,6,12 C6,11,6.25,10.03,6.7,9.2 L5.24,7.74 C4.43,9.013,4,10.491,4,12 C4,16.418,7.582,20,12,20 L12,23 L16,19 L12,15 M12,4 L12,1 L8,5 L12,9 L12,6 C15.314,6,18,8.686,18,12 C18,13,17.75,13.97,17.3,14.8 L18.76,16.26 C19.57,14.987,20,13.509,20,12 C20,7.582,16.418,4,12,4" />
 </vector>

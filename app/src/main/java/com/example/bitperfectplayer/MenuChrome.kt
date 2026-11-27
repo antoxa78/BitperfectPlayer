@@ -1,0 +1,398 @@
+package com.example.bitperfectplayer
+
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.TextUtils
+import android.text.style.ForegroundColorSpan
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.animation.LinearInterpolator
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.core.graphics.ColorUtils
+import androidx.leanback.widget.HeaderItem
+import androidx.leanback.widget.Presenter
+import androidx.leanback.widget.Row
+import androidx.leanback.widget.RowHeaderPresenter
+import androidx.leanback.widget.TitleViewAdapter
+
+/*
+ * Main-menu chrome: the branded title in the top-right corner and the icon headers in the
+ * Leanback sidebar. Both follow the current ColorThemes theme.
+ */
+
+private fun View.dp(value: Float): Int =
+    TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics).toInt()
+
+/**
+ * The app's brand mark: the cat logo next to a "Bitperfect / PLAYER" wordmark whose second
+ * half is drawn in the theme accent, echoing the launcher banner. Shared by the main menu's
+ * title ([BrandTitleView]) and the Now Playing screen, so both show the same mark.
+ * Not focusable and hidden from accessibility (it is decoration).
+ */
+class BrandMark(context: Context) : LinearLayout(context) {
+
+    private val wordmark = TextView(context)
+    private val tagline = TextView(context)
+
+    // A short light sweep every few seconds; no animator runs during the pause,
+    // so the mark costs nothing while it is idle.
+    private var accent = Color.WHITE
+    private var sweeping = false
+    private var sweepProgress = 1f
+    private var sweepScheduled = false
+    private var sweepAnimator: ValueAnimator? = null
+    private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
+    }
+    private val sweepStarter = Runnable { startSweep() }
+
+    init {
+        orientation = HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        isFocusable = false
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+
+        val logo = ImageView(context).apply {
+            setImageResource(R.mipmap.ic_launcher_cat)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = null
+        }
+        addView(logo, LayoutParams(dp(52f), dp(52f)).apply { marginEnd = dp(10f) })
+
+        val words = LinearLayout(context).apply { orientation = VERTICAL }
+        wordmark.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            includeFontPadding = false
+            maxLines = 1
+        }
+        tagline.apply {
+            text = "PLAYER"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.42f
+            setTextColor(0xFFB0B0B0.toInt())
+            includeFontPadding = false
+        }
+        // Explicit WRAP_CONTENT: a vertical LinearLayout's default child params are
+        // MATCH_PARENT wide, and in a wrap_content column that means "as wide as the
+        // widest *other* child" — the "PLAYER" tagline. The wordmark was measured to
+        // that width and, being maxLines = 1, drawn cut off as "Bitper".
+        words.addView(wordmark, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        words.addView(tagline, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(3f) })
+        addView(words)
+
+        applyTheme(ColorThemes.current(context))
+    }
+
+    /** Recolours the accent half of the wordmark and the tagline. */
+    internal fun applyTheme(theme: ColorThemes.Theme) {
+        accent = theme.accent
+        wordmark.text = SpannableStringBuilder("Bitperfect").apply {
+            setSpan(ForegroundColorSpan(theme.accent), 3, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        tagline.setTextColor(theme.cardSubtitle)
+    }
+
+    // ── Light sweep ─────────────────────────────────────────────────────────
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        scheduleSweep(1_200L)
+    }
+
+    override fun onDetachedFromWindow() {
+        stopSweep()
+        super.onDetachedFromWindow()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility == View.VISIBLE) scheduleSweep(1_200L) else stopSweep()
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (visibility == View.VISIBLE) scheduleSweep(1_200L) else stopSweep()
+    }
+
+    /**
+     * Draws the children normally, then a soft diagonal-ish band of light over
+     * the logo and both text lines. SRC_ATOP clips the band to the mark's own
+     * pixels, so the background never picks up the tint.
+     */
+    override fun dispatchDraw(canvas: Canvas) {
+        if (!sweeping || width <= 0 || height <= 0) {
+            super.dispatchDraw(canvas)
+            return
+        }
+
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val save = canvas.saveLayer(0f, 0f, w, h, null)
+        super.dispatchDraw(canvas)
+
+        val band = (w * 0.45f).coerceAtLeast(72f * resources.displayMetrics.density)
+        val x = -band + (w + band * 2f) * sweepProgress
+        sweepPaint.shader = LinearGradient(
+            x, 0f, x + band, h,
+            intArrayOf(
+                Color.TRANSPARENT,
+                ColorUtils.setAlphaComponent(Color.WHITE, 0x44),
+                ColorUtils.setAlphaComponent(accent, 0x76),
+                ColorUtils.setAlphaComponent(Color.WHITE, 0x44),
+                Color.TRANSPARENT
+            ),
+            floatArrayOf(0f, 0.28f, 0.5f, 0.72f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, w, h, sweepPaint)
+        canvas.restoreToCount(save)
+    }
+
+    private fun scheduleSweep(delayMs: Long) {
+        if (sweepScheduled || sweepAnimator != null) return
+        if (!isAttachedToWindow || windowVisibility != View.VISIBLE || visibility != View.VISIBLE) return
+        sweepScheduled = true
+        postDelayed(sweepStarter, delayMs)
+    }
+
+    private fun startSweep() {
+        sweepScheduled = false
+        if (!isAttachedToWindow || windowVisibility != View.VISIBLE || visibility != View.VISIBLE) return
+        if (sweepAnimator != null) return
+
+        sweeping = true
+        sweepProgress = 0f
+        invalidate()
+
+        val animation = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 1_500L
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                sweepProgress = it.animatedValue as Float
+                invalidate()
+            }
+        }
+        animation.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                if (sweepAnimator !== animation) return
+                sweepAnimator = null
+                sweeping = false
+                sweepProgress = 1f
+                invalidate()
+                scheduleSweep(3_500L)
+            }
+        })
+        sweepAnimator = animation
+        animation.start()
+    }
+
+    private fun stopSweep() {
+        removeCallbacks(sweepStarter)
+        sweepScheduled = false
+        sweepAnimator?.cancel()
+        sweepAnimator = null
+        sweeping = false
+        sweepProgress = 1f
+        invalidate()
+    }
+
+    companion object {
+        /** Insets from the screen's top and end edges, the same on every screen that shows the mark. */
+        const val TOP_INSET_DP = 22f
+        const val END_INSET_DP = 48f
+    }
+}
+
+/**
+ * Replaces Leanback's plain title text with the [BrandMark].
+ *
+ * Installed through [MainFragment.onInflateTitleView]; it carries the
+ * `browse_title_group` id and implements [TitleViewAdapter.Provider], which is all
+ * BrowseSupportFragment requires of a title view. The app has no search, so the search
+ * affordance is a permanently hidden view.
+ */
+class BrandTitleView(context: Context) : LinearLayout(context), TitleViewAdapter.Provider {
+
+    private val branding = BrandMark(context)
+    private val hiddenSearch = View(context).apply { visibility = View.GONE }
+
+    private val titleAdapter = object : TitleViewAdapter() {
+        override fun getSearchAffordanceView(): View = hiddenSearch
+
+        // The wordmark is fixed; the fragment's title string is not shown.
+        override fun setTitle(titleText: CharSequence?) = Unit
+
+        override fun updateComponentsVisibility(flags: Int) {
+            branding.visibility =
+                if ((flags and TitleViewAdapter.BRANDING_VIEW_VISIBLE) != 0) View.VISIBLE else View.INVISIBLE
+        }
+    }
+
+    init {
+        id = androidx.leanback.R.id.browse_title_group
+        orientation = HORIZONTAL
+        gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        setPadding(dp(BrandMark.END_INSET_DP), dp(BrandMark.TOP_INSET_DP), dp(BrandMark.END_INSET_DP), 0)
+
+        addView(branding)
+        addView(hiddenSearch)
+    }
+
+    /** Recolours the brand mark for a new theme. */
+    internal fun applyTheme(theme: ColorThemes.Theme) = branding.applyTheme(theme)
+
+    override fun getTitleViewAdapter(): TitleViewAdapter = titleAdapter
+}
+
+/**
+ * Sidebar headers with an icon per section. The header that has focus gets a soft accent pill
+ * and an accent icon; the others fade back, as Leanback's own headers do.
+ */
+class IconHeaderItemPresenter : RowHeaderPresenter() {
+
+    private class Holder(view: View, val pill: View, val icon: ImageView, val label: TextView) :
+        RowHeaderPresenter.ViewHolder(view) {
+        var theme: ColorThemes.Theme? = null
+        var iconTint: Int = Color.WHITE
+        val pillBackground = GradientDrawable().also { pill.background = it }
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup): Presenter.ViewHolder {
+        val context = parent.context
+        val root = FrameLayout(context).apply {
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            alpha = UNSELECTED_ALPHA
+        }
+        val pill = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+        }
+        val icon = ImageView(context).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        val label = FitTextView(context, maxSp = 18f, minSp = 13f).apply {
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(Color.WHITE)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        pill.addView(icon, LinearLayout.LayoutParams(root.dp(24f), root.dp(24f)).apply { marginEnd = root.dp(12f) })
+        pill.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // The 12dp end margin keeps the pill clear of Leanback's 12dp fade edge on the
+        // sidebar's right side, which would otherwise fade out the end of long labels.
+        root.addView(pill, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, root.dp(2f), root.dp(12f), root.dp(2f)) })
+        return Holder(root, pill, icon, label)
+    }
+
+    override fun onBindViewHolder(viewHolder: Presenter.ViewHolder, item: Any?) {
+        val holder = viewHolder as Holder
+        val header: HeaderItem? = (item as? Row)?.headerItem
+        val theme = ColorThemes.current(holder.view.context)
+        holder.theme = theme
+        holder.label.text = header?.name
+        // A fixed-width TextView may skip re-measuring on setText; FitTextView picks its
+        // size in onMeasure, so a recycled header must measure again for its new label.
+        holder.label.requestLayout()
+        holder.view.contentDescription = header?.name
+        holder.icon.setImageResource(iconFor(header))
+        holder.iconTint = if (header?.id == EXIT_HEADER_ID) EXIT_TINT else theme.accent
+        holder.pillBackground.cornerRadius = holder.view.dp(12f).toFloat()
+        applyLevel(holder, holder.selectLevel)
+    }
+
+    override fun onUnbindViewHolder(viewHolder: Presenter.ViewHolder) {
+        val holder = viewHolder as Holder
+        holder.label.text = null
+        holder.icon.setImageDrawable(null)
+    }
+
+    override fun onSelectLevelChanged(holder: RowHeaderPresenter.ViewHolder) {
+        (holder as? Holder)?.let { applyLevel(it, it.selectLevel) }
+    }
+
+    private fun applyLevel(holder: Holder, level: Float) {
+        holder.view.alpha = UNSELECTED_ALPHA + level * (1f - UNSELECTED_ALPHA)
+        val theme = holder.theme ?: return
+        holder.pillBackground.setColor(ColorUtils.setAlphaComponent(theme.accent, (level * PILL_ALPHA).toInt()))
+        holder.icon.setColorFilter(ColorUtils.blendARGB(0xFFDDDDDD.toInt(), holder.iconTint, 0.35f + 0.65f * level))
+    }
+
+    private fun iconFor(header: HeaderItem?): Int = when (header?.id) {
+        0L -> R.drawable.ic_play_circle      // Now Playing
+        1L -> R.drawable.ic_compass          // Actions (browse sources)
+        2L -> R.drawable.ic_folder_music     // Local Music Library
+        3L -> R.drawable.ic_network_music    // Network Shares (SMB)
+        4L -> R.drawable.ic_settings         // Settings
+        5L -> R.drawable.ic_history          // Recently Played
+        6L -> R.drawable.ic_playlist         // Playlists
+        EXIT_HEADER_ID -> R.drawable.ic_exit // Exit
+        else -> R.drawable.ic_audio
+    }
+
+    /**
+     * Single-line label that steps its text size down from [maxSp] towards [minSp] until the
+     * text fits its width, and only ellipsizes below that. The sidebar is sized so every
+     * header fits at [maxSp]; this covers a larger system font scale or a longer label.
+     * (Platform autosizing is avoided: with a wrap_content height and recycled header views
+     * it can stay shrunk after a long label is replaced by a short one.)
+     */
+    private class FitTextView(context: Context, maxSp: Float, minSp: Float) : TextView(context) {
+        private val maxPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, maxSp, resources.displayMetrics)
+        private val minPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, minSp, resources.displayMetrics)
+        private val stepPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 1f, resources.displayMetrics)
+        private val probe = android.graphics.Paint()
+
+        init { setTextSize(TypedValue.COMPLEX_UNIT_PX, maxPx) }
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            if (MeasureSpec.getMode(widthMeasureSpec) != MeasureSpec.UNSPECIFIED) {
+                val available = MeasureSpec.getSize(widthMeasureSpec) - totalPaddingLeft - totalPaddingRight
+                val label = text?.toString().orEmpty()
+                probe.set(paint)
+                var size = maxPx
+                probe.textSize = size
+                while (size > minPx && probe.measureText(label) > available) {
+                    size = (size - stepPx).coerceAtLeast(minPx)
+                    probe.textSize = size
+                }
+                if (size != textSize) setTextSize(TypedValue.COMPLEX_UNIT_PX, size)
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+        }
+    }
+
+    private companion object {
+        /** Same as Leanback's lb_browse_header_unselect_alpha. */
+        const val UNSELECTED_ALPHA = 0.5f
+        /** Maximum opacity of the focused header's accent pill. */
+        const val PILL_ALPHA = 0x3A
+        const val EXIT_HEADER_ID = 7L
+        val EXIT_TINT = 0xFFFF5252.toInt()
+    }
+}

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "console" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M20,19V7H4V19H20M20,3A2,2 0 0,1 22,5V19A2,2 0 0,1 20,21H4A2,2 0 0,1 2,19V5C2,3.89 2.9,3 4,3H20M13,17V15H18V17H13M9.58,16.08L8.16,17.5L4.91,14.25L8.16,11L9.58,12.42L7.75,14.25L9.58,16.08Z" />
+</vector>

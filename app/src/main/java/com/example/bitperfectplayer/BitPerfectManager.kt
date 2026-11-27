@@ -1,0 +1,289 @@
+package com.example.bitperfectplayer
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioMixerAttributes
+import android.os.Build
+import android.util.Log
+import androidx.annotation.RequiresApi
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.common.util.UnstableApi
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Manages Android 14+ (API 34) Bit-Perfect mixer attributes.
+ * Allows bypassing the system mixer for USB DACs when the track format matches.
+ *
+ * Thread-safety: updateAudioTrack() is called on ExoPlayer's internal playback/audio
+ * thread (immediately before AudioTrack construction, so it must stay synchronous —
+ * it cannot be deferred to a background executor). clear() is called from the app's
+ * main thread via Player.Listener callbacks in PlaybackService. These two entry points
+ * can race: without coordination, a clear() for an old track can land on top of an
+ * updateAudioTrack() for a track that started afterward, silently dropping the
+ * bit-perfect mixer preference for the new track with no error surfaced anywhere.
+ *
+ * Fixed with a lock (for mutual exclusion — AudioManager calls must not interleave)
+ * plus a monotonic version counter (so a call that's already been superseded by the
+ * time it acquires the lock is discarded instead of overwriting the newer state).
+ */
+@UnstableApi
+class BitPerfectManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "BitPerfectManager"
+    }
+
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    private val lock = Any()
+    private var appliedVersion = 0L
+    private val nextVersion = AtomicLong(0L)
+    private var appliedDevice: AudioDeviceInfo? = null
+
+    /**
+     * Incremented every time [clear] actually clears the preference. A sink that
+     * keeps an AudioTrack alive across a clear (e.g. the queue ended, then the
+     * user seeks back into it) compares this with the value it saw when the
+     * track was created: if it moved, the track no longer has its BIT_PERFECT
+     * mixer and must be recreated so [updateAudioTrack] runs again.
+     */
+    @Volatile
+    var clearGeneration = 0L
+        private set
+
+    /**
+     * Whether the last AudioTrack got a BIT_PERFECT mixer: true / false, or null
+     * before the first track and after [clear]. Lets Now Playing say when "Bit-perfect
+     * via Android" is in fact being resampled (no such mixer on the device).
+     */
+    @Volatile
+    var lastTrackBitPerfect: Boolean? = null
+        private set
+
+    /**
+     * Updates mixer attributes from the final AudioTrack output configuration.
+     * This runs immediately before AudioTrack creation, so the preference applies to that track.
+     * Must never throw because it is part of the audio-track creation path.
+     *
+     * @return true if a BIT_PERFECT mixer was set for this track.
+     */
+    fun updateAudioTrack(
+        config: AudioSink.AudioTrackConfig,
+        outputDevice: AudioDeviceInfo? = null
+    ): Boolean {
+        // null = no verdict for this track (pre-Android 14, no USB device, stale call):
+        // keep the previous one rather than claim "resampled".
+        val verdict = updateAudioTrackInternal(config, outputDevice)
+        if (verdict != null) lastTrackBitPerfect = verdict
+        return verdict == true
+    }
+
+    private fun updateAudioTrackInternal(
+        config: AudioSink.AudioTrackConfig,
+        outputDevice: AudioDeviceInfo?
+    ): Boolean? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
+
+        // Grab the version stamp *before* the lock — it must reflect when the caller
+        // actually decided to apply this config, not when it happened to get scheduled.
+        val myVersion = nextVersion.incrementAndGet()
+
+        val usbDeviceInfo = when {
+            outputDevice != null -> outputDevice.takeIf(::isUsbOutputDevice)
+            else -> findUsbOutputDevice()
+        } ?: run {
+            Log.d(TAG, "No USB output device found for bit-perfect routing")
+            return null
+        }
+
+        return synchronized(lock) {
+            if (myVersion <= appliedVersion) {
+                Log.d(TAG, "Skipping stale updateAudioTrack (v$myVersion, already at v$appliedVersion)")
+                return null
+            }
+            var bitPerfect = false
+            try {
+                if (config.offload || config.tunneling) {
+                    clearPreferredMixerAttributesLocked(usbDeviceInfo)
+                } else {
+                    val outputFormat = AudioFormat.Builder()
+                        .setEncoding(config.encoding)
+                        .setSampleRate(config.sampleRate)
+                        .setChannelMask(config.channelConfig)
+                        .build()
+                    bitPerfect = applyBitPerfectAttributesLocked(usbDeviceInfo, outputFormat)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to update bit-perfect mixer attributes", e)
+            }
+            appliedDevice = usbDeviceInfo
+            appliedVersion = myVersion
+            bitPerfect
+        }
+    }
+
+    /**
+     * Clears any preferred mixer attributes. Should be called when playback stops or service is destroyed.
+     */
+    fun clear() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+
+        val myVersion = nextVersion.incrementAndGet()
+        val device = synchronized(lock) { appliedDevice } ?: findUsbOutputDevice()
+
+        synchronized(lock) {
+            if (myVersion <= appliedVersion) {
+                Log.d(TAG, "Skipping stale clear (v$myVersion, already at v$appliedVersion)")
+                return
+            }
+            if (device != null) {
+                clearPreferredMixerAttributesLocked(device)
+            } else {
+                Log.d(TAG, "No USB output device found while clearing mixer attributes")
+            }
+            appliedDevice = null
+            appliedVersion = myVersion
+            clearGeneration++
+            lastTrackBitPerfect = null
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun clearPreferredMixerAttributesLocked(device: AudioDeviceInfo) {
+        val mediaAttr = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+
+        try {
+            audioManager.clearPreferredMixerAttributes(mediaAttr, device)
+            Log.i(TAG, "Cleared preferred mixer attributes for ${device.productName}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to clear preferred mixer attributes", e)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun applyBitPerfectAttributesLocked(device: AudioDeviceInfo, outputFormat: AudioFormat): Boolean {
+        val mediaAttr = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+
+        // 1. Query supported mixer attributes for this device
+        val supportedMixerAttributes = try {
+            audioManager.getSupportedMixerAttributes(device)
+        } catch (e: Exception) {
+            Log.e(TAG, "getSupportedMixerAttributes failed", e)
+            return false
+        }
+
+        // 2. Match the actual output format exactly. The source format can be compressed
+        //    (MP3/FLAC) and is not suitable for selecting a mixer configuration.
+        val bitPerfectAttr = supportedMixerAttributes.firstOrNull { attr ->
+            attr.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
+                    isFormatMatch(attr.format, outputFormat)
+        }
+
+        if (bitPerfectAttr != null) {
+            return try {
+                audioManager.setPreferredMixerAttributes(mediaAttr, device, bitPerfectAttr)
+                Log.i(TAG, "SUCCESS: Set BIT_PERFECT mixer for ${device.productName} " +
+                        "(${outputFormat.sampleRate}Hz, ${outputFormat.channelCount}ch, encoding=${outputFormat.encoding})")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to set preferred mixer attributes", e)
+                false
+            }
+        } else {
+            // isFormatMatch() tests rate, channel count, encoding and channel mask,
+            // and the candidate must additionally be flagged
+            // MIXER_BEHAVIOR_BIT_PERFECT. Dumping every supported mixer overflowed
+            // logd's ~4 KB line limit (truncated mid-entry on a Xiaomi TV Box S 3rd
+            // Gen), so summarise instead: the count of bit-perfect mixers is the
+            // decisive number — 0 means this HAL cannot do bit-perfect at all, no
+            // matter what the requested format is.
+            val bitPerfect = supportedMixerAttributes.filter {
+                it.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT
+            }
+            Log.w(TAG, "No matching BIT_PERFECT mixer for ${formatText(outputFormat)} — " +
+                    "device offers ${bitPerfect.size} BIT_PERFECT mixer(s) of " +
+                    "${supportedMixerAttributes.size}" +
+                    if (bitPerfect.isEmpty()) "" else ": " + bitPerfect.joinToString { formatText(it.format) })
+            // Clear if we had something set previously that doesn't match now
+            clearPreferredMixerAttributesLocked(device)
+            return false
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun formatText(format: AudioFormat): String =
+        "${format.sampleRate}Hz/${format.channelCount}ch/encoding=${format.encoding}" +
+            "/mask=0x${Integer.toHexString(format.channelMask)}"
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun isFormatMatch(mixerFormat: AudioFormat, outputFormat: AudioFormat): Boolean {
+        if (mixerFormat.sampleRate != outputFormat.sampleRate) return false
+        if (mixerFormat.channelCount != outputFormat.channelCount) return false
+        if (mixerFormat.encoding != outputFormat.encoding) return false
+
+        // Match the layout where both formats expose a channel mask. Some devices expose
+        // only a channel count, so do not reject a valid count-only description.
+        val mixerMask = mixerFormat.channelMask
+        val outputMask = outputFormat.channelMask
+        return mixerMask == 0 || outputMask == 0 || mixerMask == outputMask
+    }
+
+    /**
+     * The integer PCM encoding (AudioFormat.ENCODING_PCM_32BIT, else
+     * ENCODING_PCM_24BIT_PACKED) for which [device] offers a BIT_PERFECT mixer
+     * at [sampleRate]/[channelMask], or null if none (or below Android 14).
+     *
+     * Needed because decoders hand us float (so 24-bit sources are not
+     * truncated), but USB bit-perfect mixers only exist for the DAC's integer
+     * formats: a float AudioTrack never matches one and silently falls back to
+     * the resampling system mixer. Converting float→int32/int24 is exact for
+     * any ≤24-bit source, so the track can use the bit-perfect mixer instead.
+     */
+    fun findBitPerfectIntegerEncoding(
+        device: AudioDeviceInfo,
+        sampleRate: Int,
+        channelMask: Int
+    ): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
+        if (!isUsbOutputDevice(device)) return null
+        return try {
+            val attrs = audioManager.getSupportedMixerAttributes(device)
+            val preference = intArrayOf(AudioFormat.ENCODING_PCM_32BIT, AudioFormat.ENCODING_PCM_24BIT_PACKED)
+            preference.firstOrNull { encoding ->
+                val wanted = AudioFormat.Builder()
+                    .setEncoding(encoding)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelMask)
+                    .build()
+                attrs.any { attr ->
+                    attr.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
+                        isFormatMatch(attr.format, wanted)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "findBitPerfectIntegerEncoding failed: ${e.message}")
+            null
+        }
+    }
+
+    fun findUsbOutputDevice(): AudioDeviceInfo? {
+        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
+            it.isSink && isUsbOutputDevice(it)
+        }
+    }
+
+    private fun isUsbOutputDevice(device: AudioDeviceInfo): Boolean {
+        return device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                device.type == AudioDeviceInfo.TYPE_USB_ACCESSORY ||
+                device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+    }
+}

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "delete-sweep" from Material Design Icons by Pictogrammers (pictogrammers.com),
+     Pictogrammers Free License / Apache 2.0. White fill: tinted in code where needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M15,16 L19,16 L19,18 L15,18 Z M15,8 L22,8 L22,10 L15,10 Z M15,12 L21,12 L21,14 L15,14 Z M3,18 C3,19.105,3.895,20,5,20 L11,20 C12.105,20,13,19.105,13,18 L13,8 L3,8 Z M14,5 L11,5 L10,4 L6,4 L5,5 L2,5 L2,7 L14,7 Z" />
+</vector>
